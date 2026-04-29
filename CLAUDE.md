@@ -99,7 +99,7 @@ Two guards live here:
 ### Persistence
 
 - `data/state.json` — single cursor: `{last_run_at, last_run_status}`.
-- `data/cache.json` — Tier 1 classify cache keyed by `(file_id, modified_time)`; Tier 2 extract cache keyed by `(file_id, content_sha)`. Atomic writes via tempfile+rename. mtime change drops stale extraction payload. Tier 3 (matcher skip) is not yet implemented.
+- `data/cache.json` — Tier 1 classify cache keyed by `(file_id, modified_time)`; Tier 2 extract cache keyed by `(file_id, content_sha)`; **Tier 3 matcher cache** keyed by `(file_id, content_sha, project_topology_sha, matcher_prompt_sha)`. Atomic writes via tempfile+rename. mtime change drops stale extraction payload; fresh extraction drops stale matcher payload. Bumping `matcher.txt` / `matcher_grouped.txt` / `LLM_MODEL_CLASSIFY` / the kind-aware confidence floors invalidates every cached match (via `compute_matcher_prompt_sha`). Any structural change in CENTPM (epic added/removed/renamed, child summary or status change, description rewrites) invalidates via `compute_project_topology_sha`. Cache version is 2 — old (v1) caches are dropped on load. Section-granular caching for multi_epic files (Tier 4) is the obvious next step but not yet implemented.
 - `data/snapshots/` — debug artifacts written by scripts (`files.json`, `classifications.json`, `extraction.json`, `epics.json`, `epic_tree.json`, `project_tree.json`).
 - `data/gdrive_files/` — local copies of Drive files (Google Docs exported to markdown).
 - `data/run_plan.json` — per-run intended actions (always written, even on dry-run).

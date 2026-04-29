@@ -45,7 +45,7 @@ from .pipeline.extractor import (
 )
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 DEFAULT_CACHE_PATH = Path("data/cache.json")
 
 
@@ -168,6 +168,22 @@ class FileCacheEntry:
     classification_confidence: float | None = None
     classification_reason: str | None = None
     extraction_payload: dict | None = None  # serialize_extraction output
+    # Tier 3 — matcher decision cache. Shape:
+    #   {
+    #     "content_sha": "<sha at decision time>",
+    #     "prompt_sha":   "<matcher prompts + model fingerprint>",
+    #     "topology_sha": "<project tree fingerprint at decision time>",
+    #         (stored for diagnostics only; NOT used to validate hits)
+    #     "results": [ <file_epic_result_to_json>, ... ]   # one per section
+    #   }
+    #
+    # Validation philosophy: the doc is the source of truth, Jira is
+    # downstream. We only invalidate when the doc body or the agent's
+    # own brain (matcher prompts/model) changed. Devs editing CENTPM
+    # issues directly does NOT invalidate the cache; their edits stay.
+    # The reconciler's per-issue manual-edit + status guards still
+    # protect the apply path on doc-changed runs.
+    matcher_payload: dict | None = None
     cached_at: str = ""
 
     def to_json(self) -> dict:
@@ -178,6 +194,7 @@ class FileCacheEntry:
             "classification_confidence": self.classification_confidence,
             "classification_reason": self.classification_reason,
             "extraction_payload": self.extraction_payload,
+            "matcher_payload": self.matcher_payload,
             "cached_at": self.cached_at,
         }
 
@@ -191,6 +208,7 @@ class FileCacheEntry:
             classification_confidence=raw.get("classification_confidence"),
             classification_reason=raw.get("classification_reason"),
             extraction_payload=raw.get("extraction_payload"),
+            matcher_payload=raw.get("matcher_payload"),
             cached_at=raw.get("cached_at", ""),
         )
 
@@ -315,8 +333,87 @@ class Cache:
         entry.modified_time = modified_time
         entry.content_sha = content_sha
         entry.extraction_payload = extraction_payload
+        # Stale invalidate: a fresh extraction means any cached matcher
+        # decision was made against a different doc body.
+        entry.matcher_payload = None
         entry.cached_at = datetime.now().isoformat(timespec="seconds")
         self.files[file_id] = entry
+
+    # ---- Tier 3: matcher decision cache ---------------------------------
+
+    def get_match(
+        self,
+        file_id: str,
+        *,
+        content_sha: str,
+        prompt_sha: str,
+    ) -> list[dict] | None:
+        """Returns the cached `results` list (each entry is a serialized
+        FileEpicResult) when both fingerprints match the entry. None
+        otherwise.
+
+        - `content_sha` mismatch → the doc body changed; the matcher's
+          doc-side input is different. Re-decide.
+        - `prompt_sha` mismatch → matcher prompts or model changed; the
+          old decision may not survive the new rules. Re-decide.
+
+        We deliberately do NOT validate against the Jira project tree.
+        The doc is the source of truth; dev edits in Jira must stay and
+        not force the agent to re-decide. The runner is responsible for
+        the soft fallback if a cached `matched_jira_key` no longer
+        exists in the current tree (rare; epic was deleted).
+        """
+        entry = self.files.get(file_id)
+        if entry is None or entry.matcher_payload is None:
+            return None
+        mp = entry.matcher_payload
+        if mp.get("content_sha") != content_sha:
+            return None
+        if mp.get("prompt_sha") != prompt_sha:
+            return None
+        results = mp.get("results")
+        if not isinstance(results, list):
+            return None
+        return results
+
+    def set_match(
+        self,
+        *,
+        file_id: str,
+        modified_time: str,
+        content_sha: str,
+        prompt_sha: str,
+        topology_sha: str,
+        results: list[dict],
+    ) -> None:
+        """Persist a fresh matcher decision. `topology_sha` is stored for
+        diagnostics only — useful when reading cache.json by hand to see
+        which project state a decision was made against — but it is not
+        used to validate cache hits."""
+        entry = self.files.get(file_id) or FileCacheEntry(
+            file_id=file_id,
+            modified_time=modified_time,
+            content_sha=content_sha,
+            role=None,
+        )
+        entry.modified_time = modified_time
+        entry.content_sha = content_sha
+        entry.matcher_payload = {
+            "content_sha": content_sha,
+            "prompt_sha": prompt_sha,
+            "topology_sha": topology_sha,
+            "results": results,
+        }
+        entry.cached_at = datetime.now().isoformat(timespec="seconds")
+        self.files[file_id] = entry
+
+    def drop_match(self, file_id: str) -> None:
+        """Soft fallback: clear the matcher payload for one file (e.g.
+        the cached `matched_jira_key` no longer exists in Jira). The
+        classification + extraction caches are preserved."""
+        entry = self.files.get(file_id)
+        if entry is not None and entry.matcher_payload is not None:
+            entry.matcher_payload = None
 
 
 # ----------------------------------------------------------------------

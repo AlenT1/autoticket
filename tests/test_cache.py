@@ -259,3 +259,171 @@ def test_file_content_sha_changes_with_content(tmp_path: Path):
     b = file_content_sha(p)
     assert a != b
     assert len(a) == 64  # sha256 hex
+
+
+# ----------------------------------------------------------------------
+# Tier 3: matcher decision cache
+# ----------------------------------------------------------------------
+
+
+def _sample_match_results() -> list[dict]:
+    return [
+        {
+            "file_id": "F1",
+            "file_name": "F1.md",
+            "section_index": 0,
+            "extracted_epic_summary": "Sec",
+            "extracted_epic_description": "body",
+            "extracted_epic_assignee_raw": None,
+            "matched_jira_key": "CENTPM-1",
+            "epic_match_confidence": 0.95,
+            "epic_match_reason": "ok",
+            "task_decisions": [],
+            "orphan_keys": [],
+        }
+    ]
+
+
+def test_match_hit_when_content_and_prompt_match():
+    c = Cache()
+    c.set_match(
+        file_id="F1",
+        modified_time="t",
+        content_sha="C",
+        prompt_sha="P",
+        topology_sha="T",
+        results=_sample_match_results(),
+    )
+    hit = c.get_match("F1", content_sha="C", prompt_sha="P")
+    assert hit is not None
+    assert hit[0]["matched_jira_key"] == "CENTPM-1"
+
+
+def test_match_miss_on_content_sha_change():
+    c = Cache()
+    c.set_match(
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
+    )
+    assert c.get_match("F1", content_sha="C2", prompt_sha="P") is None
+
+
+def test_match_hit_survives_topology_change():
+    """Doc-only invalidation: if Jira changes (topology_sha would
+    differ) but the doc and prompts didn't, the cached decision must
+    still be served. Dev edits in Jira don't force re-matching."""
+    c = Cache()
+    c.set_match(
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T-old", results=_sample_match_results(),
+    )
+    # Same lookup key — get_match doesn't even take topology_sha now.
+    assert c.get_match("F1", content_sha="C", prompt_sha="P") is not None
+
+
+def test_match_miss_on_prompt_change():
+    c = Cache()
+    c.set_match(
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
+    )
+    assert c.get_match("F1", content_sha="C", prompt_sha="P2") is None
+
+
+def test_match_miss_on_unknown_file():
+    c = Cache()
+    assert c.get_match("ghost", content_sha="x", prompt_sha="z") is None
+
+
+def test_set_extraction_invalidates_matcher_payload():
+    """A fresh extraction must drop any prior matcher decision — the
+    matcher's input changed."""
+    c = Cache()
+    c.set_match(
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
+    )
+    assert c.get_match("F1", content_sha="C", prompt_sha="P") is not None
+    c.set_extraction(
+        file_id="F1", modified_time="t", content_sha="C2",
+        extraction_payload={"some": "payload"},
+    )
+    assert c.get_match("F1", content_sha="C", prompt_sha="P") is None
+    assert c.get_match("F1", content_sha="C2", prompt_sha="P") is None
+
+
+def test_drop_match_clears_only_matcher_payload():
+    c = Cache()
+    c.set_extraction(
+        file_id="F1", modified_time="t", content_sha="C",
+        extraction_payload={"x": 1},
+    )
+    c.set_match(
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
+    )
+    c.drop_match("F1")
+    assert c.get_match("F1", content_sha="C", prompt_sha="P") is None
+    assert c.get_extraction("F1", "C") == {"x": 1}
+
+
+def test_match_round_trip_via_save_load(tmp_path: Path):
+    p = tmp_path / "cache.json"
+    c = Cache()
+    c.set_match(
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
+    )
+    c.save(p)
+    c2 = Cache.load(p)
+    hit = c2.get_match("F1", content_sha="C", prompt_sha="P")
+    assert hit is not None
+    assert hit[0]["matched_jira_key"] == "CENTPM-1"
+
+
+# ----------------------------------------------------------------------
+# topology + prompt sha helpers
+# ----------------------------------------------------------------------
+
+
+def test_topology_sha_stable_for_same_input():
+    from jira_task_agent.pipeline.matcher import compute_project_topology_sha
+    tree = {
+        "epics": [
+            {"key": "K1", "summary": "S1", "description": "d1",
+             "children": [{"key": "C1", "summary": "cs", "status": "Backlog", "description": ""}]},
+        ],
+    }
+    assert compute_project_topology_sha(tree) == compute_project_topology_sha(tree)
+
+
+def test_topology_sha_changes_on_child_status():
+    from jira_task_agent.pipeline.matcher import compute_project_topology_sha
+    base_child = {"key": "C1", "summary": "cs", "status": "Backlog", "description": ""}
+    tree = {"epics": [{"key": "K1", "summary": "S1", "description": "", "children": [base_child]}]}
+    a = compute_project_topology_sha(tree)
+    base_child["status"] = "Done"
+    b = compute_project_topology_sha(tree)
+    assert a != b
+
+
+def test_topology_sha_changes_on_epic_added():
+    from jira_task_agent.pipeline.matcher import compute_project_topology_sha
+    tree = {"epics": [{"key": "K1", "summary": "S1", "description": "", "children": []}]}
+    a = compute_project_topology_sha(tree)
+    tree["epics"].append({"key": "K2", "summary": "S2", "description": "", "children": []})
+    b = compute_project_topology_sha(tree)
+    assert a != b
+
+
+def test_topology_sha_stable_under_reorder():
+    from jira_task_agent.pipeline.matcher import compute_project_topology_sha
+    a = compute_project_topology_sha({"epics": [
+        {"key": "K1", "summary": "S1", "description": "", "children": []},
+        {"key": "K2", "summary": "S2", "description": "", "children": []},
+    ]})
+    b = compute_project_topology_sha({"epics": [
+        {"key": "K2", "summary": "S2", "description": "", "children": []},
+        {"key": "K1", "summary": "S1", "description": "", "children": []},
+    ]})
+    assert a == b  # sorted internally — order in payload doesn't matter
