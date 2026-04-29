@@ -30,7 +30,7 @@ from .drive.client import DriveFile, build_service, download_file, list_folder
 from .jira.client import JiraClient
 from .jira.project_tree import fetch_project_tree
 from .pipeline.classifier import ClassifyResult, classify_file
-from .pipeline.commenter import format_manual_edit_comment, format_update_comment
+from .pipeline.commenter import format_update_comment
 from .pipeline.context_bundler import bundle_root_context
 from .pipeline.dedupe import find_duplicate_copies
 from .pipeline.file_extract import extract_or_reuse
@@ -459,9 +459,6 @@ def _apply_epic_action(
         jira.update_issue(a.target_key, fields)
         jira.post_comment(a.target_key, _comment_for(a, drive_file=drive_file, jira=jira))
         return a.target_key
-    if a.kind == "skip_manual_edits":
-        jira.post_comment(a.target_key, format_manual_edit_comment(drive_file))
-        return a.target_key
     if a.kind == "noop":
         return a.target_key
     return None
@@ -501,9 +498,6 @@ def _apply_task_action(
             fields["assignee"] = {"name": a.assignee_username}
         jira.update_issue(a.target_key, fields)
         jira.post_comment(a.target_key, _comment_for(a, drive_file=drive_file, jira=jira))
-        return
-    if a.kind == "skip_manual_edits":
-        jira.post_comment(a.target_key, format_manual_edit_comment(drive_file))
         return
     # noop / orphan: nothing to write
 

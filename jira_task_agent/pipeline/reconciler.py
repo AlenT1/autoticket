@@ -1,5 +1,5 @@
-"""Build ReconcilePlans (create / update / no-op / orphan / skip_manual_edits
-actions) from a pre-computed MatcherResult.
+"""Build ReconcilePlans (create / update / no-op / orphan actions) from a
+pre-computed MatcherResult.
 
 The reconciler is now PURE LOGIC — no LLM calls. The matcher is run
 once per `run_once()` ahead of time (see `pipeline.matcher.run_matcher`),
@@ -8,8 +8,10 @@ producing one `FileEpicResult` per extracted epic. The reconciler:
   1. Fetches live Jira issue content for matched epics + their children.
   2. Compares (after normalizing markdown→wiki on the extracted side).
   3. Emits Actions:
-       create_epic, update_epic, noop, skip_manual_edits  (epic-level)
-       create_task, update_task, noop, orphan, skip_manual_edits (task-level)
+       create_epic, update_epic, noop                (epic-level)
+       create_task, update_task, noop, orphan        (task-level)
+       skip_completed_epic                           (status-guard)
+       covered_by_rollup                             (rollup pattern)
 
 This lets the runner separate "what pairs with what" (LLM, batched) from
 "what to write to Jira given the pairing" (deterministic, per-file).
@@ -82,9 +84,6 @@ class Action:
     #   update_task         — existing task, content differs, will be updated
     #   noop                — matched, content equal — nothing to do
     #   orphan              — Jira child has no extracted-task counterpart
-    #   skip_manual_edits   — agent marker missing in description; agent will
-    #                          not overwrite. Posts a "manual edits detected"
-    #                          comment instead.
     #   skip_completed_epic — matched epic is in a completed status (Done /
     #                          In Staging / In Review / Closed / Cancelled /
     #                          Resolved). The agent treats the work as done
@@ -170,12 +169,6 @@ def _descriptions_equal(extracted_md: str | None, live_text: str | None) -> bool
     return _normalize(extracted_wiki) == _normalize(live_text)
 
 
-def _has_marker_or_empty(desc: str | None) -> bool:
-    if not desc:
-        return True
-    return AGENT_MARKER in desc
-
-
 def _resolve_assignee(client: JiraClient, raw: str | None) -> str | None:
     return client.resolve_assignee_username(raw) if raw else None
 
@@ -236,21 +229,6 @@ def _build_epic_action(
             live,
         )
 
-    if not _has_marker_or_empty(live.get("description")):
-        return (
-            Action(
-                kind="skip_manual_edits",
-                target_key=epic_key,
-                epic_anchor=epic_anchor,
-                match_confidence=match_confidence,
-                match_reason=match_reason,
-                note=(
-                    "epic description appears hand-edited (no agent marker). "
-                    "Skipping update to avoid clobbering."
-                ),
-            ),
-            live,
-        )
     # No-rename rule on adoption: if the matcher picked the wrong epic,
     # the title is the loudest visible signal. Renaming someone else's
     # epic is the worst-case false-positive blast. We always keep the
@@ -365,19 +343,6 @@ def _build_task_actions(
 
         # Normal 1:1 path.
         live = children_by_key.get(matched_key, {})
-        if not _has_marker_or_empty(live.get("description")):
-            actions.append(
-                Action(
-                    kind="skip_manual_edits",
-                    target_key=matched_key,
-                    epic_key=epic_key,
-                    epic_anchor=epic_anchor,
-                    match_confidence=decision.confidence,
-                    match_reason=decision.reason,
-                    note="task description appears hand-edited (no agent marker)",
-                )
-            )
-            continue
         if (
             _normalize(live.get("summary")) == _normalize(t.summary)
             and _descriptions_equal(t.description, live.get("description"))

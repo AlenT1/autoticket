@@ -36,9 +36,11 @@ Jira project ─► fetch_project_tree (1 paginated /search)
 - **Status guard** — matched epics in `In Staging / In Review / Done /
   Closed / Resolved / Cancelled / Won't Do / Won't Fix` emit
   `skip_completed_epic` and are not touched.
-- **Manual-edit guard** — every agent-written description ends with the
-  HTML marker `<!-- managed-by:jira-task-agent v1 -->`. Issues whose
-  description lacks the marker → `skip_manual_edits`, no overwrite.
+- **Doc-as-source-of-truth** — every agent-written description ends with
+  `<!-- managed-by:jira-task-agent v1 -->` as a "last-touched-by-agent"
+  indicator. Doc edits that map to existing Jira issues trigger
+  `update_*` regardless of who previously authored the live description;
+  the changelog comment notifies the human reviewer.
 - **Identification by remote-link**, never by label. `ai-generated` is a
   content marker only, set automatically on every agent-created issue.
 - **Confidence floors** — `epic = 0.90`, `task = 0.70`. Stage-1 epic
@@ -124,7 +126,8 @@ Discussion points:
 **What it shows:** the most complex path + warm-cache speedup. May1 has
 9 sub-epics + ~40 tasks; the matcher correctly adopts 6 existing CENTPM
 epics, creates 1 new sub-epic where there's no good match, correctly
-skips an in-staging epic, and detects 28 manual-edit cases.
+skips an in-staging epic, and updates the rest of the matched children
+with the doc's content.
 
 ### 2a. Cold run — full pipeline (~5 min)
 
@@ -144,8 +147,8 @@ extractions:        ok=1 failed=0
 cache hits:         classify=0  extract=0  match=0
 actions by kind:    {'update_epic': 7, 'create_epic': 1,
                      'skip_completed_epic': 1, 'create_task': 11,
-                     'skip_manual_edits': 28, 'orphan': 24}
-capture: 66 intended write(s) recorded to data/would_send_may1.json
+                     'update_task': 28, 'orphan': 24}
+capture written to data/would_send_may1.json
 ```
 
 ### 2b. Warm run — reuse caches except for May1
@@ -193,8 +196,8 @@ Discussion points:
   (extractor proposed '<other>', ignored)`.
 - **Status guard fires** on V0 NextJS migration → CENTPM-1238 In Staging
   → `skip_completed_epic`, no writes for that group.
-- **Manual-edit guard fires** on 28 existing children → `skip_manual_edits`
-  (these were created by humans pre-agent and have no marker).
+- **Doc-as-source-of-truth** — existing CENTPM children get `update_task`
+  with a changelog comment; the prior body remains in Jira's edit history.
 - **Conservative new-epic creation** — Monitoring readiness creates a
   fresh epic instead of adopting CENTPM-1179 because that candidate's
   children are mostly Done and describe a different scope (logging vs.

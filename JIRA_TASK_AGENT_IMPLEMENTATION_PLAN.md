@@ -177,10 +177,8 @@ Given the matcher's decisions, `build_plans_from_match` produces one
 - `create_epic` — extracted epic has no match (or below confidence floor).
 - `update_epic` — match found, descriptions differ after normalization
   (extracted markdown is run through `_md_to_jira_wiki` first so we compare
-  apples-to-apples), agent marker present.
+  apples-to-apples).
 - `noop` — match found, descriptions equivalent.
-- `skip_manual_edits` — match found but the agent marker is missing /
-  diverged → post a "manual edits detected" comment, do NOT overwrite.
 - `skip_completed_epic` — matched epic is in a terminal status; no writes.
 - `create_task` — extracted task with no candidate from Stage 2.
 - `update_task` — candidate found, content differs.
@@ -202,20 +200,21 @@ This is bounded (proportional to project size, one round-trip) and complete
 (every candidate, including `Done` / `Cancelled` children, is inspected for
 matching — no pre-filtering by status).
 
-### Manual-edit protection
+### Agent-touch marker
 
-To detect "someone hand-edited this issue in Jira between runs," every
-agent-written description ends with a hidden marker:
+Every agent-written description ends with a hidden marker:
 
 ```
 <!-- managed-by:jira-task-agent v1 -->
 ```
 
-Before any update, the agent looks for the marker. If it's absent, or the
-body around it has clearly diverged from what the agent would have written
-(LLM judgement), the agent **skips the update** and posts a "manual edits
-detected — agent will not overwrite" comment instead. Heuristic, but enough
-to prevent surprise overwrites without needing a stored hash.
+It indicates "the agent last touched this body" — useful for humans
+browsing Jira and for future tooling that wants to filter to
+agent-managed issues. The doc is the source of truth: when a doc edit
+maps to an existing Jira issue, the agent updates the issue regardless
+of who previously authored its description, and posts a changelog
+comment naming the source doc + last editor so the human reviewer
+sees what changed and why.
 
 ## 7. Update flow + Jira comment with @mention
 
@@ -377,7 +376,7 @@ Legend: ✅ done · 🟡 partial · ⏳ not started
 
 ### Phase 4 — commenter + change-tracking ✅
 - `pipeline/commenter.py` — `format_update_comment` with `[~name]` mention + LLM-summarised changelog bullets. ✅
-- HTML-comment marker (`<!-- managed-by:jira-task-agent v1 -->`) on every agent-written description, used to detect manual edits. ✅
+- HTML-comment marker (`<!-- managed-by:jira-task-agent v1 -->`) on every agent-written description as a "last-touched-by-agent" indicator. ✅
 - Unassigned / no-reporter fallback. ✅
 
 ### Phase 5 — comparator (matcher + reconciler) ✅
@@ -428,9 +427,8 @@ Legend: ✅ done · 🟡 partial · ⏳ not started
 | 2 | Five files share the name `May1_Initial_Version_Tasks.md` — multiple may be `task` role. | If multiple `task` classifications collide on cleaned-name, prefer the most recently   |
 |   |                                                                                          | edited; flag the others as duplicates in the report.                                  |
 | 3 | Jira `@mention` username (`name`) differs from email/displayName.                        | Resolve once via `/issue/{key}` and cache per assignee.                                |
-| 4 | Updating descriptions could overwrite hand-edits made directly in Jira.                  | HTML-comment marker (`<!-- managed-by:jira-task-agent v1 -->`) on every agent-written  |
-|   |                                                                                          | description. Update is skipped + a "manual edits detected" comment is posted if the    |
-|   |                                                                                          | marker is missing or the body has clearly diverged. See §6.                            |
+| 4 | Updating descriptions could overwrite hand-edits made directly in Jira.                  | The doc is the source of truth: doc edits trigger updates and post a changelog comment |
+|   |                                                                                          | naming the source doc + last editor. The previous body remains in Jira's edit history. |
 | 5 | Token cost of LLM calls (re-extracting unchanged docs every run).                        | The `last_run_at` cursor filters Drive to files with `modifiedTime > last_run_at`, so  |
 |   |                                                                                          | the extractor only sees files that actually moved since last success.                  |
 | 6 | What to do with `task` files that no longer exist in Drive (deleted / moved).            | **OPEN.** Default proposal: leave existing Jira issues alone, surface in the report.   |
@@ -450,8 +448,9 @@ Legend: ✅ done · 🟡 partial · ⏳ not started
    - Posts exactly one comment, tagging the current assignee with `[~name]`,
      showing the before/after summary + a description-change summary.
 4. Manually editing a Jira description (outside the agent) and re-running
-   does NOT silently overwrite — instead the agent posts a "manual edits
-   detected" comment and skips the update.
+   results in the doc-side update being applied, with a changelog comment
+   on the issue naming the source doc + last editor. Prior content is
+   preserved in Jira's edit history.
 5. The agent runs unattended for 7 days on its schedule with no manual
    intervention; report stays green.
 6. A manual one-shot (`python -m jira_task_agent run`) executed on the same

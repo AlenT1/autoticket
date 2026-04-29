@@ -83,11 +83,12 @@ There is no `token_set_ratio`, `rapidfuzz`, or string heuristic in the matching 
 
 ### Reconciler is pure logic
 
-`build_plans_from_match` only emits actions; it never calls the LLM. Action `kind` values: `create_epic`, `update_epic`, `noop`, `skip_manual_edits`, `skip_completed_epic`, `create_task`, `update_task`, `covered_by_rollup`, `orphan`.
+`build_plans_from_match` only emits actions; it never calls the LLM. Action `kind` values: `create_epic`, `update_epic`, `noop`, `skip_completed_epic`, `create_task`, `update_task`, `covered_by_rollup`, `orphan`.
 
-Two guards live here:
+One guard lives here:
 - **Status guard** — `_COMPLETED_EPIC_STATUSES = {In Staging, In Review, Done, Closed, Resolved, Cancelled, Won't Do, Won't Fix}`. Active statuses: `Backlog`, `In Progress`.
-- **Manual-edit guard** — every agent-written description ends with `<!-- managed-by:jira-task-agent v1 -->`. If absent or body has clearly diverged → `skip_manual_edits` + a "manual edits detected" comment, no overwrite.
+
+The doc is the source of truth: a doc edit that maps to an existing Jira issue triggers `update_*` regardless of whether the live description was previously written by a human or by the agent. The changelog comment posted alongside the update notifies the human reviewer; their prior body remains in Jira's edit history. The agent stamps `<!-- managed-by:jira-task-agent v1 -->` on every description it writes — useful as a "last-touched-by-agent" indicator but not consulted as a write gate.
 
 ### Boundary conventions
 

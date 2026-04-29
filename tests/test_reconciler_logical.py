@@ -8,7 +8,7 @@ calls. Tests construct a `MatcherResult` directly and call
   - matched epic + content unchanged → `noop`
   - partial-match + extra child → some `noop`/`update_task`/`create_task`
                                  + `orphan`
-  - manual-edit on epic   → `skip_manual_edits`
+  - matched epic with non-agent description → `update_epic`
   - multi-epic file       → multiple groups, distinct match decisions
 """
 from __future__ import annotations
@@ -343,8 +343,10 @@ def test_partial_match_creates_orphans_and_new():
     assert orphan.target_key == "DEMO-103"
 
 
-def test_manual_edit_skips_epic_update():
-    """Matched epic but no agent marker in description → skip_manual_edits."""
+def test_matched_epic_is_updated_regardless_of_prior_author():
+    """A matched epic gets updated when the doc changes. The doc is
+    the source of truth. The changelog comment informs the human
+    reviewer; their previous body remains in Jira's edit history."""
     client = MockJiraClient(
         issues={
             "DEMO-100": _live_issue(
@@ -377,8 +379,12 @@ def test_manual_edit_skips_epic_update():
     )
 
     grp = plans[0].groups[0]
-    assert grp.epic_action.kind == "skip_manual_edits"
+    assert grp.epic_action.kind == "update_epic"
     assert grp.epic_action.target_key == "DEMO-100"
+    # No-rename rule: live summary is preserved.
+    assert grp.epic_action.summary == "Demo epic"
+    # Description is the agent's new content (with marker stamped on).
+    assert AGENT_MARKER in (grp.epic_action.description or "")
 
 
 def test_skip_completed_epic_suppresses_task_actions():

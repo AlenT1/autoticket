@@ -84,16 +84,3 @@ def format_update_comment(
     parts.append(bullets)
 
     return "\n".join(parts)
-
-
-def format_manual_edit_comment(drive_file: DriveFile) -> str:
-    return (
-        "Manual edits detected on this issue (no agent marker found in the "
-        "description). The doc-sync agent skipped the update to avoid "
-        "overwriting hand-edits.\n\n"
-        f"Source doc: [{drive_file.name}]({drive_file.web_view_link or ''})\n"
-        f"Last edited by: {drive_file.last_modifying_user_name or 'unknown'}\n\n"
-        "If you want the agent to take over again, remove the manual edits "
-        "or restore the marker line `<!-- managed-by:jira-task-agent v1 -->` "
-        "at the end of the description."
-    )
