@@ -416,6 +416,58 @@ def test_topology_sha_changes_on_epic_added():
     assert a != b
 
 
+def test_diff_payload_round_trip():
+    c = Cache()
+    c.set_classification(
+        file_id="F1", modified_time="t", content_sha="C", role="single_epic",
+        confidence=1.0, reason="x",
+    )
+    c.set_diff_payload(
+        file_id="F1",
+        chunks={"A. Sec|0": "sha-A", "B. Sec|0": "sha-B"},
+        task_anchors={
+            "SEC-1 anchor": {"chunk_id": "A. Sec|0", "body_sha": "sha-A"},
+            "SEC-2 anchor": {"chunk_id": "A. Sec|0", "body_sha": "sha-A"},
+        },
+    )
+    assert c.get_chunks("F1") == {"A. Sec|0": "sha-A", "B. Sec|0": "sha-B"}
+    anchors = c.get_task_anchors("F1")
+    assert anchors["SEC-1 anchor"]["chunk_id"] == "A. Sec|0"
+    assert anchors["SEC-2 anchor"]["body_sha"] == "sha-A"
+
+
+def test_diff_payload_save_load(tmp_path: Path):
+    p = tmp_path / "cache.json"
+    c = Cache()
+    c.set_classification(
+        file_id="F1", modified_time="t", content_sha="C", role="single_epic",
+        confidence=1.0, reason="x",
+    )
+    c.set_diff_payload(
+        file_id="F1",
+        chunks={"A|0": "sha-A"},
+        task_anchors={"a1": {"chunk_id": "A|0", "body_sha": "sha-A"}},
+    )
+    c.save(p)
+    c2 = Cache.load(p)
+    assert c2.get_chunks("F1") == {"A|0": "sha-A"}
+    assert c2.get_task_anchors("F1")["a1"]["chunk_id"] == "A|0"
+
+
+def test_diff_payload_missing_file_returns_empty():
+    c = Cache()
+    assert c.get_chunks("ghost") == {}
+    assert c.get_task_anchors("ghost") == {}
+
+
+def test_diff_payload_set_requires_existing_entry():
+    """set_diff_payload silently does nothing when file_id has no entry —
+    classification must be set first. This prevents partial entries."""
+    c = Cache()
+    c.set_diff_payload(file_id="ghost", chunks={"a": "1"}, task_anchors={})
+    assert "ghost" not in c.files
+
+
 def test_topology_sha_stable_under_reorder():
     from jira_task_agent.pipeline.matcher import compute_project_topology_sha
     a = compute_project_topology_sha({"epics": [

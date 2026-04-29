@@ -45,7 +45,7 @@ from .pipeline.extractor import (
 )
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 DEFAULT_CACHE_PATH = Path("data/cache.json")
 
 
@@ -184,6 +184,21 @@ class FileCacheEntry:
     # The reconciler's per-issue manual-edit + status guards still
     # protect the apply path on doc-changed runs.
     matcher_payload: dict | None = None
+    # Diff-aware cache (per-chunk shas + per-task chunk ownership).
+    # Shape:
+    #   {
+    #     "chunks":      { "<chunk_id>": "<body_sha>", ... },
+    #     "task_anchors": {
+    #         "<source_anchor>": {
+    #             "chunk_id":  "<chunk_id>",
+    #             "body_sha":  "<sha at decision time>"
+    #         },
+    #         ...
+    #     }
+    #   }
+    # Used by the runner to decide which extracted tasks were in changed
+    # chunks (need re-match) vs unchanged chunks (reuse cached match).
+    diff_payload: dict | None = None
     cached_at: str = ""
 
     def to_json(self) -> dict:
@@ -195,6 +210,7 @@ class FileCacheEntry:
             "classification_reason": self.classification_reason,
             "extraction_payload": self.extraction_payload,
             "matcher_payload": self.matcher_payload,
+            "diff_payload": self.diff_payload,
             "cached_at": self.cached_at,
         }
 
@@ -209,6 +225,7 @@ class FileCacheEntry:
             classification_reason=raw.get("classification_reason"),
             extraction_payload=raw.get("extraction_payload"),
             matcher_payload=raw.get("matcher_payload"),
+            diff_payload=raw.get("diff_payload"),
             cached_at=raw.get("cached_at", ""),
         )
 
@@ -406,6 +423,43 @@ class Cache:
         }
         entry.cached_at = datetime.now().isoformat(timespec="seconds")
         self.files[file_id] = entry
+
+    # ---- Diff-aware cache: per-chunk shas + per-task chunk ownership ---
+
+    def get_chunks(self, file_id: str) -> dict[str, str]:
+        """Returns the cached `{chunk_id: body_sha}` map for this file.
+        Empty dict if no diff payload."""
+        entry = self.files.get(file_id)
+        if entry is None or entry.diff_payload is None:
+            return {}
+        chunks = entry.diff_payload.get("chunks") or {}
+        return chunks if isinstance(chunks, dict) else {}
+
+    def get_task_anchors(self, file_id: str) -> dict[str, dict]:
+        """Returns the cached `{source_anchor: {chunk_id, body_sha}}`
+        map for this file. Empty if no diff payload."""
+        entry = self.files.get(file_id)
+        if entry is None or entry.diff_payload is None:
+            return {}
+        anchors = entry.diff_payload.get("task_anchors") or {}
+        return anchors if isinstance(anchors, dict) else {}
+
+    def set_diff_payload(
+        self,
+        *,
+        file_id: str,
+        chunks: dict[str, str],
+        task_anchors: dict[str, dict],
+    ) -> None:
+        """Persist per-chunk shas + per-task ownership for this file."""
+        entry = self.files.get(file_id)
+        if entry is None:
+            return  # caller should ensure entry exists via set_classification first
+        entry.diff_payload = {
+            "chunks": dict(chunks),
+            "task_anchors": dict(task_anchors),
+        }
+        entry.cached_at = datetime.now().isoformat(timespec="seconds")
 
     def drop_match(self, file_id: str) -> None:
         """Soft fallback: clear the matcher payload for one file (e.g.
