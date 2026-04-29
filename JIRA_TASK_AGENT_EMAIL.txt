@@ -1,0 +1,19 @@
+Subject: Jira Task Agent — design ready for review
+
+Hi,
+
+Drafted the plan for the agent that will keep CENTPM in sync with the
+planning docs in our shared Drive folder. Two attachments:
+
+- JIRA_TASK_AGENT_OVERVIEW.md — goal, flow, how documents map to tracker
+  entries, and current status.
+- JIRA_TASK_AGENT_IMPLEMENTATION_PLAN.md — engineering detail
+  (architecture, classifier/extractor, reconcile logic, rollout).
+
+Drive listing/download and the Jira read path are already working
+end-to-end. Remaining: classification, extraction, write path,
+orchestrator.
+
+
+Thanks,
+Saar
