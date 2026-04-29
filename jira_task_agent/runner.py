@@ -313,11 +313,20 @@ def run_once(
         return report
 
     # 8. Matcher (with Tier 3 cache: per-file matcher decisions) ----------
-    # Cache invariant: a cached decision for `file_id` is reusable when
-    # ALL of (content_sha, topology_sha, prompt_sha) match the entry. Any
-    # mismatch falls through to a fresh matcher call for that file.
+    # Cache invariant: a cached decision is reusable when (content_sha,
+    # prompt_sha) both match. The doc is the source of truth; dev edits
+    # in Jira don't invalidate — their edits must stay. The reconciler's
+    # per-issue manual-edit + status guards still protect the apply path
+    # on doc-changed runs.
+    #
+    # Soft fallback: if a cached `matched_jira_key` no longer exists in
+    # the current project_tree (epic was deleted), drop the cache entry
+    # for that file and fall through to a fresh match.
     topology_sha = compute_project_topology_sha(project_tree)
     prompt_sha = compute_matcher_prompt_sha()
+    live_epic_keys: set[str] = {
+        e.get("key") for e in (project_tree.get("epics") or []) if e.get("key")
+    }
 
     cached_results: list[FileEpicResult] = []
     fresh_extractions: list[tuple[object, object]] = []
@@ -327,36 +336,53 @@ def run_once(
         fid = ext.file_id
         csha = content_shas.get(fid, "")
         cached = (
-            cache.get_match(
-                fid,
-                content_sha=csha,
-                topology_sha=topology_sha,
-                prompt_sha=prompt_sha,
-            )
+            cache.get_match(fid, content_sha=csha, prompt_sha=prompt_sha)
             if use_cache and csha
             else None
         )
         if cached is not None:
+            # Validate referenced Jira keys still exist (soft fallback).
+            stale_key = next(
+                (
+                    r.get("matched_jira_key")
+                    for r in cached
+                    if r.get("matched_jira_key")
+                    and r["matched_jira_key"] not in live_epic_keys
+                ),
+                None,
+            )
+            if stale_key is not None:
+                logger.info(
+                    "matcher cache STALE for %s: cached match %s no longer in "
+                    "project tree; re-running matcher for this file",
+                    ext.file_name, stale_key,
+                )
+                cache.drop_match(fid)
+                cached = None
+        if cached is not None:
+            this_file: list[FileEpicResult] = []
+            ok = True
             for r in cached:
                 try:
-                    cached_results.append(file_epic_result_from_json(r))
+                    this_file.append(file_epic_result_from_json(r))
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
-                        "matcher cache: failed to deserialize entry for %s (%s); "
-                        "treating as miss",
+                        "matcher cache: failed to deserialize entry for %s "
+                        "(%s); treating as miss",
                         fid, e,
                     )
-                    cached = None
+                    ok = False
                     break
-        if cached is None:
-            fresh_extractions.append((drive_file, ext))
-            fresh_keys.append((fid, csha))
-        else:
-            report.cache_hits_match += 1
-            logger.info(
-                "matcher cache HIT: %s (%d section result(s))",
-                ext.file_name, len(cached),
-            )
+            if ok:
+                cached_results.extend(this_file)
+                report.cache_hits_match += 1
+                logger.info(
+                    "matcher cache HIT: %s (%d section result(s))",
+                    ext.file_name, len(this_file),
+                )
+                continue
+        fresh_extractions.append((drive_file, ext))
+        fresh_keys.append((fid, csha))
 
     fresh_results: list[FileEpicResult] = []
     if fresh_extractions:
@@ -402,8 +428,8 @@ def run_once(
                     file_id=fid,
                     modified_time=mtime_iso,
                     content_sha=csha,
-                    topology_sha=topology_sha,
                     prompt_sha=prompt_sha,
+                    topology_sha=topology_sha,
                     results=results_by_file_id.get(fid, []),
                 )
     else:

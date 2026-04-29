@@ -284,17 +284,17 @@ def _sample_match_results() -> list[dict]:
     ]
 
 
-def test_match_hit_when_all_three_shas_match():
+def test_match_hit_when_content_and_prompt_match():
     c = Cache()
     c.set_match(
         file_id="F1",
         modified_time="t",
         content_sha="C",
-        topology_sha="T",
         prompt_sha="P",
+        topology_sha="T",
         results=_sample_match_results(),
     )
-    hit = c.get_match("F1", content_sha="C", topology_sha="T", prompt_sha="P")
+    hit = c.get_match("F1", content_sha="C", prompt_sha="P")
     assert hit is not None
     assert hit[0]["matched_jira_key"] == "CENTPM-1"
 
@@ -302,33 +302,37 @@ def test_match_hit_when_all_three_shas_match():
 def test_match_miss_on_content_sha_change():
     c = Cache()
     c.set_match(
-        file_id="F1", modified_time="t", content_sha="C", topology_sha="T",
-        prompt_sha="P", results=_sample_match_results(),
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
     )
-    assert c.get_match("F1", content_sha="C2", topology_sha="T", prompt_sha="P") is None
+    assert c.get_match("F1", content_sha="C2", prompt_sha="P") is None
 
 
-def test_match_miss_on_topology_change():
+def test_match_hit_survives_topology_change():
+    """Doc-only invalidation: if Jira changes (topology_sha would
+    differ) but the doc and prompts didn't, the cached decision must
+    still be served. Dev edits in Jira don't force re-matching."""
     c = Cache()
     c.set_match(
-        file_id="F1", modified_time="t", content_sha="C", topology_sha="T",
-        prompt_sha="P", results=_sample_match_results(),
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T-old", results=_sample_match_results(),
     )
-    assert c.get_match("F1", content_sha="C", topology_sha="T2", prompt_sha="P") is None
+    # Same lookup key — get_match doesn't even take topology_sha now.
+    assert c.get_match("F1", content_sha="C", prompt_sha="P") is not None
 
 
 def test_match_miss_on_prompt_change():
     c = Cache()
     c.set_match(
-        file_id="F1", modified_time="t", content_sha="C", topology_sha="T",
-        prompt_sha="P", results=_sample_match_results(),
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
     )
-    assert c.get_match("F1", content_sha="C", topology_sha="T", prompt_sha="P2") is None
+    assert c.get_match("F1", content_sha="C", prompt_sha="P2") is None
 
 
 def test_match_miss_on_unknown_file():
     c = Cache()
-    assert c.get_match("ghost", content_sha="x", topology_sha="y", prompt_sha="z") is None
+    assert c.get_match("ghost", content_sha="x", prompt_sha="z") is None
 
 
 def test_set_extraction_invalidates_matcher_payload():
@@ -336,28 +340,43 @@ def test_set_extraction_invalidates_matcher_payload():
     matcher's input changed."""
     c = Cache()
     c.set_match(
-        file_id="F1", modified_time="t", content_sha="C", topology_sha="T",
-        prompt_sha="P", results=_sample_match_results(),
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
     )
-    assert c.get_match("F1", content_sha="C", topology_sha="T", prompt_sha="P") is not None
+    assert c.get_match("F1", content_sha="C", prompt_sha="P") is not None
     c.set_extraction(
         file_id="F1", modified_time="t", content_sha="C2",
         extraction_payload={"some": "payload"},
     )
-    assert c.get_match("F1", content_sha="C", topology_sha="T", prompt_sha="P") is None
-    assert c.get_match("F1", content_sha="C2", topology_sha="T", prompt_sha="P") is None
+    assert c.get_match("F1", content_sha="C", prompt_sha="P") is None
+    assert c.get_match("F1", content_sha="C2", prompt_sha="P") is None
+
+
+def test_drop_match_clears_only_matcher_payload():
+    c = Cache()
+    c.set_extraction(
+        file_id="F1", modified_time="t", content_sha="C",
+        extraction_payload={"x": 1},
+    )
+    c.set_match(
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
+    )
+    c.drop_match("F1")
+    assert c.get_match("F1", content_sha="C", prompt_sha="P") is None
+    assert c.get_extraction("F1", "C") == {"x": 1}
 
 
 def test_match_round_trip_via_save_load(tmp_path: Path):
     p = tmp_path / "cache.json"
     c = Cache()
     c.set_match(
-        file_id="F1", modified_time="t", content_sha="C", topology_sha="T",
-        prompt_sha="P", results=_sample_match_results(),
+        file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
+        topology_sha="T", results=_sample_match_results(),
     )
     c.save(p)
     c2 = Cache.load(p)
-    hit = c2.get_match("F1", content_sha="C", topology_sha="T", prompt_sha="P")
+    hit = c2.get_match("F1", content_sha="C", prompt_sha="P")
     assert hit is not None
     assert hit[0]["matched_jira_key"] == "CENTPM-1"
 
