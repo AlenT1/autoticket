@@ -43,7 +43,15 @@ from .pipeline.extractor import (
     extract_from_file,
     extract_multi_from_file,
 )
-from .pipeline.matcher import run_matcher
+from .pipeline.matcher import (
+    FileEpicResult,
+    MatcherResult,
+    compute_matcher_prompt_sha,
+    compute_project_topology_sha,
+    file_epic_result_from_json,
+    file_epic_result_to_json,
+    run_matcher,
+)
 from .pipeline.reconciler import (
     Action,
     EpicGroup,
@@ -67,6 +75,7 @@ class RunReport:
     extractions_failed: int = 0
     cache_hits_classify: int = 0
     cache_hits_extract: int = 0
+    cache_hits_match: int = 0
     actions_by_kind: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     plans: list[ReconcilePlan] = field(default_factory=list)
@@ -303,22 +312,107 @@ def run_once(
         report.finished_at = datetime.now(tz=timezone.utc)
         return report
 
-    # 8. Matcher: ONE call across all extractions -------------------------
-    try:
-        matcher_result = run_matcher(
-            extractions,
-            project_tree,
-            batch_size=matcher_batch_size,
-            max_workers=matcher_max_workers,
+    # 8. Matcher (with Tier 3 cache: per-file matcher decisions) ----------
+    # Cache invariant: a cached decision for `file_id` is reusable when
+    # ALL of (content_sha, topology_sha, prompt_sha) match the entry. Any
+    # mismatch falls through to a fresh matcher call for that file.
+    topology_sha = compute_project_topology_sha(project_tree)
+    prompt_sha = compute_matcher_prompt_sha()
+
+    cached_results: list[FileEpicResult] = []
+    fresh_extractions: list[tuple[object, object]] = []
+    fresh_keys: list[tuple[str, str]] = []  # (file_id, content_sha) per fresh entry
+
+    for drive_file, ext in extractions:
+        fid = ext.file_id
+        csha = content_shas.get(fid, "")
+        cached = (
+            cache.get_match(
+                fid,
+                content_sha=csha,
+                topology_sha=topology_sha,
+                prompt_sha=prompt_sha,
+            )
+            if use_cache and csha
+            else None
         )
+        if cached is not None:
+            for r in cached:
+                try:
+                    cached_results.append(file_epic_result_from_json(r))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "matcher cache: failed to deserialize entry for %s (%s); "
+                        "treating as miss",
+                        fid, e,
+                    )
+                    cached = None
+                    break
+        if cached is None:
+            fresh_extractions.append((drive_file, ext))
+            fresh_keys.append((fid, csha))
+        else:
+            report.cache_hits_match += 1
+            logger.info(
+                "matcher cache HIT: %s (%d section result(s))",
+                ext.file_name, len(cached),
+            )
+
+    fresh_results: list[FileEpicResult] = []
+    if fresh_extractions:
+        try:
+            fresh_matcher_result = run_matcher(
+                fresh_extractions,
+                project_tree,
+                batch_size=matcher_batch_size,
+                max_workers=matcher_max_workers,
+            )
+            fresh_results = list(fresh_matcher_result.file_results)
+            logger.info(
+                "matcher: %d epic decision(s) across %d uncached file(s) "
+                "(cache hits: %d)",
+                len(fresh_results), len(fresh_extractions), report.cache_hits_match,
+            )
+        except Exception as e:  # noqa: BLE001
+            report.errors.append(f"matcher failed: {e}")
+            report.finished_at = datetime.now(tz=timezone.utc)
+            return report
+
+        # Persist fresh decisions back to the cache, grouped per file.
+        results_by_file_id: dict[str, list[dict]] = {}
+        for fr in fresh_results:
+            results_by_file_id.setdefault(fr.file_id, []).append(
+                file_epic_result_to_json(fr)
+            )
+        if use_cache:
+            for fid, csha in fresh_keys:
+                # Look up the corresponding extraction's mtime for cache bookkeeping.
+                ext = next(
+                    (e for _, e in fresh_extractions if e.file_id == fid), None
+                )
+                drive_file_for_id = next(
+                    (df for df, e in fresh_extractions if e.file_id == fid), None
+                )
+                mtime_iso = (
+                    drive_file_for_id.modified_time.isoformat()
+                    if drive_file_for_id is not None
+                    else ""
+                )
+                cache.set_match(
+                    file_id=fid,
+                    modified_time=mtime_iso,
+                    content_sha=csha,
+                    topology_sha=topology_sha,
+                    prompt_sha=prompt_sha,
+                    results=results_by_file_id.get(fid, []),
+                )
+    else:
         logger.info(
-            "matcher: %d epic decisions across %d files",
-            len(matcher_result.file_results), len(extractions),
+            "matcher: 0 LLM calls — all %d file(s) served from Tier 3 cache",
+            report.cache_hits_match,
         )
-    except Exception as e:  # noqa: BLE001
-        report.errors.append(f"matcher failed: {e}")
-        report.finished_at = datetime.now(tz=timezone.utc)
-        return report
+
+    matcher_result = MatcherResult(file_results=cached_results + fresh_results)
 
     # 9. Build ReconcilePlans -----------------------------------------------
     try:

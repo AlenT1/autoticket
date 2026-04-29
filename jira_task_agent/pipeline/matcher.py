@@ -1,5 +1,12 @@
 """LLM-based comparator: pairs extracted items with existing Jira issues.
 
+Also exposes:
+  - `compute_project_topology_sha(project_tree)`
+  - `compute_matcher_prompt_sha()`
+used by the runner cache (Tier 3) to validate that a cached matcher
+decision is still applicable to the current Jira state and prompt set.
+
+
 Two entry points:
 
   - `match(items, candidates, *, kind)`
@@ -21,9 +28,11 @@ No fuzz heuristic anywhere — the LLM is the comparator.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from ..llm.client import chat, load_prompt, models_classify, render_prompt
 
@@ -580,3 +589,102 @@ def run_matcher(
             ]
 
     return MatcherResult(file_results=file_results)
+
+
+# ----------------------------------------------------------------------
+# Tier 3 cache helpers — topology + prompt fingerprints, FileEpicResult
+# round-trip to/from JSON.
+# ----------------------------------------------------------------------
+
+
+def compute_project_topology_sha(project_tree: dict) -> str:
+    """Deterministic fingerprint of the Jira side of the matcher's input.
+
+    Covers exactly what Stage 1 + Stage 2 see:
+      - per epic: key, summary, description (truncated to preview window)
+      - per child: key, summary, description (truncated), status
+
+    Sorted by key so order doesn't matter. If the hash matches between
+    runs, the matcher's Jira-side input was byte-identical and a cached
+    decision keyed by this hash is reusable.
+
+    Description content is included so a description rewrite invalidates
+    the cache — descriptions can flip a borderline match.
+    """
+    parts: list = []
+    for e in sorted(project_tree.get("epics") or [], key=lambda x: x.get("key") or ""):
+        ek = e.get("key") or ""
+        es = (e.get("summary") or "").strip()
+        ed = (e.get("description") or "")[:_DESCRIPTION_PREVIEW_CHARS]
+        children: list = []
+        for c in sorted(e.get("children") or [], key=lambda x: x.get("key") or ""):
+            children.append(
+                (
+                    c.get("key") or "",
+                    (c.get("summary") or "").strip(),
+                    c.get("status") or "",
+                    (c.get("description") or "")[:_DESCRIPTION_PREVIEW_CHARS],
+                )
+            )
+        parts.append((ek, es, ed, children))
+    payload = json.dumps(parts, ensure_ascii=False, sort_keys=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_matcher_prompt_sha() -> str:
+    """Fingerprint of everything the matcher's behavior depends on:
+    the two prompt templates and the model id used for matcher calls.
+
+    Bumping the prompt or the model invalidates every cached decision,
+    so we never silently reuse decisions made by a different brain.
+    """
+    parts = [
+        _SYSTEM_PROMPT,
+        _GROUPED_SYSTEM_PROMPT,
+        os.environ.get("LLM_MODEL_CLASSIFY", ""),
+        f"min_conf:{_MIN_CONFIDENCE_BY_KIND}",
+    ]
+    payload = "\n---\n".join(parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def file_epic_result_to_json(fr: FileEpicResult) -> dict:
+    """Serialize one FileEpicResult for cache storage."""
+    return {
+        "file_id": fr.file_id,
+        "file_name": fr.file_name,
+        "section_index": fr.section_index,
+        "extracted_epic_summary": fr.extracted_epic_summary,
+        "extracted_epic_description": fr.extracted_epic_description,
+        "extracted_epic_assignee_raw": fr.extracted_epic_assignee_raw,
+        "matched_jira_key": fr.matched_jira_key,
+        "epic_match_confidence": fr.epic_match_confidence,
+        "epic_match_reason": fr.epic_match_reason,
+        "task_decisions": [asdict(d) for d in fr.task_decisions],
+        "orphan_keys": list(fr.orphan_keys),
+    }
+
+
+def file_epic_result_from_json(data: dict) -> FileEpicResult:
+    """Inverse of `file_epic_result_to_json`."""
+    return FileEpicResult(
+        file_id=data["file_id"],
+        file_name=data["file_name"],
+        section_index=int(data.get("section_index", 0)),
+        extracted_epic_summary=data.get("extracted_epic_summary", ""),
+        extracted_epic_description=data.get("extracted_epic_description", ""),
+        extracted_epic_assignee_raw=data.get("extracted_epic_assignee_raw"),
+        matched_jira_key=data.get("matched_jira_key"),
+        epic_match_confidence=float(data.get("epic_match_confidence") or 0.0),
+        epic_match_reason=data.get("epic_match_reason") or "",
+        task_decisions=[
+            MatchDecision(
+                item_index=int(d.get("item_index", -1)),
+                candidate_key=d.get("candidate_key"),
+                confidence=float(d.get("confidence") or 0.0),
+                reason=str(d.get("reason") or ""),
+            )
+            for d in data.get("task_decisions") or []
+        ],
+        orphan_keys=list(data.get("orphan_keys") or []),
+    )

@@ -45,7 +45,7 @@ from .pipeline.extractor import (
 )
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 DEFAULT_CACHE_PATH = Path("data/cache.json")
 
 
@@ -168,6 +168,14 @@ class FileCacheEntry:
     classification_confidence: float | None = None
     classification_reason: str | None = None
     extraction_payload: dict | None = None  # serialize_extraction output
+    # Tier 3 — matcher decision cache. Shape:
+    #   {
+    #     "content_sha": "<sha at decision time>",
+    #     "topology_sha": "<project tree fingerprint>",
+    #     "prompt_sha":   "<matcher prompts + model fingerprint>",
+    #     "results": [ <file_epic_result_to_json>, ... ]   # one per section
+    #   }
+    matcher_payload: dict | None = None
     cached_at: str = ""
 
     def to_json(self) -> dict:
@@ -178,6 +186,7 @@ class FileCacheEntry:
             "classification_confidence": self.classification_confidence,
             "classification_reason": self.classification_reason,
             "extraction_payload": self.extraction_payload,
+            "matcher_payload": self.matcher_payload,
             "cached_at": self.cached_at,
         }
 
@@ -191,6 +200,7 @@ class FileCacheEntry:
             classification_confidence=raw.get("classification_confidence"),
             classification_reason=raw.get("classification_reason"),
             extraction_payload=raw.get("extraction_payload"),
+            matcher_payload=raw.get("matcher_payload"),
             cached_at=raw.get("cached_at", ""),
         )
 
@@ -315,6 +325,71 @@ class Cache:
         entry.modified_time = modified_time
         entry.content_sha = content_sha
         entry.extraction_payload = extraction_payload
+        # Stale invalidate: a fresh extraction means any cached matcher
+        # decision was made against a different doc body.
+        entry.matcher_payload = None
+        entry.cached_at = datetime.now().isoformat(timespec="seconds")
+        self.files[file_id] = entry
+
+    # ---- Tier 3: matcher decision cache ---------------------------------
+
+    def get_match(
+        self,
+        file_id: str,
+        *,
+        content_sha: str,
+        topology_sha: str,
+        prompt_sha: str,
+    ) -> list[dict] | None:
+        """Returns the cached `results` list (each entry is a serialized
+        FileEpicResult) when ALL three fingerprints match the entry's
+        cached fingerprints. Otherwise None.
+
+        - `content_sha` mismatch → doc body changed; matcher inputs differ.
+        - `topology_sha` mismatch → Jira project tree changed; candidates
+          or their state may differ.
+        - `prompt_sha` mismatch → matcher prompts or model changed; the
+          decision may not survive the new rules.
+        """
+        entry = self.files.get(file_id)
+        if entry is None or entry.matcher_payload is None:
+            return None
+        mp = entry.matcher_payload
+        if mp.get("content_sha") != content_sha:
+            return None
+        if mp.get("topology_sha") != topology_sha:
+            return None
+        if mp.get("prompt_sha") != prompt_sha:
+            return None
+        results = mp.get("results")
+        if not isinstance(results, list):
+            return None
+        return results
+
+    def set_match(
+        self,
+        *,
+        file_id: str,
+        modified_time: str,
+        content_sha: str,
+        topology_sha: str,
+        prompt_sha: str,
+        results: list[dict],
+    ) -> None:
+        entry = self.files.get(file_id) or FileCacheEntry(
+            file_id=file_id,
+            modified_time=modified_time,
+            content_sha=content_sha,
+            role=None,
+        )
+        entry.modified_time = modified_time
+        entry.content_sha = content_sha
+        entry.matcher_payload = {
+            "content_sha": content_sha,
+            "topology_sha": topology_sha,
+            "prompt_sha": prompt_sha,
+            "results": results,
+        }
         entry.cached_at = datetime.now().isoformat(timespec="seconds")
         self.files[file_id] = entry
 

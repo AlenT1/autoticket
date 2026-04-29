@@ -35,7 +35,8 @@ def _print_report(report) -> None:
     )
     print(
         f"  cache hits:        classify={report.cache_hits_classify}  "
-        f"extract={report.cache_hits_extract}",
+        f"extract={report.cache_hits_extract}  "
+        f"match={report.cache_hits_match}",
         file=sys.stderr,
     )
     print(f"  actions by kind:   {dict(report.actions_by_kind)}", file=sys.stderr)

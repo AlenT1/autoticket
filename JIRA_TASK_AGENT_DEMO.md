@@ -49,10 +49,12 @@ Jira project ─► fetch_project_tree (1 paginated /search)
 
 ## Demo 1 — single-epic, fresh creation (V11 Dashboard)
 
-**What it shows:** matcher conservatism. V11 has no real Jira counterpart;
-the agent creates a new epic + 7 child tasks instead of falsely adopting
-a thinly-related existing epic. Demonstrates Stage 1 epic matching with
-children context, confidence floor, and the new-epic + new-tasks path.
+**What it shows:** matcher conservatism + warm-cache speedup. V11 has no
+real Jira counterpart; the agent creates a new epic + 7 child tasks
+instead of falsely adopting a thinly-related existing epic. The second
+run reuses Tier 1+2+3 caches to drop LLM cost to zero.
+
+### 1a. Cold run — full pipeline (~2 min)
 
 ```sh
 .venv/bin/python -m jira_task_agent run \
@@ -62,14 +64,38 @@ children context, confidence floor, and the new-epic + new-tasks path.
     --no-cache
 ```
 
-**Expected outcome (~2 min):**
+**Expected outcome:**
 
 ```
 classified by role: {'single_epic': 14, 'multi_epic': 2, 'root': 3}
 extractions:        ok=1 failed=0
+cache hits:         classify=0  extract=0  match=0
 actions by kind:    {'create_epic': 1, 'create_task': 7}
 capture: 16 intended write(s) recorded to data/would_send_v11.json
 ```
+
+### 1b. Warm run — reuse caches except for V11
+
+Drop only V11's cache entry, keep the rest. The next run re-classifies +
+re-extracts + re-matches **only V11**; 18 other files are pure cache hits.
+
+```sh
+.venv/bin/python -c "
+import json
+c = json.load(open('data/cache.json'))
+c['files'].pop('11NcVvB2TzqHkIHPkZQ6bQZ-jHNpSV1gY', None)  # V11
+json.dump(c, open('data/cache.json','w'), indent=2, ensure_ascii=False)
+"
+
+.venv/bin/python -m jira_task_agent run \
+    --capture data/would_send_v11_warm.json \
+    --only V11_Dashboard_Tasks.md \
+    --since 2026-01-01
+```
+
+**Expected outcome (~30s):** identical decisions, but `cache hits:
+classify=18 extract≈1 match≈1` and one fresh classify+extract+match for
+V11 only.
 
 Inspect:
 
@@ -95,11 +121,12 @@ Discussion points:
 
 ## Demo 2 — multi-epic, real-world adoption (May1)
 
-**What it shows:** the most complex path. May1 has 9 sub-epics + ~40
-tasks; the matcher correctly adopts 6 existing CENTPM epics, creates 1
-new sub-epic where there's no good match, correctly skips an in-staging
-epic, and detects 28 manual-edit cases (existing children that lack the
-agent marker).
+**What it shows:** the most complex path + warm-cache speedup. May1 has
+9 sub-epics + ~40 tasks; the matcher correctly adopts 6 existing CENTPM
+epics, creates 1 new sub-epic where there's no good match, correctly
+skips an in-staging epic, and detects 28 manual-edit cases.
+
+### 2a. Cold run — full pipeline (~5 min)
 
 ```sh
 .venv/bin/python -m jira_task_agent run \
@@ -109,16 +136,43 @@ agent marker).
     --no-cache
 ```
 
-**Expected outcome (~5 min):**
+**Expected outcome:**
 
 ```
 classified by role: {'single_epic': 14, 'multi_epic': 2, 'root': 3}
 extractions:        ok=1 failed=0
+cache hits:         classify=0  extract=0  match=0
 actions by kind:    {'update_epic': 7, 'create_epic': 1,
                      'skip_completed_epic': 1, 'create_task': 11,
                      'skip_manual_edits': 28, 'orphan': 24}
 capture: 66 intended write(s) recorded to data/would_send_may1.json
 ```
+
+### 2b. Warm run — reuse caches except for May1
+
+Drop only May1's two cache entries (it has duplicate Drive copies),
+keep the rest. The next run re-extracts + re-matches **only May1**.
+Expensive multi-epic extract + 9-group Stage 2 only paid once per
+content change.
+
+```sh
+.venv/bin/python -c "
+import json
+c = json.load(open('data/cache.json'))
+c['files'].pop('14g5aGBY2otES_JPdRvEam5U8xWmHnjoQitQBErbxSZs', None)  # May1 copy A
+c['files'].pop('1dl_SncoXCL0ZmImeDcr6rqbyh1qwItHk', None)              # May1 copy B
+json.dump(c, open('data/cache.json','w'), indent=2, ensure_ascii=False)
+"
+
+.venv/bin/python -m jira_task_agent run \
+    --capture data/would_send_may1_warm.json \
+    --only May1_Initial_Version_Tasks.md \
+    --since 2026-01-01
+```
+
+**Expected outcome (~3 min):** same 66 ops, same 9 epic decisions,
+but `cache hits: classify≈18 extract≈1 match≈1`. Only May1 pays the
+multi-epic LLM cost; other files are pure cache hits.
 
 Inspect:
 
