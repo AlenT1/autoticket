@@ -5,4 +5,5 @@ python-dotenv>=1.0
 requests>=2.31
 openai>=1.40
 rapidfuzz>=3.5
+langchain-text-splitters>=0.3
 pytest>=8.0
