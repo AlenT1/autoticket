@@ -256,9 +256,10 @@ def test_match_grouped_batches_split_correctly(monkeypatch):
 
 
 class _FakeExtractedTask:
-    def __init__(self, summary, description=""):
+    def __init__(self, summary, description="", source_anchor=""):
         self.summary = summary
         self.description = description
+        self.source_anchor = source_anchor
 
 
 class _FakeExtractedEpic:

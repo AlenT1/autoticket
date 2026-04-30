@@ -306,6 +306,7 @@ def run_once(
             matcher_batch_size=matcher_batch_size,
             matcher_max_workers=matcher_max_workers,
             on_cache_hits_match=_hit_match,
+            dirty_anchors_per_file=dirty_anchors_per_file,
         )
     except Exception as e:  # noqa: BLE001
         report.errors.append(f"matcher failed: {e}")

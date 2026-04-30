@@ -395,22 +395,23 @@ def match_grouped(
 
 @dataclass
 class FileEpicResult:
-    """One extracted epic (from one file or one section of a multi-epic
-    file) and the matcher's decisions for it.
-    """
+    """One extracted epic and the matcher's decisions for its tasks."""
     file_id: str
     file_name: str
     section_index: int
     extracted_epic_summary: str
     extracted_epic_description: str
     extracted_epic_assignee_raw: str | None
-    # Per-task: parallel to `extracted_tasks` from the source extraction.
-    # Each MatchDecision references a child of `matched_jira_key` in
-    # project_tree (or None for tasks with no Jira counterpart).
     matched_jira_key: str | None
     epic_match_confidence: float
     epic_match_reason: str
+    # Per-task decisions. Each decision's child key references a child
+    # of `matched_jira_key` in project_tree (or None for unmatched).
     task_decisions: list[MatchDecision] = field(default_factory=list)
+    # Source anchors of the extracted tasks, parallel to `task_decisions`.
+    # Lets the partial-match path splice cached decisions back to fresh
+    # tasks by anchor without needing the original extraction.
+    task_anchors: list[str | None] = field(default_factory=list)
     # Existing-but-not-in-doc: Jira children of the matched epic that no
     # extracted task paired with.
     orphan_keys: list[str] = field(default_factory=list)
@@ -447,46 +448,40 @@ def run_matcher(
     epic_match_inputs: list[MatchInput] = []
     extracted_tasks_per_result: list[list[object]] = []  # parallel to file_results
 
-    for drive_file, ext in extractions:
-        if hasattr(ext, "epics"):  # MultiExtractionResult
+    def _add_section(
+        ext_obj, section_idx: int,
+        epic_summary: str, epic_description: str, epic_assignee: str | None,
+        tasks: list,
+    ) -> None:
+        file_results.append(FileEpicResult(
+            file_id=ext_obj.file_id,
+            file_name=ext_obj.file_name,
+            section_index=section_idx,
+            extracted_epic_summary=epic_summary,
+            extracted_epic_description=epic_description,
+            extracted_epic_assignee_raw=epic_assignee,
+            matched_jira_key=None,
+            epic_match_confidence=0.0,
+            epic_match_reason="",
+            task_anchors=[t.source_anchor or None for t in tasks],
+        ))
+        epic_match_inputs.append(
+            MatchInput(summary=epic_summary, description=epic_description)
+        )
+        extracted_tasks_per_result.append(list(tasks))
+
+    for _, ext in extractions:
+        if hasattr(ext, "epics"):
             for i, epic in enumerate(ext.epics):
-                file_results.append(
-                    FileEpicResult(
-                        file_id=ext.file_id,
-                        file_name=ext.file_name,
-                        section_index=i,
-                        extracted_epic_summary=epic.summary,
-                        extracted_epic_description=epic.description,
-                        extracted_epic_assignee_raw=epic.assignee_name,
-                        matched_jira_key=None,
-                        epic_match_confidence=0.0,
-                        epic_match_reason="",
-                    )
+                _add_section(
+                    ext, i, epic.summary, epic.description,
+                    epic.assignee_name, epic.tasks,
                 )
-                epic_match_inputs.append(
-                    MatchInput(summary=epic.summary, description=epic.description)
-                )
-                extracted_tasks_per_result.append(list(epic.tasks))
-        elif hasattr(ext, "epic"):  # ExtractionResult (single_epic)
-            file_results.append(
-                FileEpicResult(
-                    file_id=ext.file_id,
-                    file_name=ext.file_name,
-                    section_index=0,
-                    extracted_epic_summary=ext.epic.summary,
-                    extracted_epic_description=ext.epic.description,
-                    extracted_epic_assignee_raw=ext.epic.assignee_name,
-                    matched_jira_key=None,
-                    epic_match_confidence=0.0,
-                    epic_match_reason="",
-                )
+        elif hasattr(ext, "epic"):
+            _add_section(
+                ext, 0, ext.epic.summary, ext.epic.description,
+                ext.epic.assignee_name, ext.tasks,
             )
-            epic_match_inputs.append(
-                MatchInput(
-                    summary=ext.epic.summary, description=ext.epic.description
-                )
-            )
-            extracted_tasks_per_result.append(list(ext.tasks))
 
     if not file_results:
         return MatcherResult(file_results=[])
@@ -649,7 +644,6 @@ def compute_matcher_prompt_sha() -> str:
 
 
 def file_epic_result_to_json(fr: FileEpicResult) -> dict:
-    """Serialize one FileEpicResult for cache storage."""
     return {
         "file_id": fr.file_id,
         "file_name": fr.file_name,
@@ -661,12 +655,12 @@ def file_epic_result_to_json(fr: FileEpicResult) -> dict:
         "epic_match_confidence": fr.epic_match_confidence,
         "epic_match_reason": fr.epic_match_reason,
         "task_decisions": [asdict(d) for d in fr.task_decisions],
+        "task_anchors": list(fr.task_anchors),
         "orphan_keys": list(fr.orphan_keys),
     }
 
 
 def file_epic_result_from_json(data: dict) -> FileEpicResult:
-    """Inverse of `file_epic_result_to_json`."""
     return FileEpicResult(
         file_id=data["file_id"],
         file_name=data["file_name"],
@@ -686,5 +680,6 @@ def file_epic_result_from_json(data: dict) -> FileEpicResult:
             )
             for d in data.get("task_decisions") or []
         ],
+        task_anchors=list(data.get("task_anchors") or []),
         orphan_keys=list(data.get("orphan_keys") or []),
     )
