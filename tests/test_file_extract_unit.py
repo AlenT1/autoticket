@@ -1,45 +1,78 @@
-"""Unit tests for pipeline.file_extract.
+"""Unit tests for `pipeline.file_extract`.
 
-Covers:
-  - _changed_chunk_ids: same / one changed / new chunk / removed chunk
-  - _compute_diff_payload: builds chunks dict + task_anchors dict
-  - _merge_diff_into_cached: single_epic edit + add + epic_changed;
-                              multi_epic edit in one section
-  - _try_diff_aware_extract: success path + fallbacks (no cache, no
-                             changed chunks, malformed LLM response)
-  - extract_or_reuse: Tier 2 hit, diff-aware path, cold path,
-                       failure path
-
-All LLM calls are stubbed; no network.
+Covers the three branches of `extract_or_reuse`: Tier 2 hit, the
+unified-diff warm path, and the cold path. LLM calls are stubbed.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 
 import pytest
 
 from jira_task_agent.cache import Cache, serialize_extraction
 from jira_task_agent.drive.client import DriveFile
-from jira_task_agent.pipeline import extractor, file_extract
+from jira_task_agent.pipeline import extractor as extractor_mod
+from jira_task_agent.pipeline import file_extract
 from jira_task_agent.pipeline.classifier import ClassifyResult
 from jira_task_agent.pipeline.extractor import (
     AGENT_MARKER,
-    DiffExtractionResult,
+    DiffLabels,
     ExtractedEpic,
     ExtractedEpicWithTasks,
     ExtractedTask,
     ExtractionResult,
     MultiExtractionResult,
+    TargetedBodies,
 )
-from jira_task_agent.pipeline.file_extract import (
-    _changed_chunk_ids,
-    _compute_diff_payload,
-    _merge_diff_into_cached,
-    _try_diff_aware_extract,
-    extract_or_reuse,
-)
+from jira_task_agent.pipeline.file_extract import compute_dirty, extract_or_reuse
+
+
+# ----------------------------------------------------------------------
+# compute_dirty — pure-Python diff between cached and merged extraction
+# ----------------------------------------------------------------------
+
+
+def test_compute_dirty_single_epic_no_change():
+    a = _single([_task("T", "anchor-T", "body")])
+    assert compute_dirty(a, a) == set()
+
+
+def test_compute_dirty_single_epic_task_modified():
+    cached = _single([_task("T", "anchor-T", "body")])
+    merged = _single([_task("T edited", "anchor-T", "edited")])
+    assert compute_dirty(cached, merged) == {"anchor-T"}
+
+
+def test_compute_dirty_single_epic_task_added():
+    cached = _single([_task("T1", "a1")])
+    merged = _single([_task("T1", "a1"), _task("T2 new", "a2-new")])
+    assert compute_dirty(cached, merged) == {"a2-new"}
+
+
+def test_compute_dirty_single_epic_epic_changed():
+    cached = _single([_task("T", "a")])
+    merged = ExtractionResult(
+        file_id="F1", file_name="F.md",
+        epic=ExtractedEpic(summary="Renamed title", description=f"x\n\n{AGENT_MARKER}"),
+        tasks=[_task("T", "a")],
+    )
+    assert compute_dirty(cached, merged) == {"<epic>:0"}
+
+
+def test_compute_dirty_multi_epic_new_subepic():
+    cached = _multi([("E1", [_task("T1", "a1")])])
+    merged = _multi([
+        ("E1", [_task("T1", "a1")]),
+        ("E2 new section", [_task("T2", "a2")]),
+    ])
+    assert compute_dirty(cached, merged) == {"a2", "<epic>:1"}
+
+
+def test_compute_dirty_multi_epic_subepic_renamed():
+    cached = _multi([("Original", [_task("T1", "a1")])])
+    merged = _multi([("Renamed section", [_task("T1", "a1")])])
+    assert compute_dirty(cached, merged) == {"<epic>:0"}
 
 
 # ----------------------------------------------------------------------
@@ -47,25 +80,20 @@ from jira_task_agent.pipeline.file_extract import (
 # ----------------------------------------------------------------------
 
 
-def _df(file_id: str = "F1", name: str = "V11_Dashboard_Tasks.md") -> DriveFile:
+def _df(file_id: str = "F1", name: str = "F.md") -> DriveFile:
     return DriveFile(
-        id=file_id,
-        name=name,
-        mime_type="text/markdown",
+        id=file_id, name=name, mime_type="text/markdown",
         created_time=datetime.now(timezone.utc),
         modified_time=datetime.now(timezone.utc),
         size=100,
-        creator_name="Aviv R",
-        creator_email=None,
-        last_modifying_user_name="Aviv R",
-        last_modifying_user_email=None,
-        parents=[],
-        web_view_link="http://drive/F1",
+        creator_name=None, creator_email=None,
+        last_modifying_user_name=None, last_modifying_user_email=None,
+        parents=[], web_view_link=f"http://drive/{file_id}",
     )
 
 
 def _classify(role: str = "single_epic") -> ClassifyResult:
-    return ClassifyResult(file_id="F1", role=role, confidence=0.99, reason="x")
+    return ClassifyResult(file_id="F1", role=role, confidence=1.0, reason="x")
 
 
 def _task_desc(body: str = "body") -> str:
@@ -78,828 +106,614 @@ def _task_desc(body: str = "body") -> str:
 
 def _task(summary: str, anchor: str, body: str = "body") -> ExtractedTask:
     return ExtractedTask(
-        summary=summary,
-        description=_task_desc(body),
-        source_anchor=anchor,
+        summary=summary, description=_task_desc(body), source_anchor=anchor,
     )
 
 
 def _single(tasks: list[ExtractedTask]) -> ExtractionResult:
     return ExtractionResult(
-        file_id="F1",
-        file_name="V11.md",
-        epic=ExtractedEpic(
-            summary="Dashboard improvements",
-            description=f"Body.\n\n{AGENT_MARKER}",
-        ),
+        file_id="F1", file_name="F.md",
+        epic=ExtractedEpic(summary="Title", description=f"x\n\n{AGENT_MARKER}"),
         tasks=tasks,
     )
 
 
 def _multi(epics: list[tuple[str, list[ExtractedTask]]]) -> MultiExtractionResult:
     return MultiExtractionResult(
-        file_id="F1",
-        file_name="May1.md",
+        file_id="F1", file_name="F.md",
         epics=[
             ExtractedEpicWithTasks(
-                summary=summary,
-                description=f"Body of {summary}.\n\n{AGENT_MARKER}",
-                assignee_name=None,
-                tasks=tasks,
+                summary=s, description=f"d\n\n{AGENT_MARKER}",
+                assignee_name=None, tasks=ts,
             )
-            for summary, tasks in epics
+            for s, ts in epics
         ],
     )
 
 
-# ----------------------------------------------------------------------
-# _changed_chunk_ids
-# ----------------------------------------------------------------------
-
-
-def test_changed_chunk_ids_no_changes():
-    cached = {"A|0": "a1", "B|0": "b1"}
-    current = {"A|0": "a1", "B|0": "b1"}
-    assert _changed_chunk_ids(cached, current) == []
-
-
-def test_changed_chunk_ids_one_changed():
-    cached = {"A|0": "a1", "B|0": "b1"}
-    current = {"A|0": "a2", "B|0": "b1"}
-    assert _changed_chunk_ids(cached, current) == ["A|0"]
-
-
-def test_changed_chunk_ids_new_chunk_added():
-    cached = {"A|0": "a1"}
-    current = {"A|0": "a1", "C|0": "c1"}
-    assert _changed_chunk_ids(cached, current) == ["C|0"]
-
-
-def test_changed_chunk_ids_chunk_removed_not_returned():
-    """Removed chunks aren't 'changed' from this function's perspective."""
-    cached = {"A|0": "a1", "B|0": "b1"}
-    current = {"A|0": "a1"}
-    assert _changed_chunk_ids(cached, current) == []
-
-
-# ----------------------------------------------------------------------
-# _compute_diff_payload
-# ----------------------------------------------------------------------
-
-
-def test_compute_diff_payload_maps_tasks_to_chunks():
-    text = (
-        "# Title\n\n"
-        "## A. Section\nSEC-1 first task body.\nSEC-2 second task body.\n\n"
-        "## B. Section\nB-1 third task body.\n"
-    )
-    ext = _single([
-        _task("First task", "SEC-1 first task"),
-        _task("Second task", "SEC-2 second task"),
-        _task("Third task", "B-1 third task"),
-    ])
-    diff = _compute_diff_payload(ext, text)
-    assert "chunks" in diff and "task_anchors" in diff
-    # Tasks 1+2 should map to A. Section, task 3 to B. Section
-    a1 = diff["task_anchors"]["SEC-1 first task"]["chunk_id"]
-    a2 = diff["task_anchors"]["SEC-2 second task"]["chunk_id"]
-    b1 = diff["task_anchors"]["B-1 third task"]["chunk_id"]
-    assert a1 == a2
-    assert "A. Section" in a1
-    assert "B. Section" in b1
-
-
-def test_compute_diff_payload_drops_unlocatable_anchors():
-    text = "# Title\n\n## A. Section\nbody.\n"
-    ext = _single([_task("ghost", "anchor-not-in-doc-XYZ")])
-    diff = _compute_diff_payload(ext, text)
-    assert "anchor-not-in-doc-XYZ" not in diff["task_anchors"]
-
-
-# ----------------------------------------------------------------------
-# _merge_diff_into_cached — single_epic
-# ----------------------------------------------------------------------
-
-
-def test_merge_single_epic_edit_replaces_only_changed_task():
-    cached_ext = _single([
-        _task("Task A", "anchor-A", "body A"),
-        _task("Task B", "anchor-B", "body B"),
-    ])
-    cached_anchors = {
-        "anchor-A": {"chunk_id": "Sec A|0", "body_sha": "sha-A"},
-        "anchor-B": {"chunk_id": "Sec B|0", "body_sha": "sha-B"},
-    }
-    diff = DiffExtractionResult(
-        file_id="F1",
-        file_name="V11.md",
-        epic_changed=False,
-        epic=None,
-        tasks=[_task("Task A edited", "anchor-A", "edited body A")],
-    )
-    merged = _merge_diff_into_cached(
-        cached_extraction=serialize_extraction(cached_ext),
-        cached_anchors=cached_anchors,
-        current_chunks={},  # not used by single_epic merge
-        changed_chunk_ids=["Sec A|0"],
-        diff_result=diff,
-        drive_file=_df(),
-    )
-    assert isinstance(merged, ExtractionResult)
-    summaries = [t.summary for t in merged.tasks]
-    # Task A replaced; Task B preserved.
-    assert "Task A edited" in summaries
-    assert "Task B" in summaries
-    assert "Task A" not in summaries  # the original was dropped
-
-
-def test_merge_single_epic_added_task():
-    cached_ext = _single([_task("Task A", "anchor-A")])
-    cached_anchors = {"anchor-A": {"chunk_id": "Sec A|0", "body_sha": "sha-A"}}
-    diff = DiffExtractionResult(
-        file_id="F1",
-        file_name="V11.md",
-        epic_changed=False,
-        epic=None,
-        tasks=[
-            _task("Task A", "anchor-A", "body A"),
-            _task("Brand new", "anchor-NEW"),
-        ],
-    )
-    merged = _merge_diff_into_cached(
-        cached_extraction=serialize_extraction(cached_ext),
-        cached_anchors=cached_anchors,
-        current_chunks={},
-        changed_chunk_ids=["Sec A|0"],
-        diff_result=diff,
-        drive_file=_df(),
-    )
-    summaries = [t.summary for t in merged.tasks]
-    # Old "Task A" dropped (chunk is in changed_set), both fresh tasks added.
-    assert "Brand new" in summaries
-    # The fresh "Task A" replaces the old one.
-    assert summaries.count("Task A") == 1
-
-
-def test_merge_single_epic_epic_changed_replaces_epic():
-    cached_ext = _single([_task("T1", "a1")])
-    cached_anchors = {"a1": {"chunk_id": "Sec A|0", "body_sha": "sha"}}
-    new_epic = ExtractedEpic(
-        summary="Updated epic title",
-        description=f"updated desc\n\n{AGENT_MARKER}",
-    )
-    diff = DiffExtractionResult(
-        file_id="F1",
-        file_name="V11.md",
-        epic_changed=True,
-        epic=new_epic,
-        tasks=[],
-    )
-    merged = _merge_diff_into_cached(
-        cached_extraction=serialize_extraction(cached_ext),
-        cached_anchors=cached_anchors,
-        current_chunks={},
-        changed_chunk_ids=["overview|0"],  # the epic-bearing chunk changed
-        diff_result=diff,
-        drive_file=_df(),
-    )
-    assert merged.epic.summary == "Updated epic title"
-    # Tasks unchanged: T1 lives in Sec A|0 (not in changed_set).
-    assert [t.summary for t in merged.tasks] == ["T1"]
-
-
-def test_merge_single_epic_no_changes_when_chunk_not_in_set():
-    """Defensive — diff returns nothing, all cached tasks survive."""
-    cached_ext = _single([_task("T1", "a1"), _task("T2", "a2")])
-    cached_anchors = {
-        "a1": {"chunk_id": "Sec A|0", "body_sha": "sha"},
-        "a2": {"chunk_id": "Sec B|0", "body_sha": "sha"},
-    }
-    diff = DiffExtractionResult(
-        file_id="F1",
-        file_name="V11.md",
-        epic_changed=False,
-        epic=None,
-        tasks=[],
-    )
-    merged = _merge_diff_into_cached(
-        cached_extraction=serialize_extraction(cached_ext),
-        cached_anchors=cached_anchors,
-        current_chunks={},
-        changed_chunk_ids=["unrelated|0"],
-        diff_result=diff,
-        drive_file=_df(),
-    )
-    assert [t.summary for t in merged.tasks] == ["T1", "T2"]
-
-
-# ----------------------------------------------------------------------
-# _merge_diff_into_cached — multi_epic
-# ----------------------------------------------------------------------
-
-
-def test_merge_multi_epic_edit_in_one_section():
-    """Edit a section that owns one task; another task in a sibling
-    chunk under the same epic survives unchanged."""
-    cached_ext = _multi([
-        ("Security Hardening", [_task("SEC-A", "sec-a"), _task("SEC-B", "sec-b")]),
-        ("Monitoring", [_task("MON-A", "mon-a")]),
-    ])
-    cached_anchors = {
-        # SEC-A and SEC-B happen to live in DIFFERENT chunks (e.g.
-        # section A has H3-anchored sub-blocks, or the chunker split
-        # them differently).
-        "sec-a": {"chunk_id": "A. Security Hardening|0", "body_sha": "sha"},
-        "sec-b": {"chunk_id": "A. Security Hardening other|0", "body_sha": "sha"},
-        "mon-a": {"chunk_id": "C. Monitoring|0", "body_sha": "sha"},
-    }
-    diff = DiffExtractionResult(
-        file_id="F1",
-        file_name="May1.md",
-        epic_changed=False,
-        epic=None,
-        tasks=[_task("SEC-A edited", "sec-a", "new body")],
-    )
-    merged = _merge_diff_into_cached(
-        cached_extraction=serialize_extraction(cached_ext),
-        cached_anchors=cached_anchors,
-        current_chunks={},
-        changed_chunk_ids=["A. Security Hardening|0"],  # only SEC-A's chunk
-        diff_result=diff,
-        drive_file=_df("F1", "May1.md"),
-    )
-    assert isinstance(merged, MultiExtractionResult)
-    sec_epic = next(e for e in merged.epics if e.summary == "Security Hardening")
-    mon_epic = next(e for e in merged.epics if e.summary == "Monitoring")
-    sec_summaries = [t.summary for t in sec_epic.tasks]
-    # SEC-B (unchanged chunk) preserved; SEC-A (changed chunk) replaced.
-    assert "SEC-B" in sec_summaries
-    assert "SEC-A edited" in sec_summaries
-    assert "SEC-A" not in sec_summaries  # original dropped
-    # Monitoring epic untouched.
-    assert [t.summary for t in mon_epic.tasks] == ["MON-A"]
-
-
-def test_merge_multi_epic_new_task_routed_by_heading_match():
-    cached_ext = _multi([
-        ("Security Hardening", [_task("SEC-A", "sec-a")]),
-        ("Monitoring", [_task("MON-A", "mon-a")]),
-    ])
-    cached_anchors = {
-        "sec-a": {"chunk_id": "A. Security Hardening|0", "body_sha": "sha"},
-        "mon-a": {"chunk_id": "C. Monitoring|0", "body_sha": "sha"},
-    }
-    # A brand-new task in the Monitoring section.
-    diff = DiffExtractionResult(
-        file_id="F1",
-        file_name="May1.md",
-        epic_changed=False,
-        epic=None,
-        tasks=[_task("MON-NEW", "mon-new")],
-    )
-    merged = _merge_diff_into_cached(
-        cached_extraction=serialize_extraction(cached_ext),
-        cached_anchors=cached_anchors,
-        current_chunks={},
-        changed_chunk_ids=["C. Monitoring|0"],
-        diff_result=diff,
-        drive_file=_df("F1", "May1.md"),
-    )
-    mon_epic = next(e for e in merged.epics if e.summary == "Monitoring")
-    summaries = [t.summary for t in mon_epic.tasks]
-    assert "MON-NEW" in summaries
-
-
-# ----------------------------------------------------------------------
-# _try_diff_aware_extract
-# ----------------------------------------------------------------------
-
-
-def test_diff_aware_returns_none_when_no_cached_state(tmp_path, monkeypatch):
-    """No prior extraction in cache → can't do diff-aware."""
-    cache = Cache()
-    p = tmp_path / "f.md"
-    p.write_text("# T\n## A\nbody")
-    out = _try_diff_aware_extract(
-        _df(),
-        local_path=p,
-        content_sha="C",
-        root_context="",
-        cache=cache,
-    )
-    assert out is None
-
-
-def test_diff_aware_returns_none_when_no_changed_chunks(tmp_path, monkeypatch):
-    """Cached chunks match current shas → defer to caller's full path."""
-    cache = Cache()
-    text = "# T\n\n## A. Section\nbody A.\n"
-    p = tmp_path / "f.md"
-    p.write_text(text)
-    # Seed cache with extraction + diff payload matching the file.
-    cached_ext = _single([_task("T1", "a1")])
-    cache.set_classification(
-        file_id="F1", modified_time="t", content_sha="OLD-SHA",
-        role="single_epic", confidence=1.0, reason="x",
-    )
-    cache.set_extraction(
-        file_id="F1", modified_time="t", content_sha="OLD-SHA",
-        extraction_payload=serialize_extraction(cached_ext),
-    )
-    # Compute current shas and write them as the cached chunks (zero diff).
-    diff_payload = _compute_diff_payload(cached_ext, text)
-    cache.set_diff_payload(
-        file_id="F1",
-        chunks=diff_payload["chunks"],
-        task_anchors=diff_payload["task_anchors"],
-    )
-    # New content_sha (so Tier 2 missed) but chunks identical.
-    out = _try_diff_aware_extract(
-        _df(),
-        local_path=p,
-        content_sha="NEW-SHA",
-        root_context="",
-        cache=cache,
-    )
-    assert out is None  # caller falls back to full re-extract
-
-
-def test_diff_aware_calls_llm_and_returns_merged(tmp_path, monkeypatch):
-    cache = Cache()
-    # Each section's body has a UNIQUE anchor string so the locator
-    # can pick the right chunk deterministically.
-    old_text = (
-        "# Title\n\n"
-        "## A. Section\nALPHA-task generate JWT secret in vault.\n\n"
-        "## B. Section\nBRAVO-task configure rate limiting middleware.\n"
-    )
-    new_text = (
-        "# Title\n\n"
-        "## A. Section\nALPHA-task EDITED generate JWT secret in vault now.\n\n"
-        "## B. Section\nBRAVO-task configure rate limiting middleware.\n"
-    )
-    p = tmp_path / "f.md"
-    p.write_text(new_text)
-    cached_ext = _single([
-        _task("Task A — JWT secret", "ALPHA-task generate JWT"),
-        _task("Task B — rate limit", "BRAVO-task configure rate limiting"),
-    ])
-    cache.set_classification(
-        file_id="F1", modified_time="t", content_sha="OLD",
-        role="single_epic", confidence=1.0, reason="x",
-    )
-    cache.set_extraction(
-        file_id="F1", modified_time="t", content_sha="OLD",
-        extraction_payload=serialize_extraction(cached_ext),
-    )
-    diff_payload = _compute_diff_payload(cached_ext, old_text)
-    cache.set_diff_payload(
-        file_id="F1",
-        chunks=diff_payload["chunks"],
-        task_anchors=diff_payload["task_anchors"],
-    )
-
-    # Stub the diff extractor LLM.
-    def _fake_chat(**_kwargs):
-        return ({
-            "epic_changed": False,
-            "epic": None,
-            "tasks": [{
-                "summary": "Task A — JWT secret edited",
-                "description": _task_desc("new body"),
-                "source_anchor": "ALPHA-task generate JWT EDITED",
-                "assignee": None,
-            }],
-        }, {"model": "stub"})
-    monkeypatch.setattr(extractor, "chat", _fake_chat)
-
-    out = _try_diff_aware_extract(
-        _df(),
-        local_path=p,
-        content_sha="NEW",
-        root_context="",
-        cache=cache,
-    )
-    assert out is not None
-    summaries = [t.summary for t in out.tasks]
-    # Task A replaced with edited version; Task B preserved (chunk unchanged).
-    assert "Task A — JWT secret edited" in summaries
-    assert "Task B — rate limit" in summaries
-
-
-def test_diff_aware_falls_through_on_llm_error(tmp_path, monkeypatch):
-    cache = Cache()
-    old_text = "# T\n\n## A\nold body."
-    new_text = "# T\n\n## A\nnew body."
-    p = tmp_path / "f.md"
-    p.write_text(new_text)
-    cached_ext = _single([_task("T1", "a1 old body")])
-    cache.set_classification(
-        file_id="F1", modified_time="t", content_sha="OLD",
-        role="single_epic", confidence=1.0, reason="x",
-    )
-    cache.set_extraction(
-        file_id="F1", modified_time="t", content_sha="OLD",
-        extraction_payload=serialize_extraction(cached_ext),
-    )
-    cache.set_diff_payload(
-        file_id="F1",
-        chunks=_compute_diff_payload(cached_ext, old_text)["chunks"],
-        task_anchors=_compute_diff_payload(cached_ext, old_text)["task_anchors"],
-    )
-    # Stub returns malformed response so extract_diff_aware raises.
-    monkeypatch.setattr(
-        extractor, "chat",
-        lambda **_: (["not a dict"], {"model": "stub"}),
-    )
-    out = _try_diff_aware_extract(
-        _df(),
-        local_path=p,
-        content_sha="NEW",
-        root_context="",
-        cache=cache,
-    )
-    assert out is None  # caller will fall back to full re-extract
-
-
-# ----------------------------------------------------------------------
-# extract_or_reuse — top-level decision tree
-# ----------------------------------------------------------------------
-
-
-class _Counters:
+class _Hooks:
     def __init__(self):
         self.ok = 0
         self.failed: list[str] = []
         self.cache_hits = 0
 
-    def hooks(self):
-        def _ok():
-            self.ok += 1
-        def _failed(msg: str):
-            self.failed.append(msg)
-        def _hit():
-            self.cache_hits += 1
-        return _ok, _failed, _hit
+    def triple(self):
+        return (
+            lambda: self.__setattr__("ok", self.ok + 1),
+            lambda m: self.failed.append(m),
+            lambda: self.__setattr__("cache_hits", self.cache_hits + 1),
+        )
 
 
-def test_extract_or_reuse_tier2_hit(tmp_path, monkeypatch):
-    cache = Cache()
-    cached_ext = _single([_task("T", "a")])
-    cache.set_classification(
-        file_id="F1", modified_time="t", content_sha="C",
-        role="single_epic", confidence=1.0, reason="x",
+def _seed_warm_cache(cache: Cache, ext, file_text: str) -> None:
+    """Populate cache so the diff path is usable: extraction + file_text
+    in diff_payload."""
+    cache.set_extraction(
+        file_id="F1", modified_time="t", content_sha="OLD",
+        extraction_payload=serialize_extraction(ext),
     )
+    cache.set_file_text("F1", file_text)
+
+
+# ----------------------------------------------------------------------
+# Tier 2 hit
+# ----------------------------------------------------------------------
+
+
+def test_tier2_hit_returns_empty_dirty(tmp_path, monkeypatch):
+    cache = Cache()
+    cached = _single([_task("T", "anchor-T")])
     cache.set_extraction(
         file_id="F1", modified_time="t", content_sha="C",
-        extraction_payload=serialize_extraction(cached_ext),
+        extraction_payload=serialize_extraction(cached),
     )
     p = tmp_path / "f.md"
     p.write_text("# T\n## A\nbody")
-
-    # Any LLM call here would be a bug.
-    def _bomb(**_):
-        raise AssertionError("LLM should not be called on Tier 2 hit")
-    monkeypatch.setattr(extractor, "chat", _bomb)
-
-    counters = _Counters()
-    ok, failed, hit = counters.hooks()
-    out = extract_or_reuse(
-        _df(),
-        classification=_classify(),
-        local_path=p,
-        content_sha="C",
-        root_context="",
-        cache=cache,
-        use_cache=True,
-        on_extract_ok=ok,
-        on_extract_failed=failed,
-        on_cache_hit_extract=hit,
+    monkeypatch.setattr(
+        extractor_mod, "chat",
+        lambda **_: (_ for _ in ()).throw(AssertionError("no LLM on Tier 2")),
+    )
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="C", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
     )
     assert out is not None
-    assert counters.ok == 1
-    assert counters.cache_hits == 1
-    assert counters.failed == []
+    assert dirty == set()
+    assert hooks.cache_hits == 1
 
 
-def test_extract_or_reuse_cold_path_calls_extractor(tmp_path, monkeypatch):
+# ----------------------------------------------------------------------
+# Cold path
+# ----------------------------------------------------------------------
+
+
+def test_cold_path_returns_dirty_none(tmp_path, monkeypatch):
     cache = Cache()
     p = tmp_path / "f.md"
-    p.write_text("# T\n## A. Section\nFresh content.\n")
+    p.write_text("# T\n## A\nfresh body.")
 
-    # Stub the cold extractor (extract_from_file) — it goes through
-    # the same `chat` call.
     def _fake(**_):
         return ({
             "epic": {
-                "summary": "Dashboard improvements",
-                "description": "body.",
-                "assignee": None,
+                "summary": "Dashboard improvements",  # >=12 chars
+                "description": "body.", "assignee": None,
             },
             "tasks": [{
                 "summary": "Cold-extracted task",
-                "description": _task_desc("cold body"),
+                "description": _task_desc("body"),
                 "source_anchor": "cold-1",
                 "assignee": None,
             }],
         }, {"model": "stub"})
-    monkeypatch.setattr(extractor, "chat", _fake)
+    monkeypatch.setattr(extractor_mod, "chat", _fake)
 
-    counters = _Counters()
-    ok, failed, hit = counters.hooks()
-    out = extract_or_reuse(
-        _df(),
-        classification=_classify(),
-        local_path=p,
-        content_sha="NEW",
-        root_context="",
-        cache=cache,
-        use_cache=True,
-        on_extract_ok=ok,
-        on_extract_failed=failed,
-        on_cache_hit_extract=hit,
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
     )
-    assert out is not None
+    assert out is not None, f"failures: {hooks.failed}"
     assert out.tasks[0].summary == "Cold-extracted task"
-    assert counters.ok == 1
-    assert counters.cache_hits == 0
-    # And it got persisted.
+    assert dirty is None
     assert cache.get_extraction("F1", "NEW") is not None
-    assert cache.get_chunks("F1")  # diff payload populated
+    assert cache.get_file_text("F1") == "# T\n## A\nfresh body."
 
 
-def test_extract_or_reuse_failed_path(tmp_path, monkeypatch):
+def test_cold_failure_returns_none(tmp_path, monkeypatch):
     cache = Cache()
     p = tmp_path / "f.md"
     p.write_text("# T")
     monkeypatch.setattr(
-        extractor, "chat",
-        lambda **_: (None, {"model": "stub"}),  # triggers ExtractionError
+        extractor_mod, "chat",
+        lambda **_: (None, {"model": "stub"}),
     )
-    counters = _Counters()
-    ok, failed, hit = counters.hooks()
-    out = extract_or_reuse(
-        _df(),
-        classification=_classify(),
-        local_path=p,
-        content_sha="X",
-        root_context="",
-        cache=cache,
-        use_cache=False,  # bypass cache to force cold path
-        on_extract_ok=ok,
-        on_extract_failed=failed,
-        on_cache_hit_extract=hit,
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="X", root_context="",
+        cache=cache, use_cache=False,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
     )
     assert out is None
-    assert counters.ok == 0
-    assert len(counters.failed) == 1
-    assert "extract failed" in counters.failed[0]
+    assert hooks.failed and "extract failed" in hooks.failed[0]
 
 
-def test_extract_or_reuse_use_cache_false_bypasses_tier2(tmp_path, monkeypatch):
-    """--no-cache equivalent: even with Tier 2 entry, run cold extract."""
+def test_unknown_role_returns_none(tmp_path):
     cache = Cache()
-    cached_ext = _single([_task("STALE", "stale-anchor")])
-    cache.set_classification(
-        file_id="F1", modified_time="t", content_sha="C",
-        role="single_epic", confidence=1.0, reason="x",
+    p = tmp_path / "f.md"
+    p.write_text("# T")
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(role="root"),
+        local_path=p, content_sha="X", root_context="",
+        cache=cache, use_cache=False,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
     )
+    assert out is None
+    assert hooks.failed == []
+
+
+# ----------------------------------------------------------------------
+# Diff path — single_epic
+# ----------------------------------------------------------------------
+
+
+def test_diff_path_single_epic_modified_only(tmp_path, monkeypatch):
+    """One task body edited → dirty = {that one anchor}."""
+    cache = Cache()
+    cached = _single([
+        _task("Task A", "anchor-A", "body A"),
+        _task("Task B", "anchor-B", "body B"),
+    ])
+    _seed_warm_cache(cache, cached, "# T\n## A\nA body line.\n## B\nB body line.\n")
+
+    mutated_path = tmp_path / "f.md"
+    mutated_path.write_text("# T\n## A\nA body line edited.\n## B\nB body line.\n")
+
+    # Stub both LLM calls: diff returns the label, targeted returns the body.
+    # Stub the two LLM calls. Bodies are returned in target order
+    # (modified-then-added), so apply_changes positionally matches them.
+    monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: DiffLabels(
+        modified_anchors=["anchor-A"], removed_anchors=[],
+        added=[], new_subepics=[], epic_changed=False,
+    ))
+    monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: TargetedBodies(
+        tasks=[_task("Task A edited", "anchor-ignored", "edited body")],
+        task_sections=[None],
+        epics=[], epic_sections=[],
+    ))
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=mutated_path, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    assert out is not None
+    summaries = [t.summary for t in out.tasks]
+    assert "Task A edited" in summaries
+    assert "Task B" in summaries
+    assert "Task A" not in summaries
+    assert dirty == {"anchor-A"}
+
+
+def test_diff_path_single_epic_added_appended(tmp_path, monkeypatch):
+    cache = Cache()
+    cached = _single([_task("Task A", "anchor-A")])
+    _seed_warm_cache(cache, cached, "old text\n")
+    p = tmp_path / "f.md"
+    p.write_text("new text with extra task\n")
+
+    monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: DiffLabels(
+        modified_anchors=[], removed_anchors=[],
+        added=[{"summary": "Brand new", "section": None}],
+        new_subepics=[], epic_changed=False,
+    ))
+    monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: TargetedBodies(
+        tasks=[_task("Brand new", "anchor-NEW")],
+        task_sections=[None],
+        epics=[], epic_sections=[],
+    ))
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    assert {t.summary for t in out.tasks} == {"Task A", "Brand new"}
+    assert dirty == {"anchor-NEW"}
+
+
+def test_diff_path_removed_drops_by_anchor(tmp_path, monkeypatch):
+    cache = Cache()
+    cached = _single([_task("T1", "a1"), _task("T2", "a2")])
+    _seed_warm_cache(cache, cached, "old\n")
+    p = tmp_path / "f.md"
+    p.write_text("new (T2 deleted)\n")
+
+    monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: DiffLabels(
+        modified_anchors=[], removed_anchors=["a2"],
+        added=[], new_subepics=[], epic_changed=False,
+    ))
+    monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: TargetedBodies(
+        tasks=[], task_sections=[], epics=[], epic_sections=[],
+    ))
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    assert [t.summary for t in out.tasks] == ["T1"]
+    # Removed anchors are NOT counted as dirty (the doc deleted them; no
+    # write action is needed beyond the cached state diverging — the
+    # reconciler currently has no orphan-on-delete behavior either).
+    assert dirty == set()
+
+
+def test_diff_path_no_real_diff_falls_back_to_cold(tmp_path, monkeypatch):
+    """If cached_text == current_text the diff is empty → no LLM call,
+    we fall through to cold (which the test stubs to avoid Drive)."""
+    cache = Cache()
+    cached = _single([_task("T", "a")])
+    _seed_warm_cache(cache, cached, "same content\n")
+    p = tmp_path / "f.md"
+    p.write_text("same content\n")  # identical → empty diff
+
+    cold_called = {"n": 0}
+
+    def _fake(**_):
+        cold_called["n"] += 1
+        return ({
+            "epic": {"summary": "Recovered fresh title", "description": "x", "assignee": None},
+            "tasks": [{
+                "summary": "Cold task",
+                "description": _task_desc("body"),
+                "source_anchor": "cold-1",
+                "assignee": None,
+            }],
+        }, {"model": "stub"})
+    monkeypatch.setattr(extractor_mod, "chat", _fake)
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="NEW",  # mismatch → Tier 2 misses
+        root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    assert out is not None
+    assert cold_called["n"] == 1  # cold extractor invoked
+    assert dirty is None  # cold path semantics
+
+
+# ----------------------------------------------------------------------
+# Diff path — multi_epic
+# ----------------------------------------------------------------------
+
+
+def test_diff_path_multi_epic_added_routed_by_section_summary(tmp_path, monkeypatch):
+    cache = Cache()
+    cached = _multi([
+        ("Security", [_task("SEC-A", "sec-a")]),
+        ("Monitoring", [_task("MON-A", "mon-a")]),
+    ])
+    _seed_warm_cache(cache, cached, "old multi\n")
+    p = tmp_path / "f.md"
+    p.write_text("new multi with MON-NEW\n")
+
+    monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: DiffLabels(
+        modified_anchors=[], removed_anchors=[],
+        added=[{"summary": "MON-NEW burst", "section": "Monitoring"}],
+        new_subepics=[], epic_changed=False,
+    ))
+    monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: TargetedBodies(
+        tasks=[_task("MON-NEW burst", "MON-NEW anchor")],
+        task_sections=["Monitoring"],
+        epics=[], epic_sections=[],
+    ))
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(role="multi_epic"),
+        local_path=p, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    assert isinstance(out, MultiExtractionResult)
+    sec = next(e for e in out.epics if e.summary == "Security")
+    mon = next(e for e in out.epics if e.summary == "Monitoring")
+    assert {t.source_anchor for t in mon.tasks} == {"mon-a", "MON-NEW anchor"}
+    assert {t.source_anchor for t in sec.tasks} == {"sec-a"}
+    assert dirty == {"MON-NEW anchor"}
+
+
+def test_diff_path_multi_epic_new_subepic_with_tasks(tmp_path, monkeypatch):
+    cache = Cache()
+    cached = _multi([("E1", [_task("T1", "t1")])])
+    _seed_warm_cache(cache, cached, "old\n")
+    p = tmp_path / "f.md"
+    p.write_text("new with section J\n")
+
+    new_sub = ExtractedEpicWithTasks(
+        summary="Disaster recovery readiness",
+        description=f"Validate runbooks.\n\n{AGENT_MARKER}",
+        assignee_name=None, tasks=[],
+    )
+    monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: DiffLabels(
+        modified_anchors=[], removed_anchors=[],
+        added=[
+            {"summary": "DR-1 cadence", "section": "Disaster recovery readiness"},
+            {"summary": "DR-2 restore", "section": "Disaster recovery readiness"},
+        ],
+        new_subepics=[{"summary": "Disaster recovery readiness"}],
+        epic_changed=False,
+    ))
+    monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: TargetedBodies(
+        tasks=[_task("DR-1 cadence", "DR-1"), _task("DR-2 restore", "DR-2")],
+        task_sections=["Disaster recovery readiness", "Disaster recovery readiness"],
+        epics=[new_sub],
+        epic_sections=["Disaster recovery readiness"],
+    ))
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(role="multi_epic"),
+        local_path=p, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    assert len(out.epics) == 2
+    new = next(e for e in out.epics if "Disaster" in e.summary)
+    assert {t.source_anchor for t in new.tasks} == {"DR-1", "DR-2"}
+    # Two task anchors plus the new sub-epic's token (section index 1).
+    assert dirty == {"DR-1", "DR-2", "<epic>:1"}
+
+
+# ----------------------------------------------------------------------
+# Cache reuse
+# ----------------------------------------------------------------------
+
+
+def test_use_cache_false_bypasses_tier2(tmp_path, monkeypatch):
+    """--no-cache equivalent: cold extract runs even when Tier 2 hit."""
+    cache = Cache()
+    cached = _single([_task("STALE", "stale-a")])
     cache.set_extraction(
         file_id="F1", modified_time="t", content_sha="C",
-        extraction_payload=serialize_extraction(cached_ext),
+        extraction_payload=serialize_extraction(cached),
     )
     p = tmp_path / "f.md"
     p.write_text("# T\n## A\nbody")
 
-    # Cold extractor returns something fresh.
     def _fake(**_):
         return ({
-            "epic": {"summary": "Fresh epic title", "description": "x", "assignee": None},
+            "epic": {"summary": "Recovered fresh title", "description": "x", "assignee": None},
             "tasks": [{
-                "summary": "Freshly extracted task",
-                "description": _task_desc("b"),
+                "summary": "Fresh task",
+                "description": _task_desc("body"),
                 "source_anchor": "fresh-1",
                 "assignee": None,
             }],
         }, {"model": "stub"})
-    monkeypatch.setattr(extractor, "chat", _fake)
+    monkeypatch.setattr(extractor_mod, "chat", _fake)
 
-    counters = _Counters()
-    ok, failed, hit = counters.hooks()
-    out = extract_or_reuse(
-        _df(),
-        classification=_classify(),
-        local_path=p,
-        content_sha="C",
-        root_context="",
-        cache=cache,
-        use_cache=False,
-        on_extract_ok=ok,
-        on_extract_failed=failed,
-        on_cache_hit_extract=hit,
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="C", root_context="",
+        cache=cache, use_cache=False,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
     )
     assert out is not None
-    assert out.tasks[0].summary == "Freshly extracted task"
-    assert counters.cache_hits == 0  # use_cache=False → no Tier 2 read
+    assert out.tasks[0].summary == "Fresh task"
+    assert hooks.cache_hits == 0  # use_cache=False → no Tier 2 read
 
 
-def test_all_tasks_with_multi_extraction():
-    multi = _multi([
-        ("E1", [_task("T1", "a1"), _task("T2", "a2")]),
-        ("E2", [_task("T3", "a3")]),
-    ])
-    flat = file_extract._all_tasks(multi)
-    assert [t.summary for t in flat] == ["T1", "T2", "T3"]
-
-
-def test_all_tasks_with_single_extraction():
-    single = _single([_task("T1", "a1"), _task("T2", "a2")])
-    flat = file_extract._all_tasks(single)
-    assert [t.summary for t in flat] == ["T1", "T2"]
-
-
-def test_extract_or_reuse_tier2_payload_unusable_falls_through(tmp_path, monkeypatch):
-    """Tier 2 entry exists but deserialize blows up → log warning and
-    fall through to fresh extract."""
+def _run_loop(
+    monkeypatch, tmp_path,
+    *,
+    cached, role, mutated_text,
+    labels, bodies, expected_dirty, expected_post_state,
+):
+    """Cold seed → mutate → warm extract → rerun with same content.
+    Asserts dirty set after warm, then asserts the rerun is a Tier 2
+    hit (no LLM calls) returning the post-mutation state."""
     cache = Cache()
-    cache.set_classification(
-        file_id="F1", modified_time="t", content_sha="C",
-        role="single_epic", confidence=1.0, reason="x",
+    _seed_warm_cache(cache, cached, "previous file text\n")
+
+    mutated_path = tmp_path / "f.md"
+    mutated_path.write_text(mutated_text)
+
+    monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: labels)
+    monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: bodies)
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    _, dirty = extract_or_reuse(
+        _df(), classification=_classify(role=role),
+        local_path=mutated_path, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
     )
-    # Manually corrupt the payload so deserialize_extraction raises.
-    cache.files["F1"].extraction_payload = {"type": "single_epic", "BROKEN": True}
+    assert dirty == expected_dirty
+    assert cache.get_extraction("F1", "NEW") is not None
+    assert cache.get_file_text("F1") == mutated_text
 
+    bomb = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no LLM on Tier 2"))
+    monkeypatch.setattr(extractor_mod, "chat", bomb)
+    monkeypatch.setattr(file_extract, "extract_diff", bomb)
+    monkeypatch.setattr(file_extract, "extract_targeted", bomb)
+
+    out2, dirty2 = extract_or_reuse(
+        _df(), classification=_classify(role=role),
+        local_path=mutated_path, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    assert dirty2 == set()
+    expected_post_state(out2)
+
+
+def test_persistence_loop_modify_task(tmp_path, monkeypatch):
+    cached = _single([_task("Task A", "anchor-A", "body A"), _task("Task B", "anchor-B", "body B")])
+    _run_loop(
+        monkeypatch, tmp_path,
+        cached=cached, role="single_epic",
+        mutated_text="# T\n## A\nA body line edited.\n## B\nB body line.\n",
+        labels=DiffLabels(
+            modified_anchors=["anchor-A"], removed_anchors=[],
+            added=[], new_subepics=[], epic_changed=False,
+        ),
+        bodies=TargetedBodies(
+            tasks=[_task("Task A edited", "anchor-A", "edited body")],
+            task_sections=[None],
+            epics=[], epic_sections=[],
+        ),
+        expected_dirty={"anchor-A"},
+        expected_post_state=lambda out: (
+            {t.summary for t in out.tasks} == {"Task A edited", "Task B"}
+        ),
+    )
+
+
+def test_persistence_loop_add_task(tmp_path, monkeypatch):
+    cached = _single([_task("Task A", "anchor-A")])
+    _run_loop(
+        monkeypatch, tmp_path,
+        cached=cached, role="single_epic",
+        mutated_text="# T\n## A\nbody.\n## B\nNEW task body.\n",
+        labels=DiffLabels(
+            modified_anchors=[], removed_anchors=[],
+            added=[{"summary": "New task", "section": None}],
+            new_subepics=[], epic_changed=False,
+        ),
+        bodies=TargetedBodies(
+            tasks=[_task("New task", "anchor-NEW", "new body")],
+            task_sections=[None],
+            epics=[], epic_sections=[],
+        ),
+        expected_dirty={"anchor-NEW"},
+        expected_post_state=lambda out: (
+            {t.summary for t in out.tasks} == {"Task A", "New task"}
+        ),
+    )
+
+
+def test_persistence_loop_update_epic(tmp_path, monkeypatch):
+    """Single-epic body change → dirty={'<epic>:0'}; epic replaced."""
+    cached = _single([_task("T1", "a1")])
+    new_epic_full = ExtractedEpicWithTasks(
+        summary="Updated epic title",
+        description=f"updated body.\n\n{AGENT_MARKER}",
+        assignee_name=None, tasks=[],
+    )
+    _run_loop(
+        monkeypatch, tmp_path,
+        cached=cached, role="single_epic",
+        mutated_text="# Updated epic title\n## A\nbody.\n",
+        labels=DiffLabels(
+            modified_anchors=[], removed_anchors=[],
+            added=[], new_subepics=[], epic_changed=True,
+        ),
+        bodies=TargetedBodies(
+            tasks=[], task_sections=[],
+            epics=[new_epic_full], epic_sections=[None],
+        ),
+        expected_dirty={"<epic>:0"},
+        expected_post_state=lambda out: (
+            out.epic.summary == "Updated epic title"
+            and [t.source_anchor for t in out.tasks] == ["a1"]
+        ),
+    )
+
+
+def test_persistence_loop_add_subepic(tmp_path, monkeypatch):
+    """Multi-epic add new sub-epic with one task → dirty has the
+    sub-epic token + the new task anchor."""
+    cached = _multi([("E1", [_task("T1", "a1")])])
+    new_sub = ExtractedEpicWithTasks(
+        summary="New section title",
+        description=f"new section body\n\n{AGENT_MARKER}",
+        assignee_name=None, tasks=[],
+    )
+    _run_loop(
+        monkeypatch, tmp_path,
+        cached=cached, role="multi_epic",
+        mutated_text="# T\n\n## A. E1\nbody.\n\n## B. New\nNew task body.\n",
+        labels=DiffLabels(
+            modified_anchors=[], removed_anchors=[],
+            added=[{"summary": "New task", "section": "New section title"}],
+            new_subepics=[{"summary": "New section title"}],
+            epic_changed=False,
+        ),
+        bodies=TargetedBodies(
+            tasks=[_task("New task", "anchor-NEW", "new body")],
+            task_sections=["New section title"],
+            epics=[new_sub],
+            epic_sections=["New section title"],
+        ),
+        expected_dirty={"anchor-NEW", "<epic>:1"},
+        expected_post_state=lambda out: (
+            len(out.epics) == 2
+            and out.epics[1].summary == "New section title"
+            and any(t.source_anchor == "anchor-NEW" for t in out.epics[1].tasks)
+        ),
+    )
+
+
+def test_corrupt_tier2_payload_falls_through_to_diff_or_cold(tmp_path, monkeypatch):
+    """If the cached payload can't be deserialized, log + fall through."""
+    cache = Cache()
+    cache.set_extraction(
+        file_id="F1", modified_time="t", content_sha="C",
+        extraction_payload={"type": "single_epic", "BROKEN": True},
+    )
     p = tmp_path / "f.md"
-    p.write_text("# T\n## A\nfresh body.")
+    p.write_text("# T\n## A\nbody")
 
-    def _fresh(**_):
+    def _fake(**_):
         return ({
-            "epic": {"summary": "Recovered fresh epic", "description": "x", "assignee": None},
+            "epic": {"summary": "Recovered fresh title", "description": "x", "assignee": None},
             "tasks": [{
                 "summary": "Recovery task",
-                "description": _task_desc("recovered"),
-                "source_anchor": "recovery-1",
+                "description": _task_desc("body"),
+                "source_anchor": "rec-1",
                 "assignee": None,
             }],
         }, {"model": "stub"})
-    monkeypatch.setattr(extractor, "chat", _fresh)
+    monkeypatch.setattr(extractor_mod, "chat", _fake)
 
-    counters = _Counters()
-    ok, failed, hit = counters.hooks()
-    out = extract_or_reuse(
-        _df(),
-        classification=_classify(),
-        local_path=p,
-        content_sha="C",
-        root_context="",
-        cache=cache,
-        use_cache=True,
-        on_extract_ok=ok,
-        on_extract_failed=failed,
-        on_cache_hit_extract=hit,
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="C", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
     )
     assert out is not None
     assert out.tasks[0].summary == "Recovery task"
-    # We didn't count it as a cache hit since the payload was unusable.
-    assert counters.cache_hits == 0
-
-
-def test_extract_or_reuse_multi_epic_cold_path(tmp_path, monkeypatch):
-    cache = Cache()
-    p = tmp_path / "f.md"
-    p.write_text("# T\n\n## A. Sec\nbody.\n\n## B. Sec\nbody.\n")
-
-    def _fake(**_):
-        return ({
-            "epics": [{
-                "summary": "Section one epic",
-                "description": "body section one.",
-                "assignee": None,
-                "tasks": [{
-                    "summary": "Section A task one",
-                    "description": _task_desc("body"),
-                    "source_anchor": "A-1",
-                    "assignee": None,
-                }],
-            }],
-        }, {"model": "stub"})
-    monkeypatch.setattr(extractor, "chat", _fake)
-
-    counters = _Counters()
-    ok, failed, hit = counters.hooks()
-    out = extract_or_reuse(
-        _df(),
-        classification=_classify(role="multi_epic"),
-        local_path=p,
-        content_sha="NEW",
-        root_context="",
-        cache=cache,
-        use_cache=True,
-        on_extract_ok=ok,
-        on_extract_failed=failed,
-        on_cache_hit_extract=hit,
-    )
-    assert out is not None
-    assert isinstance(out, MultiExtractionResult)
-    assert len(out.epics) == 1
-    assert out.epics[0].summary == "Section one epic"
-
-
-def test_extract_or_reuse_takes_diff_aware_path_when_applicable(tmp_path, monkeypatch):
-    """End-to-end through extract_or_reuse: cache has prior state, file
-    content changed, only one chunk's body differs → diff-aware path
-    fires, returns merged extraction."""
-    cache = Cache()
-    old_text = (
-        "# T\n\n"
-        "## A. Section\nALPHA generate JWT secret in vault.\n\n"
-        "## B. Section\nBRAVO configure rate limiting policy.\n"
-    )
-    new_text = (
-        "# T\n\n"
-        "## A. Section\nALPHA generate JWT secret EDITED in vault now.\n\n"
-        "## B. Section\nBRAVO configure rate limiting policy.\n"
-    )
-    p = tmp_path / "f.md"
-    p.write_text(new_text)
-
-    cached_ext = _single([
-        _task("Task A — JWT secret", "ALPHA generate JWT"),
-        _task("Task B — rate limit", "BRAVO configure rate limiting"),
-    ])
-    cache.set_classification(
-        file_id="F1", modified_time="t", content_sha="OLD",
-        role="single_epic", confidence=1.0, reason="x",
-    )
-    cache.set_extraction(
-        file_id="F1", modified_time="t", content_sha="OLD",
-        extraction_payload=serialize_extraction(cached_ext),
-    )
-    diff_old = _compute_diff_payload(cached_ext, old_text)
-    cache.set_diff_payload(
-        file_id="F1",
-        chunks=diff_old["chunks"],
-        task_anchors=diff_old["task_anchors"],
-    )
-
-    # The diff LLM returns just the edited task.
-    def _fake(**_):
-        return ({
-            "epic_changed": False,
-            "epic": None,
-            "tasks": [{
-                "summary": "Task A — JWT secret EDITED",
-                "description": _task_desc("edited body"),
-                "source_anchor": "ALPHA generate JWT EDITED",
-                "assignee": None,
-            }],
-        }, {"model": "stub"})
-    monkeypatch.setattr(extractor, "chat", _fake)
-
-    counters = _Counters()
-    ok, failed, hit = counters.hooks()
-    out = extract_or_reuse(
-        _df(),
-        classification=_classify(),
-        local_path=p,
-        content_sha="NEW",  # different from cached "OLD" → Tier 2 misses
-        root_context="",
-        cache=cache,
-        use_cache=True,
-        on_extract_ok=ok,
-        on_extract_failed=failed,
-        on_cache_hit_extract=hit,
-    )
-    assert out is not None
-    summaries = [t.summary for t in out.tasks]
-    assert "Task A — JWT secret EDITED" in summaries
-    assert "Task B — rate limit" in summaries  # preserved from unchanged chunk
-    # extract_ok was bumped, but cache_hit_extract wasn't — it's a
-    # diff-aware result, not a Tier 2 hit.
-    assert counters.ok == 1
-    assert counters.cache_hits == 0
-
-
-def test_extract_or_reuse_unknown_role_returns_none(tmp_path):
-    """Defensive: classification.role='root' should never reach this
-    function in production, but if it does we return None safely."""
-    cache = Cache()
-    p = tmp_path / "f.md"
-    p.write_text("# T")
-    counters = _Counters()
-    ok, failed, hit = counters.hooks()
-    out = extract_or_reuse(
-        _df(),
-        classification=_classify(role="root"),
-        local_path=p,
-        content_sha="X",
-        root_context="",
-        cache=cache,
-        use_cache=False,
-        on_extract_ok=ok,
-        on_extract_failed=failed,
-        on_cache_hit_extract=hit,
-    )
-    assert out is None
-    assert counters.ok == 0
-    assert counters.failed == []  # silent skip, not a failure
+    assert hooks.cache_hits == 0

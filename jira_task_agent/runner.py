@@ -226,6 +226,11 @@ def run_once(
     def _hit():
         report.cache_hits_extract += 1
 
+    # Per-file dirty-anchor map: which task source_anchors did the doc
+    # actually change this run? None = process-all (cold), set() = none
+    # changed (Tier 2 hit), set(...) = exactly these changed.
+    dirty_anchors_per_file: dict[str, set[str] | None] = {}
+
     for f in files:
         c = classifications.get(f.id)
         if not c or c.role not in ("single_epic", "multi_epic"):
@@ -242,7 +247,7 @@ def run_once(
             logger.info("skip extract %s: --only is set to %r", f.name, only_file_name)
             continue
 
-        ext = extract_or_reuse(
+        ext, dirty = extract_or_reuse(
             f,
             classification=c,
             local_path=local_paths[f.id],
@@ -256,6 +261,13 @@ def run_once(
         )
         if ext is not None:
             extractions.append((f, ext))
+            dirty_anchors_per_file[f.id] = dirty
+            if dirty is not None:
+                logger.info(
+                    "dirty anchors for %s: %d (%s)",
+                    f.name, len(dirty),
+                    ", ".join(sorted(dirty)[:5]) + ("..." if len(dirty) > 5 else ""),
+                )
 
     if not extractions:
         logger.info("run_once: no task-bearing files to reconcile")
@@ -280,7 +292,7 @@ def run_once(
         report.finished_at = datetime.now(tz=timezone.utc)
         return report
 
-    # 8. Matcher (with file-level + per-task cache) -----------------------
+    # 8. Matcher ----------------------------------------------------------
     def _hit_match():
         report.cache_hits_match += 1
 
@@ -290,7 +302,6 @@ def run_once(
             project_tree,
             cache,
             content_shas=content_shas,
-            local_paths=local_paths,
             use_cache=use_cache,
             matcher_batch_size=matcher_batch_size,
             matcher_max_workers=matcher_max_workers,
@@ -303,7 +314,12 @@ def run_once(
 
     # 9. Build ReconcilePlans -----------------------------------------------
     try:
-        plans = build_plans_from_match(matcher_result, extractions, client=jira)
+        plans = build_plans_from_match(
+            matcher_result,
+            extractions,
+            client=jira,
+            dirty_anchors_per_file=dirty_anchors_per_file,
+        )
     except Exception as e:  # noqa: BLE001
         report.errors.append(f"build_plans failed: {e}")
         report.finished_at = datetime.now(tz=timezone.utc)

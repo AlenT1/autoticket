@@ -335,9 +335,12 @@ def test_match_miss_on_unknown_file():
     assert c.get_match("ghost", content_sha="x", prompt_sha="z") is None
 
 
-def test_set_extraction_invalidates_matcher_payload():
-    """A fresh extraction must drop any prior matcher decision — the
-    matcher's input changed."""
+def test_set_extraction_preserves_matcher_payload():
+    """Setting a fresh extraction does NOT wipe the cached matcher
+    payload. The per-task partial-match path validates each cached
+    decision against current chunks + anchors, so stale-but-valid
+    decisions (tasks in unchanged chunks) can still be reused. Wiping
+    would force a full Stage-2 re-run on every doc change."""
     c = Cache()
     c.set_match(
         file_id="F1", modified_time="t", content_sha="C", prompt_sha="P",
@@ -348,8 +351,12 @@ def test_set_extraction_invalidates_matcher_payload():
         file_id="F1", modified_time="t", content_sha="C2",
         extraction_payload={"some": "payload"},
     )
-    assert c.get_match("F1", content_sha="C", prompt_sha="P") is None
+    # Old content_sha lookup misses (matcher's content_sha is "C", not
+    # "C2") — Tier 3 won't accidentally serve stale at the file level.
     assert c.get_match("F1", content_sha="C2", prompt_sha="P") is None
+    # But the original entry still exists for the per-task path to read
+    # raw via cache.files[fid].matcher_payload.
+    assert c.files["F1"].matcher_payload is not None
 
 
 def test_drop_match_clears_only_matcher_payload():
@@ -416,55 +423,39 @@ def test_topology_sha_changes_on_epic_added():
     assert a != b
 
 
-def test_diff_payload_round_trip():
+def test_file_text_round_trip():
     c = Cache()
     c.set_classification(
         file_id="F1", modified_time="t", content_sha="C", role="single_epic",
         confidence=1.0, reason="x",
     )
-    c.set_diff_payload(
-        file_id="F1",
-        chunks={"A. Sec|0": "sha-A", "B. Sec|0": "sha-B"},
-        task_anchors={
-            "SEC-1 anchor": {"chunk_id": "A. Sec|0", "body_sha": "sha-A"},
-            "SEC-2 anchor": {"chunk_id": "A. Sec|0", "body_sha": "sha-A"},
-        },
-    )
-    assert c.get_chunks("F1") == {"A. Sec|0": "sha-A", "B. Sec|0": "sha-B"}
-    anchors = c.get_task_anchors("F1")
-    assert anchors["SEC-1 anchor"]["chunk_id"] == "A. Sec|0"
-    assert anchors["SEC-2 anchor"]["body_sha"] == "sha-A"
+    c.set_file_text("F1", "# Title\n\nbody line.\n")
+    assert c.get_file_text("F1") == "# Title\n\nbody line.\n"
 
 
-def test_diff_payload_save_load(tmp_path: Path):
+def test_file_text_save_load(tmp_path: Path):
     p = tmp_path / "cache.json"
     c = Cache()
     c.set_classification(
         file_id="F1", modified_time="t", content_sha="C", role="single_epic",
         confidence=1.0, reason="x",
     )
-    c.set_diff_payload(
-        file_id="F1",
-        chunks={"A|0": "sha-A"},
-        task_anchors={"a1": {"chunk_id": "A|0", "body_sha": "sha-A"}},
-    )
+    c.set_file_text("F1", "saved text")
     c.save(p)
     c2 = Cache.load(p)
-    assert c2.get_chunks("F1") == {"A|0": "sha-A"}
-    assert c2.get_task_anchors("F1")["a1"]["chunk_id"] == "A|0"
+    assert c2.get_file_text("F1") == "saved text"
 
 
-def test_diff_payload_missing_file_returns_empty():
+def test_file_text_missing_file_returns_empty():
     c = Cache()
-    assert c.get_chunks("ghost") == {}
-    assert c.get_task_anchors("ghost") == {}
+    assert c.get_file_text("ghost") == ""
 
 
-def test_diff_payload_set_requires_existing_entry():
-    """set_diff_payload silently does nothing when file_id has no entry —
+def test_set_file_text_requires_existing_entry():
+    """set_file_text silently does nothing when file_id has no entry —
     classification must be set first. This prevents partial entries."""
     c = Cache()
-    c.set_diff_payload(file_id="ghost", chunks={"a": "1"}, task_anchors={})
+    c.set_file_text("ghost", "x")
     assert "ghost" not in c.files
 
 

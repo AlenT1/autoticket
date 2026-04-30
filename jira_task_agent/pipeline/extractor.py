@@ -24,7 +24,8 @@ from ..llm.client import chat, load_prompt, models_extract, render_prompt
 AGENT_MARKER = "<!-- managed-by:jira-task-agent v1 -->"
 _SYSTEM_PROMPT = load_prompt("extractor")
 _SYSTEM_PROMPT_MULTI = load_prompt("extractor_multi")
-_SYSTEM_PROMPT_DIFF = load_prompt("extractor_diff_aware")
+_SYSTEM_PROMPT_DIFF = load_prompt("extractor_diff")
+_SYSTEM_PROMPT_TARGETED = load_prompt("extractor_targeted")
 
 
 @dataclass
@@ -65,26 +66,6 @@ class MultiExtractionResult:
     file_id: str
     file_name: str
     epics: list[ExtractedEpicWithTasks]
-
-
-@dataclass
-class DiffExtractionResult:
-    """Output of the diff-aware extractor.
-
-    Carries only the parts of the file that changed since the cached
-    extraction. The runner merges this with the cached extraction to
-    produce the full extraction for the current run.
-
-    epic_changed=False + epic=None means: reuse the cached epic verbatim.
-    tasks is the list of tasks living in changed chunks (could be a
-    re-extraction of an edited task, or a brand-new task added to a
-    changed chunk). Tasks in unchanged chunks are NOT included here.
-    """
-    file_id: str
-    file_name: str
-    epic_changed: bool
-    epic: ExtractedEpic | None
-    tasks: list[ExtractedTask]
 
 
 class ExtractionError(RuntimeError):
@@ -365,156 +346,224 @@ def extract_multi_from_file(
 
 
 # ----------------------------------------------------------------------
-# Diff-aware extractor
-# ----------------------------------------------------------------------
+# Unified-diff extractor
+@dataclass
+class DiffLabels:
+    """Labels-only verdict from the diff prompt."""
+    modified_anchors: list[str]
+    removed_anchors: list[str]
+    added: list[dict]            # [{summary, section?}]
+    new_subepics: list[dict]     # [{summary}]
+    epic_changed: bool
 
 
-def _serialize_cached_for_prompt(cached: dict | None) -> str:
-    """Compact representation of the cached extraction passed to the
-    diff-aware prompt. We pass enough for the LLM to know what was
-    already extracted (so it doesn't re-emit), but not full bodies —
-    it can see those in the file directly. Saves output tokens.
-    """
+@dataclass
+class TargetedBodies:
+    """Full-body extracts for items the diff prompt flagged."""
+    tasks: list[ExtractedTask]
+    task_sections: list[str | None]
+    epics: list[ExtractedEpicWithTasks]
+    epic_sections: list[str | None]
+
+
+def _serialize_cached_for_diff(cached: dict | None) -> tuple[str, str, str]:
     if not cached:
-        return "{}"
+        return "[]", "null", "[]"
     if cached.get("type") == "multi_epic":
-        compact = {
-            "type": "multi_epic",
-            "epics": [
-                {
-                    "summary": e.get("summary", ""),
-                    "tasks": [
-                        {
-                            "summary": t.get("summary", ""),
-                            "source_anchor": t.get("source_anchor", ""),
-                        }
-                        for t in (e.get("tasks") or [])
-                    ],
-                }
-                for e in (cached.get("epics") or [])
-            ],
-        }
-    else:
-        compact = {
-            "type": "single_epic",
-            "epic": {"summary": (cached.get("epic") or {}).get("summary", "")},
-            "tasks": [
-                {
+        items, sections = [], []
+        for e in cached.get("epics") or []:
+            sections.append({"summary": e.get("summary", "")})
+            for t in e.get("tasks") or []:
+                items.append({
                     "summary": t.get("summary", ""),
                     "source_anchor": t.get("source_anchor", ""),
-                }
-                for t in (cached.get("tasks") or [])
-            ],
-        }
-    return json.dumps(compact, ensure_ascii=False, indent=2)
+                    "section_summary": e.get("summary", ""),
+                })
+        return (
+            json.dumps(items, ensure_ascii=False, indent=2),
+            "null",
+            json.dumps(sections, ensure_ascii=False, indent=2),
+        )
+    items = [
+        {"summary": t.get("summary", ""), "source_anchor": t.get("source_anchor", "")}
+        for t in (cached.get("tasks") or [])
+    ]
+    epic = cached.get("epic") or {}
+    return (
+        json.dumps(items, ensure_ascii=False, indent=2),
+        json.dumps({"summary": epic.get("summary", "")}, ensure_ascii=False, indent=2),
+        "[]",
+    )
 
 
-def extract_diff_aware(
+def _cached_anchor_set(cached: dict | None) -> set[str]:
+    if not cached:
+        return set()
+    out: set[str] = set()
+    if cached.get("type") == "multi_epic":
+        for e in cached.get("epics") or []:
+            for t in e.get("tasks") or []:
+                a = t.get("source_anchor")
+                if a:
+                    out.add(a)
+        return out
+    for t in cached.get("tasks") or []:
+        a = t.get("source_anchor")
+        if a:
+            out.add(a)
+    return out
+
+
+def extract_diff(
     f: DriveFile,
     *,
-    local_path: Path,
-    root_context: str,
-    cached_extraction: dict | None,
-    changed_chunk_ids: list[str],
-) -> DiffExtractionResult:
-    """Re-extract ONLY items in `changed_chunk_ids`.
+    cached_extraction: dict,
+    unified_diff: str,
+    current_file_text: str,
+) -> DiffLabels:
+    """Label what changed between the cached and current file. No bodies."""
+    if not unified_diff.strip():
+        return DiffLabels([], [], [], [], False)
 
-    The LLM gets the full current file + root context + a compact view
-    of the cached extraction + the list of changed chunk headings. It
-    returns just the items in changed chunks — the runner merges those
-    with cached items from unchanged chunks.
-
-    This saves output tokens (small response) while preserving full
-    input context for quality (no extraction-quality regression).
-
-    If the LLM produces malformed output, raises `ExtractionError`. The
-    runner catches this and falls back to a full re-extract.
-    """
-    if not changed_chunk_ids:
-        # Nothing to do — entire file unchanged. Caller shouldn't have
-        # invoked us, but handle defensively.
-        return DiffExtractionResult(
-            file_id=f.id,
-            file_name=f.name,
-            epic_changed=False,
-            epic=None,
-            tasks=[],
-        )
-
+    items_json, epic_json, sections_json = _serialize_cached_for_diff(cached_extraction)
     user_msg = render_prompt(
         _SYSTEM_PROMPT_DIFF,
         task_file_name=f.name,
-        last_modifying_user_name=f.last_modifying_user_name or "(unknown)",
-        file_text=_read(local_path),
-        root_context=root_context,
-        cached_extraction_json=_serialize_cached_for_prompt(cached_extraction),
-        changed_chunks_json=json.dumps(changed_chunk_ids, ensure_ascii=False),
+        cached_items_json=items_json,
+        cached_epic_json=epic_json,
+        cached_sections_json=sections_json,
+        unified_diff=unified_diff,
+        current_file=current_file_text,
     )
     parsed, _ = chat(
         system="You output strict JSON only. Never include markdown fences or prose.",
         user=user_msg,
         models=models_extract(),
-        temperature=0.1,
+        temperature=0.0,
         json_mode=True,
     )
     if not isinstance(parsed, dict):
         raise ExtractionError("diff extractor did not return a JSON object")
 
-    epic_changed = bool(parsed.get("epic_changed"))
-    epic_d = parsed.get("epic")
-    tasks_d = parsed.get("tasks") or []
-    if not isinstance(tasks_d, list):
-        raise ExtractionError("diff extractor 'tasks' is not a list")
+    cached_anchors = _cached_anchor_set(cached_extraction)
+    return DiffLabels(
+        modified_anchors=[
+            a for a in (parsed.get("modified_anchors") or [])
+            if isinstance(a, str) and (not cached_anchors or a in cached_anchors)
+        ],
+        removed_anchors=[
+            a for a in (parsed.get("removed_anchors") or [])
+            if isinstance(a, str) and (not cached_anchors or a in cached_anchors)
+        ],
+        added=[
+            {
+                "summary": str(t.get("summary", "")).strip(),
+                "section": str(t.get("section", "")).strip() or None,
+            }
+            for t in (parsed.get("added") or [])
+            if isinstance(t, dict) and str(t.get("summary", "")).strip()
+        ],
+        new_subepics=[
+            {"summary": str(e.get("summary", "")).strip()}
+            for e in (parsed.get("new_subepics") or [])
+            if isinstance(e, dict) and str(e.get("summary", "")).strip()
+        ],
+        epic_changed=bool(parsed.get("epic_changed")),
+    )
 
-    epic_obj: ExtractedEpic | None = None
-    if epic_changed:
-        if not isinstance(epic_d, dict):
-            raise ExtractionError(
-                "diff extractor reported epic_changed=true but did not "
-                "return an 'epic' object"
-            )
-        epic_obj = ExtractedEpic(
-            summary=str(epic_d.get("summary", "")).strip(),
-            description=_ensure_marker(
-                _inject_co_owners(
-                    str(epic_d.get("description", "")),
-                    epic_d.get("assignee"),
-                )
-            ),
-            assignee_name=_clean_assignee(epic_d.get("assignee")),
-        )
-        _validate_summary(
-            epic_obj.summary,
-            "Epic",
-            min_len=12,
-            max_len=70,
-            ban_coord_connectors=True,
-        )
 
+def extract_targeted(
+    f: DriveFile,
+    *,
+    local_path: Path,
+    targets: dict,
+    root_context: str,
+) -> TargetedBodies:
+    """Produce full Jira-quality bodies for the items in `targets`.
+    `targets = {"tasks": [{summary, section?}], "epics": [{summary, section?}]}`.
+    Empty targets → no LLM call."""
+    if not (targets.get("tasks") or targets.get("epics")):
+        return TargetedBodies([], [], [], [])
+
+    user_msg = render_prompt(
+        _SYSTEM_PROMPT_TARGETED,
+        task_file_name=f.name,
+        last_modifying_user_name=f.last_modifying_user_name or "(unknown)",
+        task_file_content=_read(local_path),
+        targets_json=json.dumps(targets, ensure_ascii=False, indent=2),
+        root_context=root_context,
+    )
+    parsed, _ = chat(
+        system="You output strict JSON only. Never include markdown fences or prose.",
+        user=user_msg,
+        models=models_extract(),
+        temperature=0.0,
+        json_mode=True,
+    )
+    if not isinstance(parsed, dict):
+        raise ExtractionError("targeted extractor did not return a JSON object")
+
+    tasks, task_sections = _parse_targeted_tasks(parsed.get("tasks") or [])
+    epics, epic_sections = _parse_targeted_epics(parsed.get("epics") or [])
+    return TargetedBodies(
+        tasks=tasks, task_sections=task_sections,
+        epics=epics, epic_sections=epic_sections,
+    )
+
+
+def _parse_targeted_tasks(
+    raw: list,
+) -> tuple[list[ExtractedTask], list[str | None]]:
     tasks: list[ExtractedTask] = []
-    for i, t in enumerate(tasks_d):
+    sections: list[str | None] = []
+    for i, t in enumerate(raw):
         if not isinstance(t, dict):
-            raise ExtractionError(f"diff Task #{i + 1} is not an object")
+            continue
         summary = str(t.get("summary", "")).strip()
         description = _ensure_marker(
             _inject_co_owners(str(t.get("description", "")), t.get("assignee"))
         )
         anchor = str(t.get("source_anchor", "")).strip()[:60]
-        _validate_summary(summary, f"Diff task #{i + 1}")
+        _validate_summary(summary, f"Targeted task #{i + 1}")
         _validate_task_description(description, i)
         tasks.append(
             ExtractedTask(
-                summary=summary,
-                description=description,
+                summary=summary, description=description,
                 source_anchor=anchor,
                 assignee_name=_clean_assignee(t.get("assignee")),
             )
         )
+        sec = t.get("section")
+        sections.append(str(sec).strip() if sec else None)
+    return tasks, sections
 
-    return DiffExtractionResult(
-        file_id=f.id,
-        file_name=f.name,
-        epic_changed=epic_changed,
-        epic=epic_obj,
-        tasks=tasks,
-    )
+
+def _parse_targeted_epics(
+    raw: list,
+) -> tuple[list[ExtractedEpicWithTasks], list[str | None]]:
+    epics: list[ExtractedEpicWithTasks] = []
+    sections: list[str | None] = []
+    for i, e in enumerate(raw):
+        if not isinstance(e, dict):
+            continue
+        summary = str(e.get("summary", "")).strip()
+        description = _ensure_marker(
+            _inject_co_owners(str(e.get("description", "")), e.get("assignee"))
+        )
+        try:
+            _validate_summary(
+                summary, f"Targeted epic #{i + 1}",
+                min_len=12, max_len=70, ban_coord_connectors=True,
+            )
+        except ExtractionError:
+            continue
+        epics.append(
+            ExtractedEpicWithTasks(
+                summary=summary, description=description,
+                assignee_name=_clean_assignee(e.get("assignee")),
+                tasks=[],
+            )
+        )
+        sec = e.get("section")
+        sections.append(str(sec).strip() if sec else None)
+    return epics, sections

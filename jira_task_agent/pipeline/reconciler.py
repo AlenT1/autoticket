@@ -277,6 +277,7 @@ def _build_task_actions(
     epic_key: str | None,
     epic_anchor: str,
     client: JiraClient,
+    dirty_anchors: set[str] | None = None,
 ) -> list[Action]:
     """Build per-task Actions given the matcher's decisions.
 
@@ -301,6 +302,27 @@ def _build_task_actions(
     for t, decision in zip(extracted_tasks, task_decisions):
         task_assignee = _resolve_assignee(client, t.assignee_name)
         matched_key = decision.candidate_key
+
+        # Skip tasks the doc didn't change. `dirty_anchors=None` means
+        # "no diff context" (cold path) → process all.
+        if (
+            dirty_anchors is not None
+            and t.source_anchor
+            and t.source_anchor not in dirty_anchors
+        ):
+            actions.append(
+                Action(
+                    kind="noop",
+                    target_key=matched_key,
+                    epic_key=epic_key,
+                    epic_anchor=epic_anchor,
+                    source_anchor=t.source_anchor,
+                    match_confidence=decision.confidence,
+                    match_reason=decision.reason,
+                    note="task unchanged in this run",
+                )
+            )
+            continue
 
         if matched_key is None:
             actions.append(
@@ -408,14 +430,23 @@ def build_plans_from_match(
     extractions: list[tuple[DriveFile, ExtractionResult | MultiExtractionResult]],
     *,
     client: JiraClient,
+    dirty_anchors_per_file: dict[str, set[str] | None] | None = None,
 ) -> list[ReconcilePlan]:
     """Group `matcher_result.file_results` by file_id and build one
     `ReconcilePlan` per file. Each plan contains one `EpicGroup` per
     extracted epic (1 for single_epic, N for multi_epic).
+
+    `dirty_anchors_per_file[file_id]` gates write actions:
+      - None entry (or missing) → process all tasks in that file.
+      - empty set → no tasks changed; all tasks emit noop.
+      - populated set → only items whose identifier is in the set emit
+        write actions; the rest emit noop. Identifiers are task
+        `source_anchor` strings or `"<epic>:N"` for the Nth section's epic.
     """
     extractions_by_file_id: dict[str, tuple[DriveFile, object]] = {
         ext.file_id: (df, ext) for df, ext in extractions
     }
+    dirty_per_file = dirty_anchors_per_file or {}
 
     grouped_by_file: dict[str, list[FileEpicResult]] = {}
     for fr in matcher_result.file_results:
@@ -446,6 +477,43 @@ def build_plans_from_match(
                 if fr.matched_jira_key is None
                 else "matched via LLM matcher"
             )
+            file_dirty = dirty_per_file.get(file_id)
+            section_anchors = {
+                t.source_anchor for t in tasks_for_section if t.source_anchor
+            }
+            epic_token = f"<epic>:{fr.section_index}"
+            epic_is_dirty = (
+                file_dirty is None
+                or fr.matched_jira_key is None
+                or bool(section_anchors & file_dirty)
+                or epic_token in file_dirty
+            )
+
+            if not epic_is_dirty:
+                epic_action = Action(
+                    kind="noop",
+                    target_key=fr.matched_jira_key,
+                    epic_anchor=f"{fr.file_id}#{fr.section_index}",
+                    match_confidence=fr.epic_match_confidence,
+                    match_reason=fr.epic_match_reason,
+                    note="section unchanged in this run",
+                )
+                task_actions: list[Action] = [
+                    Action(
+                        kind="noop",
+                        target_key=decision.candidate_key,
+                        epic_key=fr.matched_jira_key,
+                        epic_anchor=f"{fr.file_id}#{fr.section_index}",
+                        source_anchor=t.source_anchor,
+                        match_confidence=decision.confidence,
+                        match_reason=decision.reason,
+                        note="task unchanged in this run",
+                    )
+                    for t, decision in zip(tasks_for_section, fr.task_decisions)
+                ]
+                groups.append(EpicGroup(epic_action=epic_action, task_actions=task_actions))
+                continue
+
             epic_action, live_epic = _build_epic_action(
                 epic_key=fr.matched_jira_key,
                 extracted_summary=fr.extracted_epic_summary,
@@ -458,20 +526,32 @@ def build_plans_from_match(
                 create_note=create_note,
             )
 
-            # Status-guard short-circuit: if matched epic is in a
-            # completed status, suppress all task-level actions for
-            # this group. The doc is presumed stale.
+            # Suppress task-level actions when the matched epic is in
+            # a completed status — the doc is presumed stale.
             if epic_action.kind == "skip_completed_epic":
-                task_actions: list[Action] = []
+                task_actions = []
             elif fr.matched_jira_key is None:
-                # No match → all extracted tasks are creates under the
-                # not-yet-existing epic.
                 task_actions = []
                 for t in tasks_for_section:
+                    if (
+                        file_dirty is not None
+                        and t.source_anchor
+                        and t.source_anchor not in file_dirty
+                    ):
+                        task_actions.append(
+                            Action(
+                                kind="noop",
+                                epic_key=None,
+                                epic_anchor=f"{fr.file_id}#{fr.section_index}",
+                                source_anchor=t.source_anchor,
+                                note="task unchanged in this run",
+                            )
+                        )
+                        continue
                     task_actions.append(
                         Action(
                             kind="create_task",
-                            epic_key=None,  # resolved at apply time
+                            epic_key=None,
                             epic_anchor=f"{fr.file_id}#{fr.section_index}",
                             summary=t.summary,
                             description=t.description,
@@ -492,6 +572,7 @@ def build_plans_from_match(
                     epic_key=fr.matched_jira_key,
                     epic_anchor=f"{fr.file_id}#{fr.section_index}",
                     client=client,
+                    dirty_anchors=dirty_per_file.get(file_id),
                 )
 
             groups.append(
