@@ -18,11 +18,15 @@ python3 -m venv .venv
 cp .env.example .env
 $EDITOR .env
 
-# 3. run dry-run (no Jira writes); review data/run_plan.json
-.venv/bin/python -m jira_task_agent run
+# 3. RECOMMENDED: review-then-apply via the verify gate.
+#    Renders data/run_plan.md with every proposed change numbered;
+#    you press Enter (approve all), pick a subset (e.g. "1,3,7"),
+#    or type "x" to cancel before any Jira write fires.
+.venv/bin/python -m jira_task_agent run --apply --verify
 
-# 4. apply for real
-.venv/bin/python -m jira_task_agent run --apply
+# Variants:
+.venv/bin/python -m jira_task_agent run                 # dry-run, no writes
+.venv/bin/python -m jira_task_agent run --apply         # apply without the gate
 ```
 
 Required `.env` keys: `FOLDER_ID`, `JIRA_HOST`, `JIRA_PROJECT_KEY`,
@@ -34,28 +38,50 @@ when reading from Drive.
 ## CLI
 
 ```sh
-# default: read both Drive + data/local_files/, dry-run
+# RECOMMENDED — review every proposed change in data/run_plan.md and
+# approve all / a subset / cancel at the verify gate before any Jira
+# write fires.
+python -m jira_task_agent run --apply --verify
+
+# Plain apply (no verify gate)
+python -m jira_task_agent run --apply
+
+# Dry-run (no writes; default)
 python -m jira_task_agent run
 
-# choose source: gdrive | local | both
+# Source: gdrive | local | both (default both)
 python -m jira_task_agent run --source local
 python -m jira_task_agent run --source gdrive
 
-# narrow to one file
+# Narrow to one file
 python -m jira_task_agent run --only V11_Dashboard_Tasks.md
 
-# override the last_run_at cursor
+# Override the last_run_at cursor
 python -m jira_task_agent run --since 2026-01-01
 
-# write to Jira
-python -m jira_task_agent run --apply
-
-# capture intended writes to a JSON without sending
+# Capture intended writes to a JSON without sending
 python -m jira_task_agent run --capture data/would_send.json
 
-# bypass cache (force re-classify + re-extract)
+# Bypass cache (force re-classify + re-extract)
 python -m jira_task_agent run --no-cache
 ```
+
+### `--apply --verify` partial-approval gate
+
+When you pass `--verify` together with `--apply`, the runner stops
+after building the plan and writes `data/run_plan.md` — a numbered,
+human-readable summary of every proposed Jira write. At the prompt:
+
+```
+Review the plan in data/run_plan.md (5 change(s) proposed).
+  ENTER         approve all
+  e.g. 1,3,7    approve only those numbers
+  x             cancel everything
+```
+
+Out-of-range numbers are silently dropped. Skipped actions never reach
+Jira and never enter the cache. The renderer is pure (`pipeline/run_plan_md.py`)
+and deterministic — same plan dict in, same MD out.
 
 ## Pipeline
 
@@ -72,7 +98,21 @@ Jira project ──fetch_project_tree (1 query)──► [tree]  │
                                                        │
                                        ┌───────────────┴───────────────┐
                                      dry-run                       --apply
-                              (run_plan.json + .md)             (Jira writes)
+                              (run_plan.json + .md)                    │
+                                                                       ▼
+                                                           verify gate (--verify)
+                                                                       │
+                                                                       ▼
+                                                          finalize_body (one LLM
+                                                          call per update_*:
+                                                          merges new body with
+                                                          live Jira body —
+                                                          preserves user DoD
+                                                          checkmarks across
+                                                          paraphrasing)
+                                                                       │
+                                                                       ▼
+                                                                  Jira writes
 ```
 
 | Stage | Module |
@@ -81,12 +121,13 @@ Jira project ──fetch_project_tree (1 query)──► [tree]  │
 | Classify | `pipeline/classifier.py` |
 | Bundle root | `pipeline/context_bundler.py` |
 | Extract (cold + multi + diff + targeted) | `pipeline/extractor.py` |
-| Per-file extract w/ caching | `pipeline/file_extract.py` |
+| Per-file extract w/ caching + LLM-output filtering | `pipeline/file_extract.py` |
+| Finalize body (merge new + live, preserve user state) | `pipeline/extractor.py::finalize_body` |
 | Two-stage LLM matcher | `pipeline/matcher.py` |
 | Per-file match w/ caching | `pipeline/file_match.py` |
 | Filter to dirty changes | `pipeline/dirty_filter.py` |
 | Reconcile (action emitter) | `pipeline/reconciler.py` |
-| Apply / capture | `runner.py::_apply_plan` |
+| Apply / capture / verify gate | `runner.py::_apply_plan` + `_verify_gate` |
 | Render run plan as MD | `pipeline/run_plan_md.py` |
 | Orchestrate | `runner.py::run_once` |
 | CLI | `__main__.py` |
@@ -103,6 +144,12 @@ Jira project ──fetch_project_tree (1 query)──► [tree]  │
 
 Warm runs with no doc changes cost ~0 LLM tokens. Bumping the matcher
 prompt or the model id invalidates Tier 3 cache project-wide.
+
+**Save policy.** The cache is persisted **only after a successful
+`--apply` run** (no errors, no `--capture`). Dry-runs and capture-mode
+runs never touch the cache. This protects against state drift: if
+capture-mode wrote cache, a later `--apply` would Tier 2-hit and skip
+`create_*` actions whose Jira issues were never created.
 
 ## Tests
 
