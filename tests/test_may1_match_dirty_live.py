@@ -252,7 +252,10 @@ def test_matcher_partial_path_only_processes_dirty(tmp_path):
         if fr.matched_jira_key is None:
             continue
         tasks = warm_ext.epics[i].tasks
-        if i in dirty_epic_idxs:
+        if i in processed_section_idxs:
+            # Section was re-evaluated by Stage 1 (epic-dirty, has-dirty-
+            # tasks, or brand-new). Stage 2 runs full because the
+            # children list may have shifted with the re-pairing.
             expected_s2_summaries.update(t.summary for t in tasks)
         else:
             expected_s2_summaries.update(
