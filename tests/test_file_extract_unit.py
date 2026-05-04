@@ -25,7 +25,11 @@ from jira_task_agent.pipeline.extractor import (
     MultiExtractionResult,
     TargetedBodies,
 )
-from jira_task_agent.pipeline.file_extract import compute_dirty, extract_or_reuse
+from jira_task_agent.pipeline.file_extract import (
+    _sanitize_labels_against_source,
+    compute_dirty,
+    extract_or_reuse,
+)
 
 
 # ----------------------------------------------------------------------
@@ -73,6 +77,104 @@ def test_compute_dirty_multi_epic_subepic_renamed():
     cached = _multi([("Original", [_task("T1", "a1")])])
     merged = _multi([("Renamed section", [_task("T1", "a1")])])
     assert compute_dirty(cached, merged) == {"<epic>:0"}
+
+
+# ----------------------------------------------------------------------
+# _sanitize_labels_against_source — drops LLM over-emission against the
+# deterministic source-doc text. This is the safety net that prevents an
+# LLM `modified_anchors=[T1, T2]` claim from causing a write when only
+# T2's source bullet actually changed.
+# ----------------------------------------------------------------------
+
+
+def _sanitize_doc(t1_tail: str = "", t2_tail: str = "") -> str:
+    """Build a single_epic source doc with T1 and T2 bullets."""
+    return (
+        "# Test Epic\n\n"
+        "Standing test container. Owner: Saar.\n\n"
+        "## Tasks\n\n"
+        f"- T1 First task — body line one.{t1_tail}\n\n"
+        f"- T2 Second task — body line two.{t2_tail}\n"
+    )
+
+
+def _sanitize_cached_extraction() -> ExtractionResult:
+    return _single([
+        _task("T1 First task", "T1 First task"),
+        _task("T2 Second task", "T2 Second task"),
+    ])
+
+
+def test_sanitizer_drops_modified_when_bullet_unchanged():
+    cached_text = _sanitize_doc()
+    current_text = _sanitize_doc(t2_tail=" Owner: Saar.")
+    labels = DiffLabels(
+        modified_anchors=["T1 First task", "T2 Second task"],
+        removed_anchors=[], added=[], new_subepics=[], epic_changed=False,
+    )
+    out = _sanitize_labels_against_source(
+        labels, _sanitize_cached_extraction(), cached_text, current_text,
+    )
+    assert out.modified_anchors == ["T2 Second task"]
+    assert out.epic_changed is False
+
+
+def test_sanitizer_keeps_modified_when_bullet_changed():
+    cached_text = _sanitize_doc()
+    current_text = _sanitize_doc(t1_tail=" extra", t2_tail=" Owner: Saar.")
+    labels = DiffLabels(
+        modified_anchors=["T1 First task", "T2 Second task"],
+        removed_anchors=[], added=[], new_subepics=[], epic_changed=False,
+    )
+    out = _sanitize_labels_against_source(
+        labels, _sanitize_cached_extraction(), cached_text, current_text,
+    )
+    assert sorted(out.modified_anchors) == ["T1 First task", "T2 Second task"]
+
+
+def test_sanitizer_drops_epic_changed_when_intro_unchanged():
+    cached_text = _sanitize_doc()
+    current_text = _sanitize_doc(t2_tail=" Owner: Saar.")
+    labels = DiffLabels(
+        modified_anchors=[], removed_anchors=[], added=[],
+        new_subepics=[], epic_changed=True,
+    )
+    out = _sanitize_labels_against_source(
+        labels, _sanitize_cached_extraction(), cached_text, current_text,
+    )
+    assert out.epic_changed is False
+
+
+def test_sanitizer_keeps_epic_changed_when_intro_changed():
+    cached_text = _sanitize_doc()
+    current_text = cached_text.replace(
+        "Standing test container. Owner: Saar.",
+        "Standing test container, expanded scope. Owner: Saar.",
+    )
+    labels = DiffLabels(
+        modified_anchors=[], removed_anchors=[], added=[],
+        new_subepics=[], epic_changed=True,
+    )
+    out = _sanitize_labels_against_source(
+        labels, _sanitize_cached_extraction(), cached_text, current_text,
+    )
+    assert out.epic_changed is True
+
+
+def test_sanitizer_keeps_unknown_anchor_defensive():
+    """If the LLM returns an anchor that isn't in the cached extraction,
+    the sanitizer can't verify the source. Defensive default: keep it,
+    let downstream decide."""
+    cached_text = _sanitize_doc()
+    current_text = _sanitize_doc(t2_tail=" Owner: Saar.")
+    labels = DiffLabels(
+        modified_anchors=["totally-hallucinated-anchor"],
+        removed_anchors=[], added=[], new_subepics=[], epic_changed=False,
+    )
+    out = _sanitize_labels_against_source(
+        labels, _sanitize_cached_extraction(), cached_text, current_text,
+    )
+    assert out.modified_anchors == ["totally-hallucinated-anchor"]
 
 
 # ----------------------------------------------------------------------

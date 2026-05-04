@@ -212,6 +212,14 @@ def test_matcher_partial_path_only_processes_dirty(tmp_path):
         int(d[len("<epic>:"):]) for d in dirty if d.startswith("<epic>:")
     } | new_section_indexes
     dirty_task_anchors = {d for d in dirty if not d.startswith("<epic>:")}
+    # Stage 1 always re-runs for any *processed* section: epic-dirty,
+    # has-dirty-tasks, or brand-new. This is the always-Stage-1 self-heal
+    # behavior — Stage 1 LLM stochasticity can mis-pair on a cold run, so
+    # any subsequent run that processes the section re-pairs it.
+    processed_section_idxs = set(dirty_epic_idxs)
+    for i, epic in enumerate(warm_ext.epics):
+        if any(t.source_anchor in dirty_task_anchors for t in epic.tasks):
+            processed_section_idxs.add(i)
 
     section_owner: dict[str, str] = {}
     for i, epic in enumerate(warm_ext.epics):
@@ -230,7 +238,7 @@ def test_matcher_partial_path_only_processes_dirty(tmp_path):
     )
 
     expected_s1_summaries = sorted(
-        warm_ext.epics[i].summary for i in dirty_epic_idxs
+        warm_ext.epics[i].summary for i in processed_section_idxs
     )
     assert s1_summaries == expected_s1_summaries, (
         f"stage1 mismatch: got {s1_summaries}; expected {expected_s1_summaries}"

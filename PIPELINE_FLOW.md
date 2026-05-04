@@ -66,7 +66,7 @@ Three reuse tiers:
   `FileEpicResult`s verbatim, no LLM.
 
 Each tier's invalidation is independent. Bumping a matcher prompt
-(`matcher.txt` / `matcher_grouped.txt`) or `LLM_MODEL_CLASSIFY` changes
+(`match/epic.md` / `match/issue.md`) or `LLM_MODEL_CLASSIFY` changes
 `prompt_sha` and invalidates every cached match across the project. A
 structural change in CENTPM (epic add/remove/rename) changes
 `topology_sha`; that's stored for diagnostics but is not a hard
@@ -107,7 +107,7 @@ set in the cache:
 
 1. `compute_unified_diff(cached_text, current_text)` — pure Python,
    `difflib.unified_diff` with 3 lines of context.
-2. **LLM #1: `extract_diff`** (prompt `extractor_diff.txt`) — labels-only
+2. **LLM #1: `extract_diff`** (prompt `extract/diff.md`) — labels-only
    verdict on each diff region:
    ```json
    {
@@ -121,7 +121,7 @@ set in the cache:
 3. `labels_to_targets(labels, cached)` — picks the items needing fresh
    bodies (modified anchors → cached summary; added → LLM-given summary;
    epic targets cover single-epic body change + new sub-epics).
-4. **LLM #2: `extract_targeted`** (prompt `extractor_targeted.txt`) —
+4. **LLM #2: `extract_targeted`** (prompt `extract/targeted.md`) —
    produces full Jira-quality bodies (with DoD, Acceptance criteria,
    Source) for **only** the items in `targets`. Output is bounded by
    change count, not file size.

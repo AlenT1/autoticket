@@ -15,7 +15,7 @@ from ..llm.client import chat, load_prompt, models_classify, render_prompt
 # Big enough to see top-level section structure (which is the multi_epic
 # signal). The biggest task doc in this folder is ~13 KB.
 _MAX_CONTENT_CHARS = 15_000
-_SYSTEM_PROMPT = load_prompt("classifier")
+_SYSTEM_PROMPT = load_prompt("classify")
 
 
 @dataclass

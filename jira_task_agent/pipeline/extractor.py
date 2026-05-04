@@ -22,10 +22,10 @@ from ..drive.client import DriveFile
 from ..llm.client import chat, load_prompt, models_extract, render_prompt
 
 AGENT_MARKER = "<!-- managed-by:jira-task-agent v1 -->"
-_SYSTEM_PROMPT = load_prompt("extractor")
-_SYSTEM_PROMPT_MULTI = load_prompt("extractor_multi")
-_SYSTEM_PROMPT_DIFF = load_prompt("extractor_diff")
-_SYSTEM_PROMPT_TARGETED = load_prompt("extractor_targeted")
+_SYSTEM_PROMPT = load_prompt("extract/single")
+_SYSTEM_PROMPT_MULTI = load_prompt("extract/multi")
+_SYSTEM_PROMPT_DIFF = load_prompt("extract/diff")
+_SYSTEM_PROMPT_TARGETED = load_prompt("extract/targeted")
 
 
 @dataclass

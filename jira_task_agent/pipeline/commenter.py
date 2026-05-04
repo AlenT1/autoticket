@@ -22,7 +22,7 @@ from __future__ import annotations
 from ..drive.client import DriveFile
 from ..llm.client import chat, load_prompt, models_summarize, render_prompt
 
-_SYSTEM_PROMPT = load_prompt("summarizer")
+_SYSTEM_PROMPT = load_prompt("summarize")
 
 
 def _summarize_changes(

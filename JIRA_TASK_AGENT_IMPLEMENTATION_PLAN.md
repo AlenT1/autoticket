@@ -308,14 +308,14 @@ LLM_MODEL_SUMMARIZE=meta/llama-3.3-70b-instruct
 
 | File                       | Purpose                                                                   |
 |----------------------------|----------------------------------------------------------------------------|
-| `classifier.txt`           | File → `{role, confidence, reason}`.                                       |
-| `extractor_single.txt`     | Cold full extract for `single_epic` files.                                 |
-| `extractor_multi.txt`      | Cold full extract for `multi_epic` files.                                  |
-| `extractor_diff.txt`       | Diff path — **labels only**: `{modified_anchors, removed_anchors, added, new_subepics, epic_changed}`. No bodies, no DoD. Inputs: cached extraction + unified diff. |
-| `extractor_targeted.txt`   | Diff path — full Jira-quality bodies for the items the labels named. Output: `{tasks, epics}` with full descriptions. |
-| `matcher.txt`              | Stage 1 (epic) and Stage 2 (task) matching. Stage 2 leans toward PAIRING — false-pair is bounded; missed-pair = duplicate Jira issue. Description preview is 3000 chars to spot rollup epic descriptions. |
-| `matcher_grouped.txt`      | Stage 2 grouping prompt (4 epics per call, parallel 3 workers).            |
-| `summarizer.txt`           | Comment changelog — 2-5 plain-text bullets.                                |
+| `classify.md`              | File → `{role, confidence, reason}`.                                       |
+| `extract/single.md`        | Cold full extract for `single_epic` files.                                 |
+| `extract/multi.md`         | Cold full extract for `multi_epic` files.                                  |
+| `extract/diff.md`          | Diff path — **labels only**: `{modified_anchors, removed_anchors, added, new_subepics, epic_changed}`. No bodies, no DoD. Inputs: cached extraction + unified diff. |
+| `extract/targeted.md`      | Diff path — full Jira-quality bodies for the items the labels named. Output: `{tasks, epics}` with full descriptions. |
+| `match/epic.md`            | Stage 1 epic matching. Description preview is 3000 chars to spot rollup epic descriptions. |
+| `match/issue.md`           | Stage 2 grouped task matching (4 epics per call, parallel 3 workers). Leans toward PAIRING — false-pair is bounded; missed-pair = duplicate Jira issue. |
+| `summarize.md`             | Comment changelog — 2-5 plain-text bullets.                                |
 
 ### Diff-aware extract pipeline (the doc-as-truth rule)
 
@@ -362,7 +362,7 @@ Four-role classifier (`single_epic` / `multi_epic` / `root` / `skip`),
 
 ### Phase 2 — extractor ✅
 - Single + multi cold extractors with DoD validator + composite-owner injection.
-- Two-prompt diff path: `extractor_diff` (labels) + `extractor_targeted` (bodies).
+- Two-prompt diff path: `extract/diff` (labels) + `extract/targeted` (bodies).
 - `apply_changes` + `compute_dirty` in `pipeline/file_extract`.
 
 ### Phase 3 — Jira write primitives ✅
@@ -441,7 +441,7 @@ HTML marker on every agent-written description.
 | 3 | Jira `@mention` username (`name`) differs from email/displayName.                        | Resolve once via `/issue/{key}` and cache per assignee.                                |
 | 4 | Doc edits overwrite hand-edits made directly in Jira.                                    | **By design.** Doc is source of truth — agent updates and posts a changelog comment naming the source doc + last editor. Prior body lives in Jira's edit history. |
 | 5 | Stage 1 LLM stochasticity — clear matches sometimes return None.                         | Matcher partial path always re-runs Stage 1 for processed sections (self-heals on next warm run, before any duplicate-create can happen). |
-| 6 | Bumping `matcher.txt` / `matcher_grouped.txt` / model IDs invalidates Tier 3 cache project-wide. | Intended: prompt-sha is part of the matcher cache key so behavior changes can't be silently masked. Cost is one full re-match; one-time per prompt change. |
+| 6 | Bumping `match/epic.md` / `match/issue.md` / model IDs invalidates Tier 3 cache project-wide. | Intended: prompt-sha is part of the matcher cache key so behavior changes can't be silently masked. Cost is one full re-match; one-time per prompt change. |
 | 7 | Token cost of LLM calls.                                                                 | `last_run_at` cursor pre-filters; Tier 1/2/3 caches collapse warm-run cost; diff path collapses warm-run extract cost; partial matcher collapses warm-run match cost. |
 | 8 | Task files deleted/moved in the source folder.                                           | **OPEN.** Default: leave existing Jira issues alone, surface in the report.            |
 | 9 | Issue type for child tasks — always `Task`, or sometimes `Story`?                        | **OPEN.** Default to `Task`; allow extractor to suggest `Story`.                       |

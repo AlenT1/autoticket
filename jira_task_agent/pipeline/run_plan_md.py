@@ -48,7 +48,169 @@ Schema (top-level dict):
 """
 from __future__ import annotations
 
-from typing import Any
+from collections import Counter
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..jira.client import JiraClient
+    from ..runner import RunReport
+
+
+def _jira_url(host: str | None, key: str | None) -> str | None:
+    if not host or not key:
+        return None
+    base = host if host.startswith("http") else f"https://{host}"
+    return f"{base.rstrip('/')}/browse/{key}"
+
+
+def _epic_action_dict(ea: Any, jira: Any, host: str | None) -> dict | None:
+    from ..jira.client import get_issue
+    if ea.kind == "update_epic" and ea.target_key:
+        live = (get_issue(ea.target_key, client=jira) if jira else {}) or {}
+        return {
+            "kind": "update_epic",
+            "target_key": ea.target_key,
+            "jira_url": _jira_url(host, ea.target_key),
+            "summary": ea.summary,
+            "description": ea.description,
+            "source_anchor": ea.source_anchor,
+            "assignee_username": ea.assignee_username,
+            "live_summary": live.get("summary"),
+            "live_description": live.get("description"),
+        }
+    if ea.kind == "create_epic":
+        return {
+            "kind": "create_epic",
+            "summary": ea.summary,
+            "description": ea.description,
+            "source_anchor": ea.source_anchor,
+            "assignee_username": ea.assignee_username,
+        }
+    if ea.kind == "skip_completed_epic" and ea.target_key:
+        return {
+            "kind": "skip_completed_epic",
+            "target_key": ea.target_key,
+            "jira_url": _jira_url(host, ea.target_key),
+        }
+    return None
+
+
+def _task_action_dict(
+    ta: Any, *, epic_key: str | None, parent_summary: str | None,
+    jira: Any, host: str | None,
+) -> dict | None:
+    from ..jira.client import get_issue
+    if ta.kind == "update_task" and ta.target_key:
+        live = (get_issue(ta.target_key, client=jira) if jira else {}) or {}
+        return {
+            "kind": "update_task",
+            "target_key": ta.target_key,
+            "jira_url": _jira_url(host, ta.target_key),
+            "summary": ta.summary,
+            "description": ta.description,
+            "source_anchor": ta.source_anchor,
+            "assignee_username": ta.assignee_username,
+            "live_summary": live.get("summary"),
+            "live_description": live.get("description"),
+        }
+    if ta.kind == "create_task":
+        return {
+            "kind": "create_task",
+            "summary": ta.summary,
+            "description": ta.description,
+            "source_anchor": ta.source_anchor,
+            "assignee_username": ta.assignee_username,
+            "parent_epic_key": epic_key,
+            "parent_epic_url": _jira_url(host, epic_key),
+            "parent_epic_summary": parent_summary,
+        }
+    if ta.kind == "covered_by_rollup":
+        return {
+            "kind": "covered_by_rollup",
+            "target_key": ta.target_key,
+            "jira_url": _jira_url(host, ta.target_key),
+            "source_anchor": ta.source_anchor,
+        }
+    return None
+
+
+def _group_actions(g: Any, jira: Any, host: str | None, totals: Counter) -> list[dict]:
+    from ..jira.client import get_issue
+    out: list[dict] = []
+    ea = g.epic_action
+    totals[ea.kind] += 1
+    d = _epic_action_dict(ea, jira, host)
+    if d is not None:
+        out.append(d)
+
+    parent_summary = None
+    if ea.target_key and jira:
+        live_epic = get_issue(ea.target_key, client=jira) or {}
+        parent_summary = live_epic.get("summary") or ea.summary
+
+    for ta in g.task_actions:
+        totals[ta.kind] += 1
+        d = _task_action_dict(
+            ta, epic_key=ea.target_key, parent_summary=parent_summary,
+            jira=jira, host=host,
+        )
+        if d is not None:
+            out.append(d)
+    return out
+
+
+def build_run_plan_dict(
+    report: "RunReport",
+    *,
+    jira: "JiraClient | None" = None,
+    mode: str = "dry-run",
+    source: str = "?",
+) -> dict[str, Any]:
+    """Assemble the renderer's input dict from a RunReport.
+
+    For `update_*` actions, fetches the live Jira state via `jira` so
+    the diff view shows before/after. Pass `jira=None` to skip those
+    reads; the diff section will fall back to "new only".
+    """
+    host = getattr(jira, "host", None) if jira else None
+    totals: Counter = Counter()
+    files_out: list[dict[str, Any]] = []
+
+    for plan in report.plans:
+        actions_out: list[dict[str, Any]] = []
+        for g in plan.groups:
+            actions_out.extend(_group_actions(g, jira, host, totals))
+        files_out.append({
+            "file_name": plan.file_name,
+            "source_url": None,
+            "last_edited_by": None,
+            "actions": actions_out,
+        })
+
+    writes = sum(totals.get(k, 0) for k in (
+        "create_epic", "update_epic", "create_task", "update_task",
+    ))
+    comments = totals.get("update_epic", 0) + totals.get("update_task", 0)
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "mode": mode,
+        "source": source,
+        "files_scanned": len(report.plans),
+        "files_with_changes": sum(1 for f in files_out if f["actions"]),
+        "totals": {
+            "create_epic": totals.get("create_epic", 0),
+            "update_epic": totals.get("update_epic", 0),
+            "create_task": totals.get("create_task", 0),
+            "update_task": totals.get("update_task", 0),
+            "skip_completed_epic": totals.get("skip_completed_epic", 0),
+            "covered_by_rollup": totals.get("covered_by_rollup", 0),
+            "comments": comments,
+            "jira_ops": writes + comments,
+        },
+        "files": files_out,
+    }
 
 
 def render_run_plan_md(plan: dict[str, Any]) -> str:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -186,6 +187,9 @@ def _diff_extract(
         return None
 
     cached_ext = deserialize_extraction(entry.extraction_payload)
+    labels = _sanitize_labels_against_source(
+        labels, cached_ext, cached_text, current_text,
+    )
     targets = labels_to_targets(labels, cached_ext)
     try:
         bodies = extract_targeted(
@@ -216,6 +220,99 @@ def compute_unified_diff(cached_text: str, current_text: str) -> str:
             fromfile="cached", tofile="current", n=3,
         )
     )
+
+
+def _sanitize_labels_against_source(
+    labels: DiffLabels,
+    cached: Extraction,
+    cached_text: str,
+    current_text: str,
+) -> DiffLabels:
+    """Drop `modified_anchors` and `epic_changed` when the source-doc
+    bullet (or epic intro) is byte-identical between cached and current.
+
+    The LLM diff extractor sometimes over-claims which sections changed.
+    This deterministic check is authoritative: if the source text for a
+    given task/epic didn't change, that task/epic isn't modified — no
+    matter what the LLM says.
+    """
+    cached_bullets = _extract_task_bullets(cached_text, cached)
+    return DiffLabels(
+        modified_anchors=_filter_real_modified(
+            labels.modified_anchors, cached_bullets, current_text,
+        ),
+        removed_anchors=labels.removed_anchors,
+        added=labels.added,
+        new_subepics=labels.new_subepics,
+        epic_changed=_real_epic_changed(
+            labels.epic_changed, cached_text, current_text,
+        ),
+    )
+
+
+def _filter_real_modified(
+    anchors: list[str], cached_bullets: dict[str, str], current_text: str,
+) -> list[str]:
+    real: list[str] = []
+    for a in anchors:
+        bullet = cached_bullets.get(a)
+        if bullet and bullet in current_text:
+            logger.info(
+                "diff-extract: dropping spurious modified_anchor %r "
+                "(source bullet unchanged)", a,
+            )
+            continue
+        real.append(a)
+    return real
+
+
+def _real_epic_changed(
+    claimed: bool, cached_text: str, current_text: str,
+) -> bool:
+    if not claimed:
+        return False
+    epic_intro = _extract_epic_intro(cached_text)
+    if epic_intro and epic_intro in current_text:
+        logger.info(
+            "diff-extract: dropping spurious epic_changed "
+            "(source intro unchanged)",
+        )
+        return False
+    return True
+
+
+def _extract_task_bullets(
+    cached_text: str, cached: Extraction,
+) -> dict[str, str]:
+    """For each cached task with a `source_anchor`, locate its bullet
+    block in `cached_text` and return `{anchor: bullet_text}`. The
+    bullet block is the substring from the line where the anchor first
+    appears up to (but not including) the next bullet of the same
+    indent, or end of file."""
+    out: dict[str, str] = {}
+    lines = cached_text.splitlines(keepends=True)
+    anchors = [t.source_anchor for t in _all_tasks(cached) if t.source_anchor]
+
+    starts: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
+        for a in anchors:
+            if a and a in line:
+                starts.append((i, a))
+                break
+    starts.sort()
+    for j, (start_i, anchor) in enumerate(starts):
+        end_i = starts[j + 1][0] if j + 1 < len(starts) else len(lines)
+        out[anchor] = "".join(lines[start_i:end_i]).rstrip() + "\n"
+    return out
+
+
+def _extract_epic_intro(cached_text: str) -> str:
+    """Everything in `cached_text` before the first markdown bullet."""
+    lines = cached_text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*-\s", line):
+            return "".join(lines[:i]).rstrip() + "\n"
+    return cached_text
 
 
 def labels_to_targets(labels: DiffLabels, cached: Extraction) -> dict:

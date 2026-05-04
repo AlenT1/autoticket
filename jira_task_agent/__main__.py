@@ -74,8 +74,8 @@ def _serialize_action(a) -> dict:
         "epic_key": a.epic_key,
         "epic_anchor": a.epic_anchor,
         "summary": a.summary,
+        "description": a.description,
         "assignee_username": a.assignee_username,
-        "before_summary": a.before_summary,
         "source_anchor": a.source_anchor,
         "match_confidence": a.match_confidence,
         "match_reason": a.match_reason,
@@ -86,6 +86,11 @@ def _serialize_action(a) -> dict:
 def cmd_run(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     apply_writes = args.apply or bool(args.capture)
+    if args.verify and not args.apply:
+        print(
+            "--verify only meaningful with --apply; ignoring.", file=sys.stderr,
+        )
+    md_path = Path(args.report_out).with_suffix(".md") if args.report_out else None
     report = run_once(
         apply=apply_writes,
         since_override=args.since,
@@ -96,6 +101,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         target_epic=args.target_epic,
         capture_path=args.capture,
         use_cache=not args.no_cache,
+        verify_before_apply=bool(args.apply and args.verify),
+        verify_md_path=md_path,
     )
     _print_report(report)
 
@@ -124,6 +131,15 @@ def main(argv: list[str] | None = None) -> int:
         "--apply",
         action="store_true",
         help="Actually write to Jira. Without this, the run is dry: classify + extract + reconcile only.",
+    )
+    r.add_argument(
+        "--verify",
+        action="store_true",
+        help=(
+            "Only with --apply. After planning, render the run plan to "
+            "<report_out>.md, print its path, and pause for confirmation. "
+            "Press Enter to apply, Ctrl-C to abort before any Jira writes."
+        ),
     )
     r.add_argument(
         "--since",

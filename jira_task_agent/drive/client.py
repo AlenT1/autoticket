@@ -218,7 +218,11 @@ def list_local_folder(
         return [], {}
     files: list[DriveFile] = []
     paths: dict[str, Path] = {}
-    user = os.environ.get("USER") or "local"
+    user = (
+        os.environ.get("LOCAL_AUTHOR_NAME")
+        or os.environ.get("USER")
+        or "local"
+    )
     for p in sorted(local_dir.iterdir()):
         if not p.is_file() or p.suffix.lower() not in _LOCAL_TEXTUAL_SUFFIXES:
             continue

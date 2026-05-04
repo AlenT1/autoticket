@@ -21,6 +21,7 @@ from __future__ import annotations
 import json as _json
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,6 +85,8 @@ def run_once(
     capture_path: str | None = None,
     matcher_batch_size: int = 4,
     matcher_max_workers: int = 3,
+    verify_before_apply: bool = False,
+    verify_md_path: Path | None = None,
 ) -> RunReport:
     """Single end-to-end run.
 
@@ -348,6 +351,26 @@ def run_once(
             report.bump_action(a.kind)
 
     # 10. apply (or report-only) ------------------------------------------
+    if apply and verify_before_apply:
+        from .pipeline.run_plan_md import build_run_plan_dict, render_run_plan_md
+        plan_dict = build_run_plan_dict(
+            report, jira=jira, mode="apply (verify)", source=source,
+        )
+        md_path = verify_md_path or Path("data") / "run_plan.md"
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(render_run_plan_md(plan_dict), encoding="utf-8")
+        print(f"\nRun plan written to: {md_path}", file=sys.stderr)
+        print(
+            f"  totals: {plan_dict['totals']}", file=sys.stderr,
+        )
+        try:
+            input("Review the plan above, then press Enter to apply (Ctrl-C to abort): ")
+        except (KeyboardInterrupt, EOFError):
+            print("\n[verify] aborted before apply; no Jira writes issued.",
+                  file=sys.stderr)
+            report.finished_at = datetime.now(tz=timezone.utc)
+            return report
+
     if apply:
         for plan in plans:
             f = next((df for df, _ in extractions if _.file_id == plan.file_id), None)

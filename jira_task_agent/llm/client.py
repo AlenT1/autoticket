@@ -80,7 +80,7 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
 def load_prompt(name: str) -> str:
-    """Load `prompts/<name>.md`."""
+    """Load `prompts/<name>.md`. `name` may contain slashes for subdirs."""
     return (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
 
 

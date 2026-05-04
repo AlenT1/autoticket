@@ -36,8 +36,8 @@ from dataclasses import asdict, dataclass, field
 
 from ..llm.client import chat, load_prompt, models_classify, render_prompt
 
-_SYSTEM_PROMPT = load_prompt("matcher")
-_GROUPED_SYSTEM_PROMPT = load_prompt("matcher_grouped")
+_SYSTEM_PROMPT = load_prompt("match/epic")
+_GROUPED_SYSTEM_PROMPT = load_prompt("match/issue")
 # Send a generous preview so the matcher can recognize "rollup" issues —
 # Jira issues whose description summarizes multiple work items in bullets.
 # Smaller previews caused us to miss rollup pairings (e.g. CENTPM-1239's
