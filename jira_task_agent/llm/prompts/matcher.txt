@@ -66,8 +66,32 @@ DOMAIN HINTS:
    - Children full of "Done" / "Closed" / "Cancelled" / "Resolved" status
      suggest the workstream is finished; adopt only if the item clearly
      describes the same finished work, otherwise null.
-- For "task": candidates are already filtered to children of the matched
-  parent epic, so you don't need to consider scope drift across epics.
+- For "task":
+   - Candidates are ALREADY filtered to children of the matched parent
+     epic, so cross-epic scope drift is impossible. The cost calculus
+     here flips compared to epic-level matching: false-pair risk is
+     bounded (sibling tasks under the same epic are at least related
+     work); missed-pair cost is a DUPLICATE Jira issue, which then
+     requires a human to merge. Lean toward PAIRING when the work is
+     plausibly the same.
+   - **Title wording is unreliable as a primary signal.** Different
+     authors phrase the same task differently. Compare descriptions
+     and the underlying nouns/objects/verbs:
+       - same surface (file path, API endpoint, table column, UI
+         component, config flag, ticket-id prefix)?
+       - same problem statement (what's broken, what needs to happen)?
+       - same release scope or feature area?
+     If yes, PAIR — the title difference is just rewording.
+   - Concrete example: item summary "Disable Flows schedule button
+     for the May 1 release" vs candidate summary "Hide/disable
+     schedule button in Flows" with descriptions both saying the
+     Flows page schedule button shouldn't be active because background
+     scheduling doesn't work — these are the SAME task. PAIR with
+     high confidence (>= 0.85). The "Hide" vs "Disable" framing is
+     just author rewording.
+   - Only return null when the item describes work the candidate
+     genuinely doesn't cover (different file/endpoint/component, or
+     different acceptance criteria).
 
 ITEMS (the things to match — use their `index` field as item_index):
 {items_json}
