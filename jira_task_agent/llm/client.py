@@ -80,8 +80,8 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
 def load_prompt(name: str) -> str:
-    """Load `prompts/<name>.txt`."""
-    return (PROMPTS_DIR / f"{name}.txt").read_text(encoding="utf-8")
+    """Load `prompts/<name>.md`."""
+    return (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
 
 
 def render_prompt(template: str, **vars: object) -> str:
