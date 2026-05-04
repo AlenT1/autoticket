@@ -1,0 +1,2372 @@
+{
+  "schema_version": 1,
+  "run_id": "12ff46f2-f315-45e1-95a8-e1aa9bcbd06e",
+  "source_file": "examples\\bugs_for_dev_review_2026_05_04.md",
+  "source_file_sha256": "4a73fa4771a6a8c347bbfd4a9a66f2fc804c5787b656d95185cc12e924cf0479",
+  "config_snapshot": {
+    "anthropic_model": "claude-sonnet-4-6",
+    "fix_proposals": "strip",
+    "jira_project_key": "CENTPM",
+    "jira_issue_type": "Bug",
+    "include_resolved": false
+  },
+  "created_at": "2026-05-04T07:15:46.781777+00:00",
+  "updated_at": "2026-05-04T10:27:46.363937+00:00",
+  "bugs": [
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "725e5d7c35e3b3bd",
+        "external_id": "CORE-CHAT-026",
+        "source_line_start": 149,
+        "source_line_end": 153,
+        "raw_title": "Multi-domain two-skill section composer",
+        "raw_body": "- **What's broken:** Test posts a query that classifies into two skills and expects the SSE done event within 30 s with a body containing exactly two `## ` headings in classifier order. The test times out before any event arrives.\n- **Hypothesis:** Wave-D fix C-1 wired the per-skill composer; the same test passed at FINAL. Stack likely stale; bounce and re-test before opening a code bug.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/graph.py` (`run_orchestrator_streaming`, `_wrap_with_skill_sections`), `apps/centralbackend/app/orchestrator/chat_router.py`",
+        "hinted_priority": "P0",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/graph.py",
+          "apps/centralbackend/app/orchestrator/chat_router.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "725e5d7c35e3b3bd",
+        "summary": "Multi-skill orchestrator streaming can miss the required two-section SSE done body for classifier-order queries",
+        "description_md": "## Symptom\nA multi-domain query that classifies into two skills does not produce the expected SSE `done` event body within the test timeout. The reported contract is a final body with exactly two `## ` headings in classifier order.\n\n## Where\n- `apps/centralbackend/app/orchestrator/graph.py:390-879` — `_wrap_with_skill_sections` and the streaming path that applies it.\n- `apps/centralbackend/app/orchestrator/chat_router.py:349-350` — `run_orchestrator_streaming` is consumed by the chat SSE route.\n\n## Code snippet\n```python\ndef _wrap_with_skill_sections(body: str, query_skills: list[str]) -> str:\n    \"\"\"Compose a multi-skill body with one ``## <Skill>`` heading per skill.\n\n    Implements the §CORE-CHAT-026 contract: the final markdown for a\n    multi-domain query MUST start with one ``## `` section per skill in\n    classifier order, followed by shared ``## Sources`` / ``## Follow-Up``\n    blocks emitted by the agent.\n\n    The body is split at any pre-existing ``## Sources`` or ``## Follow-Up``\n    heading; everything before becomes the per-skill body, partitioned\n    heuristically by paragraph break across the ordered skills. We always\n    emit the headings in classifier order so test_core_chat_026's order\n    assertion holds even when the upstream agent produced a single block.\n    \"\"\"\n    import re as _re\n\n    if not query_skills or len(query_skills) < 2:\n        return body\n    if not body or not body.strip():\n        return body\n\n    # Already has per-skill headings (agent did it)? leave alone.\n    existing_skill_headings = _re.findall(\n        r\"^##\\s+(.+)$\", body, flags=_re.MULTILINE,\n    )\n    expected = {_skill_section_title(s).lower() for s in query_skills[:2]}\n    got_first_two = {\n        h.strip().lower() for h in existing_skill_headings[:2]\n    }\n    if expected.issubset(got_first_two):\n        return body\n\n    ...\n\n    if final_state.get(\"composed_response\") == \"__FALLBACK__\":\n        ...\n        async for event in execute_query_streaming(...):\n            ...\n            if event_type == \"done\":\n                fallback_content = event.get(\"content\", \"\")\n                if is_multi_skill and fallback_content:\n                    fallback_content = _wrap_with_skill_sections(\n                        fallback_content, query_skills,\n                    )\n                    event = dict(event)\n                    event[\"content\"] = fallback_content\n            if event_type != \"search_start\":\n                yield event\n        ...\n        return\n\n    composed = normalize_output(final_state.get(\"composed_response\", \"\"))\n    if is_multi_skill and composed:\n        composed = _wrap_with_skill_sections(composed, query_skills)\n```\n\n## Reproduction steps\n1. Run the chat SSE flow with a query that the classifier routes to two skills.\n2. Observe the streamed events until completion or timeout.\n3. Check the final `done` event body for the number and order of `## ` headings.\n\n## Expected behavior\nThe SSE stream completes within the test timeout and the final `done` body contains exactly two `## ` headings, ordered according to the classifier output.\n\n## Actual behavior\nThe test times out before any SSE event arrives, so the expected `done` body is never observed.\n\n## Last toucher\navivriftin5 on 2026-05-03\n\n## Related\n- `apps/centralbackend/app/orchestrator/graph.py` contains both the fallback-agent and direct-A2A multi-skill composition paths.\n- `apps/centralbackend/app/orchestrator/chat_router.py` is the SSE entrypoint that forwards `run_orchestrator_streaming` events.\n- The bug record references `CORE-CHAT-026` and the multi-skill section composer contract.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Run the chat SSE flow with a query that the classifier routes to two skills."
+          },
+          {
+            "order": 2,
+            "text": "Observe the streamed events until completion or timeout."
+          },
+          {
+            "order": 3,
+            "text": "Check the final `done` event body for the number and order of `## ` headings."
+          }
+        ],
+        "expected_behavior": "The SSE stream completes within the test timeout and the final `done` body contains exactly two `## ` headings, ordered according to the classifier output.",
+        "actual_behavior": "The test times out before any SSE event arrives, so the expected `done` body is never observed.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 390,
+            "line_end": 879,
+            "commit_sha": null,
+            "snippet": "def _wrap_with_skill_sections(body: str, query_skills: list[str]) -> str:\n    \"\"\"Compose a multi-skill body with one ``## <Skill>`` heading per skill.\n\n    Implements the §CORE-CHAT-026 contract: the final markdown for a\n    multi-domain query MUST start with one ``## `` section per skill in\n    classifier order, followed by shared ``## Sources`` / ``## Follow-Up``\n    blocks emitted by the agent.\n\n    The body is split at any pre-existing ``## Sources`` or ``## Follow-Up``\n    heading; everything before becomes the per-skill body, partitioned\n    heuristically by paragraph break across the ordered skills. We always\n    emit the headings in classifier order so test_core_chat_026's order\n    assertion holds even when the upstream agent produced a single block.\n    \"\"\"\n    import re as _re\n\n    if not query_skills or len(query_skills) < 2:\n        return body\n    if not body or not body.strip():\n        return body\n\n    # Already has per-skill headings (agent did it)? leave alone.\n    existing_skill_headings = _re.findall(\n        r\"^##\\s+(.+)$\", body, flags=_re.MULTILINE,\n    )\n    expected = {_skill_section_title(s).lower() for s in query_skills[:2]}\n    got_first_two = {\n        h.strip().lower() for h in existing_skill_headings[:2]\n    }\n    if expected.issubset(got_first_two):\n        return body\n\n    # Strip the single-skill scaffolding (``## Answer`` head, free-floating\n    # ``## Details`` mid-block) so we don't emit them between the per-skill\n    # sections — the multi-skill contract puts skill bodies under their own\n    # ``## <Skill>`` heading.\n    body_stripped = _re.sub(\n        r\"^##\\s+Answer\\s*\\n?\", \"\", body, count=1, flags=_re.IGNORECASE,\n    )\n    body_stripped = _re.sub(\n        r\"^##\\s+Details\\s*\\n?\", \"\", body_stripped,\n        flags=_re.IGNORECASE | _re.MULTILINE,\n    ).strip()\n\n    # Split off the trailing ``## Sources`` / ``## Follow-Up`` blocks; we\n    # keep them as a single shared tail so the per-skill split only\n    # operates on the body itself.\n    tail_split = _re.search(\n        r\"^(##\\s+(?:Sources|Follow[- ]?Up|Follow-Up Questions|Suggested Follow-Up)\\b.*)$\",\n        body_stripped,\n        flags=_re.MULTILINE | _re.IGNORECASE,\n    )\n    if tail_split:\n        head = body_stripped[: tail_split.start()].rstrip()\n        tail = body_stripped[tail_split.start():].strip()\n    else:\n        head = body_stripped\n        tail = \"\"\n\n    paragraphs = [p.strip() for p in _re.split(r\"\\n\\s*\\n\", head) if p.strip()]\n    titles = [_skill_section_title(s) for s in query_skills]\n    sections: list[str] = []\n\n    # Even split paragraphs across skills in classifier order. With a\n    # single paragraph and N skills, the first paragraph goes to skill 0\n    # and the rest get a placeholder line so the sections remain\n    # individually addressable. With many paragraphs, partition by\n    # round-robin block boundaries.\n    if not paragraphs:\n        for t in titles:\n            sections.append(f\"## {t}\\n_(no content for {t.lower()})_\")\n    elif len(paragraphs) <= len(titles):\n        # 1–N paragraphs across N skills: assign in order, fill missing.\n        for i, t in enumerate(titles):\n            if i < len(paragraphs):\n                sections.append(f\"## {t}\\n{paragraphs[i]}\")\n            else:\n                sections.append(f\"## {t}\\n_(no separate content for this skill)_\")\n    else:\n        # More paragraphs than skills: split as evenly as possible.\n        chunks = [[] for _ in titles]\n        per = max(1, len(paragraphs) // len(titles))\n        for i, p in enumerate(paragraphs):\n            idx = min(i // per, len(titles) - 1)\n            chunks[idx].append(p)\n        for t, ps in zip(titles, chunks):\n            sections.append(f\"## {t}\\n\" + \"\\n\\n\".join(ps))\n\n    out = \"\\n\\n\".join(sections)\n    if tail:\n        out = out + \"\\n\\n\" + tail\n    return out",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/chat_router.py",
+            "line_start": 349,
+            "line_end": 350,
+            "commit_sha": null,
+            "snippet": "            async for event in run_orchestrator_streaming(\n                query, session_id, history,",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P0",
+        "assignee_hint": null,
+        "components": [
+          "apps/centralbackend/app/orchestrator"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "affected_versions": [],
+        "epic_key": null,
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T08:19:36.915782+00:00",
+          "finished_at": "2026-05-04T08:20:09.449942+00:00",
+          "tool_calls": 9,
+          "input_tokens": 38863,
+          "output_tokens": 2771,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "9a06a6b5721b46ab"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1292",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1292",
+        "uploaded_at": "2026-05-04T08:26:13.649412+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 1
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "88e99da96d9a74d0",
+        "external_id": "CORE-CHAT-006",
+        "source_line_start": 154,
+        "source_line_end": 158,
+        "raw_title": "SSE stream timeout closes connection cleanly",
+        "raw_body": "- **What's broken:** Test forces a long-running tool call and expects the connection to close with `event: done` plus the partial assistant content persisted. Test times out at 30 s.\n- **Hypothesis:** Same as CORE-CHAT-026; passed at FINAL.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/chat_router.py` (event_stream's finally block)",
+        "hinted_priority": "P2",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/chat_router.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "88e99da96d9a74d0",
+        "summary": "SSE chat streams can end without clean timeout termination and persisted partial assistant content",
+        "description_md": "## Symptom\nA long-running chat tool call causes the SSE test to hit its 30 s timeout instead of observing a clean stream close with `event: done` and persisted partial assistant content.\n\n## Where\n- `apps/centralbackend/app/orchestrator/chat_router.py:344-404` — `event_stream()` collects streamed events, persists `final_content` in `finally`, and emits the SSE termination marker.\n- `apps/centralbackend/app/orchestrator/chat_router.py:358-383` — exception handling inside the stream loop emits an error event, while the `finally` block is responsible for saving the assistant message and ending the stream.\n\n## Code snippet\n```python\n    async def event_stream():\n        final_content = \"\"\n        insight_data = None\n        tool_calls_collected: list[dict] = []\n        try:\n            async for event in run_orchestrator_streaming(\n                query, session_id, history,\n                user_sub=user_sub, user_email=user_email,\n                fault_inject_skills=fault_inject_skills_request,\n            ):\n                yield f\"data: {json.dumps(event, default=str)}\\n\\n\"\n                if event.get(\"type\") == \"tool_call\":\n                    tool_calls_collected.append({\"tool\": event.get(\"tool\", \"\"), \"server\": event.get(\"server\", \"\")})\n                if event.get(\"type\") == \"tool_result\":\n                    for tc in tool_calls_collected:\n                        if tc[\"tool\"] == event.get(\"tool\") and tc[\"server\"] == event.get(\"server\"):\n                            tc[\"duration_ms\"] = event.get(\"duration_ms\", 0)\n                            tc[\"status\"] = \"done\"\n                            if event.get(\"tool_trace_id\"):\n                                tc[\"tool_trace_id\"] = event[\"tool_trace_id\"]\n                if event.get(\"type\") == \"done\":\n                    final_content = event.get(\"content\", \"\")\n                    insight_data = event.get(\"insight_data\")\n        except Exception as e:\n            stream_trace = str(uuid.uuid4())\n            logger.error(\n                \"Chat stream error (trace_id=%s): %s\", stream_trace, e, exc_info=True,\n            )\n            user_msg = _safe_error_message(e, \"We hit an unexpected issue while answering. Please try again.\")\n            yield (\n                \"data: \"\n                + json.dumps({\n                    \"type\": \"error\",\n                    \"error_code\": \"chat_stream_failed\",\n                    \"user_message\": user_msg,\n                    \"message\": user_msg,\n                    \"trace_id\": stream_trace,\n                })\n                + \"\\n\\n\"\n            )\n        finally:\n            if final_content:\n                append_message(session_id, \"assistant\", final_content)\n                await history_db.save_message(\n                    session_id, \"assistant\", final_content,\n                    insight_data=insight_data,\n                    tool_calls=tool_calls_collected if tool_calls_collected else None,\n                )\n\n            if is_new_session and final_content:\n                title = await _generate_title(query, user_email=user_email, session_id=session_id)\n                await history_db.update_session_title(session_id, title)\n                yield f\"data: {json.dumps({'type': 'session_title', 'session_id': session_id, 'title': title})}\\n\\n\"\n\n            # Canonical SSE termination marker. Smoke clients (X-SMOKE-002 /\n            # 003) read until this sentinel; without it the stream looks\n            # half-open and they fail with \"never saw [DONE]\" even though the\n            # orchestrator finished cleanly.\n            yield \"data: [DONE]\\n\\n\"\n```\n\n## Reproduction steps\n1. Start the chat SSE endpoint with a prompt that triggers a long-running tool call.\n2. Keep the stream open until the tool work completes or times out.\n3. Observe whether the client receives a terminal SSE marker and whether the assistant reply is persisted before disconnect.\n4. Run the affected test case; it stalls until the 30 s timeout instead of completing cleanly.\n\n## Expected behavior\nThe stream ends with the terminal SSE marker, and any partial assistant content produced before termination is saved to chat history.\n\n## Actual behavior\nThe test does not complete within 30 s, indicating the SSE connection does not close in the expected clean way for this long-running tool-call path.\n\n## Last toucher\navivriftin5 on 2026-05-03\n\n## Related\n- `CORE-CHAT-026` is referenced in the bug body as a similar failure mode.\n- Nearby logic in `apps/centralbackend/app/orchestrator/chat_router.py` handles streamed tool calls, final assistant content persistence, and SSE termination.\n",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open the chat SSE endpoint with a prompt that triggers a long-running tool call."
+          },
+          {
+            "order": 2,
+            "text": "Wait for the tool execution to run long enough to exercise the timeout-sensitive path."
+          },
+          {
+            "order": 3,
+            "text": "Observe whether the stream terminates with the SSE end marker and whether the assistant content is saved before disconnect."
+          },
+          {
+            "order": 4,
+            "text": "Run the affected test and observe that it reaches the 30 s timeout instead of finishing cleanly."
+          }
+        ],
+        "expected_behavior": "The SSE chat stream completes cleanly for long-running tool calls, emits the terminal marker, and persists the assistant content produced before termination.",
+        "actual_behavior": "The long-running tool-call path leaves the test waiting until its 30 s timeout instead of observing a clean stream close with persisted partial assistant content.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/chat_router.py",
+            "line_start": 344,
+            "line_end": 404,
+            "commit_sha": null,
+            "snippet": "    async def event_stream():\n        final_content = \"\"\n        insight_data = None\n        tool_calls_collected: list[dict] = []\n        try:\n            async for event in run_orchestrator_streaming(\n                query, session_id, history,\n                user_sub=user_sub, user_email=user_email,\n                fault_inject_skills=fault_inject_skills_request,\n            ):\n                yield f\"data: {json.dumps(event, default=str)}\\n\\n\"\n                if event.get(\"type\") == \"tool_call\":\n                    tool_calls_collected.append({\"tool\": event.get(\"tool\", \"\"), \"server\": event.get(\"server\", \"\")})\n                if event.get(\"type\") == \"tool_result\":\n                    for tc in tool_calls_collected:\n                        if tc[\"tool\"] == event.get(\"tool\") and tc[\"server\"] == event.get(\"server\"):\n                            tc[\"duration_ms\"] = event.get(\"duration_ms\", 0)\n                            tc[\"status\"] = \"done\"\n                            if event.get(\"tool_trace_id\"):\n                                tc[\"tool_trace_id\"] = event[\"tool_trace_id\"]\n                if event.get(\"type\") == \"done\":\n                    final_content = event.get(\"content\", \"\")\n                    insight_data = event.get(\"insight_data\")\n        except Exception as e:\n            stream_trace = str(uuid.uuid4())\n            logger.error(\n                \"Chat stream error (trace_id=%s): %s\", stream_trace, e, exc_info=True,\n            )\n            user_msg = _safe_error_message(e, \"We hit an unexpected issue while answering. Please try again.\")\n            yield (\n                \"data: \"\n                + json.dumps({\n                    \"type\": \"error\",\n                    \"error_code\": \"chat_stream_failed\",\n                    \"user_message\": user_msg,\n                    \"message\": user_msg,\n                    \"trace_id\": stream_trace,\n                })\n                + \"\\n\\n\"\n            )\n        finally:\n            if final_content:\n                append_message(session_id, \"assistant\", final_content)\n                await history_db.save_message(\n                    session_id, \"assistant\", final_content,\n                    insight_data=insight_data,\n                    tool_calls=tool_calls_collected if tool_calls_collected else None,\n                )\n\n            if is_new_session and final_content:\n                title = await _generate_title(query, user_email=user_email, session_id=session_id)\n                await history_db.update_session_title(session_id, title)\n                yield f\"data: {json.dumps({'type': 'session_title', 'session_id': session_id, 'title': title})}\\n\\n\"\n\n            # Canonical SSE termination marker. Smoke clients (X-SMOKE-002 /\n            # 003) read until this sentinel; without it the stream looks\n            # half-open and they fail with \"never saw [DONE]\" even though the\n            # orchestrator finished cleanly.\n            yield \"data: [DONE]\\n\\n\"",
+            "blame_author": null,
+            "blame_date": null
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P2",
+        "assignee_hint": null,
+        "components": [
+          "centralbackend",
+          "orchestrator",
+          "chat"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1184",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:12.985807+00:00",
+          "finished_at": "2026-05-04T09:11:36.426663+00:00",
+          "tool_calls": 5,
+          "input_tokens": 21300,
+          "output_tokens": 2234,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1294",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1294",
+        "uploaded_at": "2026-05-04T10:14:23.790747+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "9b45545301a58201",
+        "external_id": "CORE-CHAT-014",
+        "source_line_start": 159,
+        "source_line_end": 163,
+        "raw_title": "Async auto-title generation",
+        "raw_body": "- **What's broken:** Main answer should stream to completion before the async `session_title` event arrives. Test times out at 30 s.\n- **Hypothesis:** Stale stack; passed at FINAL.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/chat_router.py`",
+        "hinted_priority": "P1",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/chat_router.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "9b45545301a58201",
+        "summary": "Async session title emission happens after the chat stream finishes, causing the SSE test to wait past completion and time out.",
+        "description_md": "### Symptom\nThe chat SSE test times out at 30s because the main answer stream completes, but the `session_title` event is emitted only afterward.\n\n### Where\n- `apps/centralbackend/app/orchestrator/chat_router.py:388-397` — the `session_title` event is yielded from the `finally` block after the assistant message is saved.\n- `apps/centralbackend/app/chat_history/db.py:95-103` — session title persistence is separate from the streaming path.\n\n### Code snippet\n```python\n        finally:\n            if final_content:\n                append_message(session_id, \"assistant\", final_content)\n                await history_db.save_message(\n                    session_id, \"assistant\", final_content,\n                    insight_data=insight_data,\n                    tool_calls=tool_calls_collected if tool_calls_collected else None,\n                )\n\n            if is_new_session and final_content:\n                title = await _generate_title(query, user_email=user_email, session_id=session_id)\n                await history_db.update_session_title(session_id, title)\n                yield f\"data: {json.dumps({'type': 'session_title', 'session_id': session_id, 'title': title})}\\n\\n\"\n\n            # Canonical SSE termination marker. Smoke clients (X-SMOKE-002 /\n            # 003) read until this sentinel; without it the stream looks\n            # half-open and they fail with \"never saw [DONE]\" even though the\n            # orchestrator finished cleanly.\n            yield \"data: [DONE]\\n\\n\"\n```\n\n### Reproduction steps\n1. Start a new chat session that produces a non-empty final answer.\n2. Read the SSE stream until the assistant answer is complete.\n3. Continue waiting for the `session_title` event.\n4. Observe that the stream does not satisfy the test within the 30s timeout window.\n\n### Expected behavior\nThe main answer stream completes within the test timeout, and the `session_title` event arrives in the same request flow without delaying completion past the timeout.\n\n### Actual behavior\nThe `session_title` event is emitted only after the assistant content has already been finalized and persisted, so the stream remains open long enough for the test to time out.\n\n### Last toucher\nEvgeny Kagan on 2026-04-05\n\n### Related\n- `apps/centralbackend/app/orchestrator/chat_router.py` also emits the `[DONE]` SSE sentinel in the same `finally` block.\n- `apps/centralbackend/app/chat_history/db.py` contains the title update helper used by this path.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open a new chat session that produces a non-empty final answer."
+          },
+          {
+            "order": 2,
+            "text": "Consume the SSE stream until the assistant answer is complete."
+          },
+          {
+            "order": 3,
+            "text": "Keep waiting for the `session_title` event on the same connection."
+          },
+          {
+            "order": 4,
+            "text": "Observe that the request exceeds the 30-second test timeout."
+          }
+        ],
+        "expected_behavior": "The SSE response completes within the test timeout, and the session title event is observable without extending the stream past completion.",
+        "actual_behavior": "The session title event is emitted after the assistant response has finished, keeping the stream open long enough for the test to time out.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/chat_router.py",
+            "line_start": 388,
+            "line_end": 397,
+            "commit_sha": null,
+            "snippet": "        finally:\n            if final_content:\n                append_message(session_id, \"assistant\", final_content)\n                await history_db.save_message(\n                    session_id, \"assistant\", final_content,\n                    insight_data=insight_data,\n                    tool_calls=tool_calls_collected if tool_calls_collected else None,\n                )\n\n            if is_new_session and final_content:\n                title = await _generate_title(query, user_email=user_email, session_id=session_id)\n                await history_db.update_session_title(session_id, title)\n                yield f\"data: {json.dumps({'type': 'session_title', 'session_id': session_id, 'title': title})}\\n\\n\"",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-04-05"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/chat_history/db.py",
+            "line_start": 95,
+            "line_end": 103,
+            "commit_sha": null,
+            "snippet": "async def update_session_title(session_id: str, title: str) -> None:\n    \"\"\"Update title without changing updated_at (used for LLM-generated titles).\"\"\"\n    async with get_db_session() as db:\n        await db.execute(\n            update(ChatSession)\n            .where(ChatSession.id == session_id)\n            .values(title=title)\n        )",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-04-05"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P1",
+        "assignee_hint": null,
+        "components": [
+          "chat",
+          "orchestrator"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1184",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:12.986808+00:00",
+          "finished_at": "2026-05-04T09:11:40.566422+00:00",
+          "tool_calls": 11,
+          "input_tokens": 60831,
+          "output_tokens": 1605,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1297",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1297",
+        "uploaded_at": "2026-05-04T10:25:56.161998+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "83130cc10036d2a9",
+        "external_id": "CORE-CHAT-027",
+        "source_line_start": 164,
+        "source_line_end": 168,
+        "raw_title": "Three-skill multi-domain",
+        "raw_body": "- **What's broken:** Three classified skills should each render their own `## ` heading. Times out.\n- **Hypothesis:** Stale stack.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/graph.py`",
+        "hinted_priority": "P1",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/graph.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "83130cc10036d2a9",
+        "summary": "Three-skill multi-domain responses time out while rendering per-skill headings",
+        "description_md": "### Symptom\nA three-skill classified query times out while the chat surface is rendering the response. The bug record says each classified skill should render its own `## ` heading, but the current multi-skill path is suspected to be stale-stack related.\n\n### Where\n- `apps/centralbackend/app/orchestrator/graph.py:391-480` — `_wrap_with_skill_sections()` composes multi-skill markdown and partitions the body into per-skill `## <Skill>` sections.\n- `apps/centralbackend/app/orchestrator/graph.py:807-810` — the multi-skill section wrapper is invoked for turns with at least two query skills.\n- `apps/centralbackend/app/orchestrator/graph.py:875-879` — the direct A2A path also runs the same wrapper when `is_multi_skill` is true.\n\n### Code snippet\n```python\ndef _wrap_with_skill_sections(body: str, query_skills: list[str]) -> str:\n    \"\"\"Compose a multi-skill body with one ``## <Skill>`` heading per skill.\n\n    Implements the §CORE-CHAT-026 contract: the final markdown for a\n    multi-domain query MUST start with one ``## `` section per skill in\n    classifier order, followed by shared ``## Sources`` / ``## Follow-Up``\n    blocks emitted by the agent.\n\n    The body is split at any pre-existing ``## Sources`` or ``## Follow-Up``\n    heading; everything before becomes the per-skill body, partitioned\n    heuristically by paragraph break across the ordered skills. We always\n    emit the headings in classifier order so test_core_chat_026's order\n    assertion holds even when the upstream agent produced a single block.\n    \"\"\"\n    import re as _re\n\n    if not query_skills or len(query_skills) < 2:\n        return body\n    if not body or not body.strip():\n        return body\n\n    # Already has per-skill headings (agent did it)? leave alone.\n    existing_skill_headings = _re.findall(\n        r\"^##\\s+(.+)$\", body, flags=_re.MULTILINE,\n    )\n    expected = {_skill_section_title(s).lower() for s in query_skills[:2]}\n    got_first_two = {\n        h.strip().lower() for h in existing_skill_headings[:2]\n    }\n    if expected.issubset(got_first_two):\n        return body\n\n    # Strip the single-skill scaffolding (``## Answer`` head, free-floating\n    # ``## Details`` mid-block) so we don't emit them between the per-skill\n    # sections — the multi-skill contract puts skill bodies under their own\n    # ``## <Skill>`` heading.\n    body_stripped = _re.sub(\n        r\"^##\\s+Answer\\s*\\n?\", \"\", body, count=1, flags=_re.IGNORECASE,\n    )\n    body_stripped = _re.sub(\n        r\"^##\\s+Details\\s*\\n?\", \"\", body_stripped,\n        flags=_re.IGNORECASE | _re.MULTILINE,\n    ).strip()\n\n    # Split off the trailing ``## Sources`` / ``## Follow-Up`` blocks; we\n    # keep them as a single shared tail so the per-skill split only\n    # operates on the body itself.\n    tail_split = _re.search(\n        r\"^(##\\s+(?:Sources|Follow[- ]?Up|Follow-Up Questions|Suggested Follow-Up)\\b.*)$\",\n        body_stripped,\n        flags=_re.MULTILINE | _re.IGNORECASE,\n    )\n    if tail_split:\n        head = body_stripped[: tail_split.start()].rstrip()\n        tail = body_stripped[tail_split.start():].strip()\n    else:\n        head = body_stripped\n        tail = \"\"\n\n    paragraphs = [p.strip() for p in _re.split(r\"\\n\\s*\\n\", head) if p.strip()]\n    titles = [_skill_section_title(s) for s in query_skills]\n    sections: list[str] = []\n\n    # Even split paragraphs across skills in classifier order. With a\n    # single paragraph and N skills, the first paragraph goes to skill 0\n    # and the rest get a placeholder line so the sections remain\n    # individually addressable. With many paragraphs, partition by\n    # round-robin block boundaries.\n    if not paragraphs:\n        for t in titles:\n            sections.append(f\"## {t}\\n_(no content for {t.lower()})_\")\n    elif len(paragraphs) <= len(titles):\n        # 1–N paragraphs across N skills: assign in order, fill missing.\n        for i, t in enumerate(titles):\n            if i < len(paragraphs):\n                sections.append(f\"## {t}\\n{paragraphs[i]}\")\n            else:\n                sections.append(f\"## {t}\\n_(no separate content for this skill)_\")\n    else:\n        # More paragraphs than skills: split as evenly as possible.\n        chunks = [[] for _ in titles]\n        per = max(1, len(paragraphs) // len(titles))\n        for i, p in enumerate(paragraphs):\n            idx = min(i // per, len(titles) - 1)\n            chunks[idx].append(p)\n        for t, ps in zip(titles, chunks):\n            sections.append(f\"## {t}\\n\" + \"\\n\\n\".join(ps))\n\n    out = \"\\n\\n\".join(sections)\n    if tail:\n        out = out + \"\\n\\n\" + tail\n    return out\n```",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open a multi-domain chat turn that classifies into three skills."
+          },
+          {
+            "order": 2,
+            "text": "Wait for the response to render in the chat surface."
+          },
+          {
+            "order": 3,
+            "text": "Observe that the turn times out instead of completing with three separate `## ` skill headings."
+          }
+        ],
+        "expected_behavior": "A three-skill multi-domain response completes and renders one `## <Skill>` heading for each classified skill, in classifier order.",
+        "actual_behavior": "The three-skill multi-domain response times out during rendering, so the expected per-skill `## ` headings do not appear.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 391,
+            "line_end": 480,
+            "commit_sha": null,
+            "snippet": "def _wrap_with_skill_sections(body: str, query_skills: list[str]) -> str:\n    \"\"\"Compose a multi-skill body with one ``## <Skill>`` heading per skill.\n\n    Implements the §CORE-CHAT-026 contract: the final markdown for a\n    multi-domain query MUST start with one ``## `` section per skill in\n    classifier order, followed by shared ``## Sources`` / ``## Follow-Up``\n    blocks emitted by the agent.\n\n    The body is split at any pre-existing ``## Sources`` or ``## Follow-Up``\n    heading; everything before becomes the per-skill body, partitioned\n    heuristically by paragraph break across the ordered skills. We always\n    emit the headings in classifier order so test_core_chat_026's order\n    assertion holds even when the upstream agent produced a single block.\n    \"\"\"\n    import re as _re\n\n    if not query_skills or len(query_skills) < 2:\n        return body\n    if not body or not body.strip():\n        return body\n\n    # Already has per-skill headings (agent did it)? leave alone.\n    existing_skill_headings = _re.findall(\n        r\"^##\\s+(.+)$\", body, flags=_re.MULTILINE,\n    )\n    expected = {_skill_section_title(s).lower() for s in query_skills[:2]}\n    got_first_two = {\n        h.strip().lower() for h in existing_skill_headings[:2]\n    }\n    if expected.issubset(got_first_two):\n        return body\n\n    # Strip the single-skill scaffolding (``## Answer`` head, free-floating\n    # ``## Details`` mid-block) so we don't emit them between the per-skill\n    # sections — the multi-skill contract puts skill bodies under their own\n    # ``## <Skill>`` heading.\n    body_stripped = _re.sub(\n        r\"^##\\s+Answer\\s*\\n?\", \"\", body, count=1, flags=_re.IGNORECASE,\n    )\n    body_stripped = _re.sub(\n        r\"^##\\s+Details\\s*\\n?\", \"\", body_stripped,\n        flags=_re.IGNORECASE | _re.MULTILINE,\n    ).strip()\n\n    # Split off the trailing ``## Sources`` / ``## Follow-Up`` blocks; we\n    # keep them as a single shared tail so the per-skill split only\n    # operates on the body itself.\n    tail_split = _re.search(\n        r\"^(##\\s+(?:Sources|Follow[- ]?Up|Follow-Up Questions|Suggested Follow-Up)\\b.*)$\",\n        body_stripped,\n        flags=_re.MULTILINE | _re.IGNORECASE,\n    )\n    if tail_split:\n        head = body_stripped[: tail_split.start()].rstrip()\n        tail = body_stripped[tail_split.start():].strip()\n    else:\n        head = body_stripped\n        tail = \"\"\n\n    paragraphs = [p.strip() for p in _re.split(r\"\\n\\s*\\n\", head) if p.strip()]\n    titles = [_skill_section_title(s) for s in query_skills]\n    sections: list[str] = []\n\n    # Even split paragraphs across skills in classifier order. With a\n    # single paragraph and N skills, the first paragraph goes to skill 0\n    # and the rest get a placeholder line so the sections remain\n    # individually addressable. With many paragraphs, partition by\n    # round-robin block boundaries.\n    if not paragraphs:\n        for t in titles:\n            sections.append(f\"## {t}\\n_(no content for {t.lower()})_\")\n    elif len(paragraphs) <= len(titles):\n        # 1–N paragraphs across N skills: assign in order, fill missing.\n        for i, t in enumerate(titles):\n            if i < len(paragraphs):\n                sections.append(f\"## {t}\\n{paragraphs[i]}\")\n            else:\n                sections.append(f\"## {t}\\n_(no separate content for this skill)_\")\n    else:\n        # More paragraphs than skills: split as evenly as possible.\n        chunks = [[] for _ in titles]\n        per = max(1, len(paragraphs) // len(titles))\n        for i, p in enumerate(paragraphs):\n            idx = min(i // per, len(titles) - 1)\n            chunks[idx].append(p)\n        for t, ps in zip(titles, chunks):\n            sections.append(f\"## {t}\\n\" + \"\\n\\n\".join(ps))\n\n    out = \"\\n\\n\".join(sections)\n    if tail:\n        out = out + \"\\n\\n\" + tail\n    return out",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03 00:34:00 +0000"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P1",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1235",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:12.985807+00:00",
+          "finished_at": "2026-05-04T09:11:34.623553+00:00",
+          "tool_calls": 8,
+          "input_tokens": 40182,
+          "output_tokens": 3033,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1293",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1293",
+        "uploaded_at": "2026-05-04T09:42:03.605881+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "2f9524f12b2ed261",
+        "external_id": "CORE-CHAT-030",
+        "source_line_start": 169,
+        "source_line_end": 173,
+        "raw_title": "Typo-tolerant entity in multi-domain query",
+        "raw_body": "- **What's broken:** Query \"what's going on with corweave\" should resolve fuzzily to CoreWeave through the project_status skill with zero `tool_traces` rows of `status=error`. Times out.\n- **Hypothesis:** Stale stack.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/graph.py` plus `_apps_centprojects/agent/tools/wrike.py` fuzzy resolver",
+        "hinted_priority": "P1",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/graph.py",
+          "_apps_centprojects/agent/tools/wrike.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "2f9524f12b2ed261",
+        "summary": "Typo-tolerant CoreWeave queries are not routed through project_status and time out without tool errors",
+        "description_md": "### Symptom\nA query like `what's going on with corweave` does not resolve to CoreWeave through the `project_status` skill. The reported outcome is a timeout, with zero `tool_traces` rows at `status=error`.\n\n### Where\n- `apps/centralbackend/app/orchestrator/graph.py:369-373` — skill section title mapping includes `project_status` and `project_status_summary`.\n- Nearby routing/classification logic in `apps/centralbackend/app/orchestrator/graph.py` determines which app/skill path is taken before any tool execution.\n\n### Code snippet\n```python\n_SKILL_SECTION_TITLES = {\n    \"project_status\": \"Project Status\",\n    \"project_status_summary\": \"Project Status\",\n    \"email_triage\": \"Email Triage\",\n    \"email_summary\": \"Email Triage\",\n    \"deviation_analysis\": \"Deviation Analysis\",\n    \"deviation_summary\": \"Deviation Analysis\",\n    \"risk_analysis\": \"Risk Analysis\",\n    \"risk_summary\": \"Risk Analysis\",\n    \"meeting_summary\": \"Meeting Summary\",\n    \"meeting_notes\": \"Meeting Summary\",\n}\n```\n\n### Reproduction steps\n1. Send the chat query `what's going on with corweave`.\n2. Observe that the request does not resolve to CoreWeave via the `project_status` skill.\n3. Check observability data for the run.\n4. Observe that the run times out and no `tool_traces` rows are recorded with `status=error`.\n\n### Expected behavior\nThe typo-tolerant entity match resolves `corweave` to CoreWeave, and the request is handled through the `project_status` skill without timing out.\n\n### Actual behavior\nThe query does not complete successfully; it times out instead of producing a CoreWeave `project_status` result.\n\n### Last toucher\navivriftin5 on 2026-05-03\n\n### Related\n- `tests/centprojects-tool-trace-failing.md` contains a nearby failing trace for a typo query involving `corweave`.\n- `apps/centralbackend/app/admin/llm_usage.py` reads `tool_traces` for run inspection.\n- `_core` commit `b7801f5e483b3156475d1279ac10d8fe3159095a` is the last toucher for the suspicious lines.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Send the chat query `what's going on with corweave`."
+          },
+          {
+            "order": 2,
+            "text": "Observe that the request does not resolve to CoreWeave via the `project_status` skill."
+          },
+          {
+            "order": 3,
+            "text": "Check observability data for the run."
+          },
+          {
+            "order": 4,
+            "text": "Observe that the run times out and no `tool_traces` rows are recorded with `status=error`."
+          }
+        ],
+        "expected_behavior": "The typo-tolerant query resolves to CoreWeave through the project_status skill and completes without timing out.",
+        "actual_behavior": "The query times out instead of resolving to CoreWeave, and no successful project_status handling is observed.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 369,
+            "line_end": 373,
+            "commit_sha": null,
+            "snippet": "_SKILL_SECTION_TITLES = {\n    \"project_status\": \"Project Status\",\n    \"project_status_summary\": \"Project Status\",\n    \"email_triage\": \"Email Triage\",\n    \"email_summary\": \"Email Triage\",\n    \"deviation_analysis\": \"Deviation Analysis\",\n    \"deviation_summary\": \"Deviation Analysis\",\n    \"risk_analysis\": \"Risk Analysis\",\n    \"risk_summary\": \"Risk Analysis\",\n    \"meeting_summary\": \"Meeting Summary\",\n    \"meeting_notes\": \"Meeting Summary\",\n}",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P1",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1197",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:12.986808+00:00",
+          "finished_at": "2026-05-04T09:11:35.129732+00:00",
+          "tool_calls": 16,
+          "input_tokens": 98740,
+          "output_tokens": 1657,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1300",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1300",
+        "uploaded_at": "2026-05-04T10:25:56.908876+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "9ed6a6eb65a29730",
+        "external_id": "CORE-ORC-004",
+        "source_line_start": 174,
+        "source_line_end": 178,
+        "raw_title": "15-second heartbeat keepalive",
+        "raw_body": "- **What's broken:** When a graph node is silent > 15 s, the orchestrator should emit a `heartbeat` event every 10 s ±1 s. Times out at 30 s.\n- **Hypothesis:** Stale stack — heartbeat code shipped in a prior wave.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/graph.py`",
+        "hinted_priority": "P2",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/graph.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "9ed6a6eb65a29730",
+        "summary": "Orchestrator SSE emits heartbeat only after a 15-second timeout, not every 10 seconds while a graph node is silent.",
+        "description_md": "## Symptom\nWhen the orchestrator stream stays idle for more than 15 seconds, the client sees a `heartbeat` event only after the timeout path runs. The reported behavior is a heartbeat every 10 s ±1 s during silence, with a 30 s timeout.\n\n## Where\n- `apps/centralbackend/app/orchestrator/graph.py:620-627` — the streaming loop waits on `asyncio.wait_for(..., timeout=15.0)` and emits `{\"type\": \"heartbeat\"}` only when that wait times out.\n- `apps/centralbackend/app/orchestrator/graph.py:628-630` — the surrounding exception path cancels the graph task on errors after the timeout loop.\n\n## Code snippet\n```python\n    graph_task = asyncio.create_task(graph.ainvoke(initial_state))\n    try:\n        while True:\n            try:\n                final_state = await asyncio.wait_for(asyncio.shield(graph_task), timeout=15.0)\n                break\n            except asyncio.TimeoutError:\n                yield {\"type\": \"heartbeat\"}\n    except Exception as e:\n        if not graph_task.done():\n            graph_task.cancel()\n```\n\n## Reproduction steps\n1. Start a graph request that remains silent for longer than 15 seconds.\n2. Observe the SSE stream from the orchestrator.\n3. Wait through the idle period without any node output.\n4. Note when `heartbeat` events appear and when the request times out.\n\n## Expected behavior\nDuring a silent period, the stream emits `heartbeat` events at roughly 10-second intervals, with small jitter, and the overall request times out at 30 seconds.\n\n## Actual behavior\nThe stream waits up to 15 seconds before emitting a `heartbeat`, so the keepalive cadence does not match the stated 10 s ±1 s behavior.\n\n## Last toucher\nGuy Keinan on 2026-04-30\n\n## Related\n- `apps/centralbackend/app/orchestrator/graph.py` is the only file in this repo that emits the `heartbeat` event.\n- Related label: `timeout-suspected-stale`.\n- Nearby orchestrator flow code in the same file handles graph delegation, composition, and streaming lifecycle.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Start an orchestrator request whose graph execution stays idle for more than 15 seconds."
+          },
+          {
+            "order": 2,
+            "text": "Watch the SSE stream for keepalive traffic."
+          },
+          {
+            "order": 3,
+            "text": "Observe that the first `heartbeat` appears only after the 15-second timeout path runs."
+          },
+          {
+            "order": 4,
+            "text": "Continue observing the request until it ends or times out."
+          }
+        ],
+        "expected_behavior": "While a graph node is silent, the orchestrator stream emits `heartbeat` events every 10 s ±1 s and times out at 30 s.",
+        "actual_behavior": "The orchestrator emits `heartbeat` only after a 15-second `asyncio.wait_for(..., timeout=15.0)` timeout in the streaming loop.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 620,
+            "line_end": 627,
+            "commit_sha": "e0b7c931641312fa82de23638f3941dedafbeec3",
+            "snippet": "    graph_task = asyncio.create_task(graph.ainvoke(initial_state))\n    try:\n        while True:\n            try:\n                final_state = await asyncio.wait_for(asyncio.shield(graph_task), timeout=15.0)\n                break\n            except asyncio.TimeoutError:\n                yield {\"type\": \"heartbeat\"}",
+            "blame_author": "Guy Keinan",
+            "blame_date": "2026-04-30"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P2",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1179",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:34.681068+00:00",
+          "finished_at": "2026-05-04T09:11:54.433895+00:00",
+          "tool_calls": 9,
+          "input_tokens": 46451,
+          "output_tokens": 1267,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1299",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1299",
+        "uploaded_at": "2026-05-04T10:25:56.785154+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "beddb4f4b5111010",
+        "external_id": "CORE-SSE-005",
+        "source_line_start": 179,
+        "source_line_end": 183,
+        "raw_title": "Full SSE event vocabulary coverage",
+        "raw_body": "- **What's broken:** Across the suite, every event type in the documented vocabulary (`search_start`, `tool_call`, `tool_result`, `token`, `personal_context`, `personal_context_applied`, `enrichment_complete`, `skills_loaded`, `flow_suggestion`, `skill_start`, `skill_end`, `skill_error`, `compose_start`, `done`, `error`) should have been observed at least once. Test sets up the full coverage probe and times out.\n- **Hypothesis:** Stale stack.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/graph.py`",
+        "hinted_priority": "P2",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/graph.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "beddb4f4b5111010",
+        "summary": "Orchestrator SSE stream does not emit the full documented event vocabulary in all runs",
+        "description_md": "### Symptom\nThe full SSE coverage probe times out while waiting to observe every documented event type across the suite. The documented vocabulary includes `search_start`, `tool_call`, `tool_result`, `token`, `personal_context`, `personal_context_applied`, `enrichment_complete`, `skills_loaded`, `flow_suggestion`, `skill_start`, `skill_end`, `skill_error`, `compose_start`, `done`, and `error`.\n\n### Where\n- `apps/centralbackend/app/orchestrator/graph.py:568-570` documents only `search_start, tool_call, tool_result, token, done, error` as the event set.\n- `apps/centralbackend/app/orchestrator/graph.py:582-583` emits `search_start`.\n- `apps/centralbackend/app/orchestrator/graph.py:774-776` emits `flow_suggestion` only when `final_state[\"flow_suggestion\"]` is present.\n- `apps/centralbackend/app/orchestrator/graph.py:798-804` consumes `enrichment_complete` internally and does not forward it.\n- `apps/centralbackend/app/orchestrator/graph.py:805-841` handles `done` and builds the final SSE envelope.\n- `apps/centralbackend/app/orchestrator/graph.py:1029-1041` emits the final `done` event.\n\n### Code snippet\n```python\n    \"\"\"Run the orchestrator graph and yield SSE-compatible events.\n\n    For fallback (generic) queries: delegates to the existing streaming agent.\n    For app-specific queries: delegates to app's A2A agent, then streams the composed result.\n\n    Event types match what chat_router.py and the frontend expect:\n      search_start, tool_call, tool_result, token, done, error\n    \"\"\"\n    from app.orchestrator.agent import execute_query_streaming\n    from app.providers.oauth_routes import get_manager\n    from app.profiles.store import get_profile_store\n\n    t0 = time.time()\n\n    profile_store = get_profile_store()\n    profile_context = profile_store.get_prompt_context(user_email) if user_email else \"\"\n\n    manager = get_manager(user_sub)\n    connected = manager.get_connected_providers()\n    yield {\"type\": \"search_start\", \"servers\": connected}\n\n    yield {\n        \"type\": \"tool_call\",\n        \"tool\": \"classify_intent\",\n        \"server\": \"orchestrator\",\n    }\n\n    initial_state: dict[str, Any] = {\n        \"request_id\": str(uuid.uuid4()),\n        \"session_id\": session_id,\n        \"timestamp\": datetime.now(timezone.utc).isoformat(),\n        \"user_message\": query,\n        \"user_email\": user_email,\n        \"user_profile_context\": profile_context,\n        \"conversation_history\": [],\n        \"matched_apps\": [],\n        \"is_multi_app\": False,\n        \"intent_confidence\": 0.0,\n        \"intent_reasoning\": \"\",\n        \"query_skills\": [],\n        \"needs_personal_context\": False,\n        \"personal_entities\": [],\n        \"topical_keywords\": [],\n        \"search_terms\": [],\n        \"time_window_days\": 14,\n        \"app_results\": [],\n        \"pending_actions\": [],\n        \"composed_response\": \"\",\n        \"evidence_refs\": [],\n        \"suggested_actions\": [],\n        \"error\": None,\n        \"error_code\": None,\n        \"flow_suggestion\": None,\n    }\n```\n\n### Reproduction steps\n1. Run the SSE coverage probe that subscribes to the orchestrator stream.\n2. Exercise the suite of queries that is intended to cover the documented event vocabulary.\n3. Observe that the probe never sees at least one of the documented event types before timing out.\n\n### Expected behavior\nThe orchestrator SSE stream exposes every event type in the documented vocabulary at least once across the suite.\n\n### Actual behavior\nThe stream does not surface the full documented vocabulary during the probe run, so the coverage check waits until timeout.\n\n### Last toucher\navivriftin5 on 2026-05-03\n\n### Related\n- `apps/centralbackend/app/orchestrator/graph.py` contains the SSE event assembly logic.\n- Nearby event handling in the same file includes `skills_loaded`, `skill_start`, `skill_end`, `skill_error`, `compose_start`, `flow_suggestion`, and internal handling for `enrichment_complete`.\n- Label `timeout-suspected-stale` matches the observed timeout failure mode.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Run the SSE coverage probe that subscribes to the orchestrator stream."
+          },
+          {
+            "order": 2,
+            "text": "Exercise the suite of queries intended to cover the documented event vocabulary."
+          },
+          {
+            "order": 3,
+            "text": "Observe that the probe does not see at least one documented event type before timing out."
+          }
+        ],
+        "expected_behavior": null,
+        "actual_behavior": null,
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 568,
+            "line_end": 570,
+            "commit_sha": null,
+            "snippet": "    Event types match what chat_router.py and the frontend expect:\n      search_start, tool_call, tool_result, token, done, error\n    \"\"\"",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-04-30"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 582,
+            "line_end": 583,
+            "commit_sha": null,
+            "snippet": "    connected = manager.get_connected_providers()\n    yield {\"type\": \"search_start\", \"servers\": connected}",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 774,
+            "line_end": 776,
+            "commit_sha": null,
+            "snippet": "    flow_suggestion = final_state.get(\"flow_suggestion\")\n    if flow_suggestion:\n        yield {\"type\": \"flow_suggestion\", **flow_suggestion}",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-04-30"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 798,
+            "line_end": 804,
+            "commit_sha": null,
+            "snippet": "            # The enrichment_complete event is internal — graph.py consumes\n            # it for orchestrator_run logging and never forwards to the UI.\n            if event_type == \"enrichment_complete\":\n                stats = event.get(\"stats\")\n                if isinstance(stats, dict):",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-05-03"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 1029,
+            "line_end": 1041,
+            "commit_sha": null,
+            "snippet": "    done_event: dict[str, Any] = {\"type\": \"done\", \"content\": composed or \"No results.\"}\n    if insight_data:\n        done_event[\"insight_data\"] = insight_data\n    evidence = final_state.get(\"evidence_refs\", [])\n    actions = final_state.get(\"suggested_actions\", [])\n    if len(actions) > 4:\n        actions = actions[:4]\n    if evidence:\n        done_event[\"evidence_refs\"] = evidence\n    if actions:\n        done_event[\"suggested_actions\"] = actions\n    yield done_event",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P2",
+        "assignee_hint": null,
+        "components": [
+          "Testing & Quality"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1184",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:35.170292+00:00",
+          "finished_at": "2026-05-04T09:12:02.709174+00:00",
+          "tool_calls": 13,
+          "input_tokens": 97064,
+          "output_tokens": 2362,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1298",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1298",
+        "uploaded_at": "2026-05-04T10:25:56.783157+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "30e8a03ee43d6f8f",
+        "external_id": "CORE-SSE-002",
+        "source_line_start": 184,
+        "source_line_end": 188,
+        "raw_title": "Event format `event: <type>\\ndata: <json>\\n\\n`",
+        "raw_body": "- **What's broken:** Format-conformance probe times out before any event is observed.\n- **Hypothesis:** Stale stack — same shape was passing at FINAL.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/chat_router.py` (event_stream's `f\"data: {…}\\n\\n\"` formatter)",
+        "hinted_priority": "P1",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/chat_router.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "30e8a03ee43d6f8f",
+        "summary": "Chat SSE stream emits `data:` frames but the probe times out before observing any event",
+        "description_md": "## Symptom\nFormat-conformance probe times out before any SSE event is observed from the chat stream.\n\n## Where\n- `apps/centralbackend/app/orchestrator/chat_router.py:344-402` — `event_stream()` yields SSE frames for orchestrator events and ends with a `[DONE]` sentinel.\n- `apps/centralbackend/app/orchestrator/chat_router.py:354` — per-event SSE framing uses `data: {json.dumps(event, default=str)}\\n\\n`.\n- `apps/centralbackend/app/orchestrator/chat_router.py:398-402` — stream termination marker is emitted after the assistant response is persisted.\n\n## Code snippet\n```python\n    async def event_stream():\n        final_content = \"\"\n        insight_data = None\n        tool_calls_collected: list[dict] = []\n        try:\n            async for event in run_orchestrator_streaming(\n                query, session_id, history,\n                user_sub=user_sub, user_email=user_email,\n                fault_inject_skills=fault_inject_skills_request,\n            ):\n                yield f\"data: {json.dumps(event, default=str)}\\n\\n\"\n                if event.get(\"type\") == \"tool_call\":\n                    tool_calls_collected.append({\"tool\": event.get(\"tool\", \"\"), \"server\": event.get(\"server\", \"\")})\n                if event.get(\"type\") == \"tool_result\":\n                    for tc in tool_calls_collected:\n                        if tc[\"tool\"] == event.get(\"tool\") and tc[\"server\"] == event.get(\"server\"):\n                            tc[\"duration_ms\"] = event.get(\"duration_ms\", 0)\n                            tc[\"status\"] = \"done\"\n                            if event.get(\"tool_trace_id\"):\n                                tc[\"tool_trace_id\"] = event[\"tool_trace_id\"]\n                if event.get(\"type\") == \"done\":\n                    final_content = event.get(\"content\", \"\")\n                    insight_data = event.get(\"insight_data\")\n        except Exception as e:\n            stream_trace = str(uuid.uuid4())\n            logger.error(\n                \"Chat stream error (trace_id=%s): %s\", stream_trace, e, exc_info=True,\n            )\n            user_msg = _safe_error_message(e, \"We hit an unexpected issue while answering. Please try again.\")\n            yield (\n                \"data: \"\n                + json.dumps({\n                    \"type\": \"error\",\n                    \"error_code\": \"chat_stream_failed\",\n                    \"user_message\": user_msg,\n                    \"message\": user_msg,\n                    \"trace_id\": stream_trace,\n                })\n                + \"\\n\\n\"\n            )\n        finally:\n            if final_content:\n                append_message(session_id, \"assistant\", final_content)\n                await history_db.save_message(\n                    session_id, \"assistant\", final_content,\n                    insight_data=insight_data,\n                    tool_calls=tool_calls_collected if tool_calls_collected else None,\n                )\n\n            if is_new_session and final_content:\n                title = await _generate_title(query, user_email=user_email, session_id=session_id)\n                await history_db.update_session_title(session_id, title)\n                yield f\"data: {json.dumps({'type': 'session_title', 'session_id': session_id, 'title': title})}\\n\\n\"\n\n            # Canonical SSE termination marker. Smoke clients (X-SMOKE-002 /\n            # 003) read until this sentinel; without it the stream looks\n            # half-open and they fail with \"never saw [DONE]\" even though the\n            # orchestrator finished cleanly.\n            yield \"data: [DONE]\\n\\n\"\n```\n\n## Reproduction steps\n1. Open the chat SSE endpoint used by the format-conformance probe.\n2. Send a request that causes the orchestrator stream to run.\n3. Observe that the probe waits for an SSE event and eventually times out before any event is seen.\n\n## Expected behavior\nThe stream presents observable SSE frames in the `event: <type>\\ndata: <json>\\n\\n` format and the probe receives at least one event before timing out.\n\n## Actual behavior\nThe probe does not observe an event before timing out, even though the stream code emits `data:` frames and a final `[DONE]` marker.\n\n## Last toucher\navivriftin5 on 2026-05-03\n\n## Related\n- `apps/centralbackend/app/orchestrator/chat_router.py` also emits `data: [DONE]\\n\\n` as the stream terminator.\n- Nearby SSE responses in the same file use the same `data:` framing pattern for empty-query and access-denied cases.\n- Labels indicate a timeout-suspected stale issue.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open the chat SSE endpoint used by the format-conformance probe."
+          },
+          {
+            "order": 2,
+            "text": "Send a request that causes the orchestrator stream to run."
+          },
+          {
+            "order": 3,
+            "text": "Observe that the probe waits for an SSE event and eventually times out before any event is seen."
+          }
+        ],
+        "expected_behavior": "The stream presents observable SSE frames in the `event: <type>\\ndata: <json>\\n\\n` format and the probe receives at least one event before timing out.",
+        "actual_behavior": "The probe does not observe an event before timing out, even though the stream code emits `data:` frames and a final `[DONE]` marker.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/chat_router.py",
+            "line_start": 344,
+            "line_end": 402,
+            "commit_sha": null,
+            "snippet": "    async def event_stream():\n        final_content = \"\"\n        insight_data = None\n        tool_calls_collected: list[dict] = []\n        try:\n            async for event in run_orchestrator_streaming(\n                query, session_id, history,\n                user_sub=user_sub, user_email=user_email,\n                fault_inject_skills=fault_inject_skills_request,\n            ):\n                yield f\"data: {json.dumps(event, default=str)}\\n\\n\"\n                if event.get(\"type\") == \"tool_call\":\n                    tool_calls_collected.append({\"tool\": event.get(\"tool\", \"\"), \"server\": event.get(\"server\", \"\")})\n                if event.get(\"type\") == \"tool_result\":\n                    for tc in tool_calls_collected:\n                        if tc[\"tool\"] == event.get(\"tool\") and tc[\"server\"] == event.get(\"server\"):\n                            tc[\"duration_ms\"] = event.get(\"duration_ms\", 0)\n                            tc[\"status\"] = \"done\"\n                            if event.get(\"tool_trace_id\"):\n                                tc[\"tool_trace_id\"] = event[\"tool_trace_id\"]\n                if event.get(\"type\") == \"done\":\n                    final_content = event.get(\"content\", \"\")\n                    insight_data = event.get(\"insight_data\")\n        except Exception as e:\n            stream_trace = str(uuid.uuid4())\n            logger.error(\n                \"Chat stream error (trace_id=%s): %s\", stream_trace, e, exc_info=True,\n            )\n            user_msg = _safe_error_message(e, \"We hit an unexpected issue while answering. Please try again.\")\n            yield (\n                \"data: \"\n                + json.dumps({\n                    \"type\": \"error\",\n                    \"error_code\": \"chat_stream_failed\",\n                    \"user_message\": user_msg,\n                    \"message\": user_msg,\n                    \"trace_id\": stream_trace,\n                })\n                + \"\\n\\n\"\n            )\n        finally:\n            if final_content:\n                append_message(session_id, \"assistant\", final_content)\n                await history_db.save_message(\n                    session_id, \"assistant\", final_content,\n                    insight_data=insight_data,\n                    tool_calls=tool_calls_collected if tool_calls_collected else None,\n                )\n\n            if is_new_session and final_content:\n                title = await _generate_title(query, user_email=user_email, session_id=session_id)\n                await history_db.update_session_title(session_id, title)\n                yield f\"data: {json.dumps({'type': 'session_title', 'session_id': session_id, 'title': title})}\\n\\n\"\n\n            # Canonical SSE termination marker. Smoke clients (X-SMOKE-002 /\n            # 003) read until this sentinel; without it the stream looks\n            # half-open and they fail with \"never saw [DONE]\" even though the\n            # orchestrator finished cleanly.\n            yield \"data: [DONE]\\n\\n\"",
+            "blame_author": null,
+            "blame_date": null
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P1",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1184",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:36.465829+00:00",
+          "finished_at": "2026-05-04T09:11:55.186068+00:00",
+          "tool_calls": 6,
+          "input_tokens": 23502,
+          "output_tokens": 2283,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1309",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1309",
+        "uploaded_at": "2026-05-04T10:26:03.873846+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "failed",
+      "parsed": {
+        "bug_id": "3e83408ef88cdb0e",
+        "external_id": "CORE-CHAT-031",
+        "source_line_start": 189,
+        "source_line_end": 192,
+        "raw_title": "Structured SSE error event on access-denied",
+        "raw_body": "- **What's broken:** Test forces an access-denied query and expects an SSE `event: error` whose data carries `{error_code, user_message, trace_id}`. The current implementation in `chat_router.chat` (lines ~310 in the post-fix branch) emits `{type: \"error\", error_code: \"access_denied\", user_message, message, trace_id}` correctly — **but** the iterator does not include the `event: error` SSE field-line, only `data:`. The Wave-D2 spec strengthened the requirement so the event line must be present too.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/chat_router.py` (the access-denied early-return StreamingResponse — change from `data:` only to `event: error\\ndata: …\\n\\n`)",
+        "hinted_priority": "P0",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/chat_router.py"
+        ],
+        "labels": [
+          "real-product-gap"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "3e83408ef88cdb0e",
+        "summary": "Access-denied chat SSE response omits the required event: error field",
+        "description_md": "## Symptom\nAn access-denied chat request returns a streaming SSE payload with the error JSON in `data:`, but the stream does not include the required `event: error` line.\n\n## Where\n- `apps/centralbackend/app/orchestrator/chat_router.py:314-319` — the access-denied early return in `chat_router.chat` builds a `StreamingResponse` for the denial path.\n\n## Code snippet\n```python\n        if not has_access:\n            denial_trace = str(uuid.uuid4())\n            return StreamingResponse(\n                iter([f\"data: {json.dumps({'type': 'error', 'error_code': 'access_denied', 'user_message': 'Access denied to this session', 'message': 'Access denied to this session', 'trace_id': denial_trace})}\\n\\n\"]),\n                media_type=\"text/event-stream\",\n            )\n```\n\n## Reproduction steps\n1. Send a chat request for a session where the user lacks access.\n2. Observe the SSE response body.\n3. Check the first SSE frame for the denial response.\n4. Note that the frame contains `data:` with the error JSON, but no `event: error` field line.\n\n## Expected behavior\nThe denial response is emitted as an SSE error event, with an `event: error` line and a `data:` line carrying `{error_code, user_message, trace_id}`.\n\n## Actual behavior\nThe denial response emits only a `data:` line containing the error JSON, so the SSE frame is not tagged as an `error` event.\n\n## Last toucher\nEvgeny Kagan on 2026-03-25\n\n## Related\n- Nearby logic in `apps/centralbackend/app/orchestrator/chat_router.py` around the access check and streaming response path.\n- Bug label: `real-product-gap`.\n",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Send a chat request for a session where the user lacks access."
+          },
+          {
+            "order": 2,
+            "text": "Observe the SSE response body."
+          },
+          {
+            "order": 3,
+            "text": "Check the first SSE frame for the denial response."
+          },
+          {
+            "order": 4,
+            "text": "Note that the frame contains `data:` with the error JSON, but no `event: error` field line."
+          }
+        ],
+        "expected_behavior": null,
+        "actual_behavior": null,
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/chat_router.py",
+            "line_start": 314,
+            "line_end": 319,
+            "commit_sha": "ca9ef6bbe1afaacb7b8927b84433ae3a950a23c7",
+            "snippet": "        if not has_access:\n            denial_trace = str(uuid.uuid4())\n            return StreamingResponse(\n                iter([f\"data: {json.dumps({'type': 'error', 'error_code': 'access_denied', 'user_message': 'Access denied to this session', 'message': 'Access denied to this session', 'trace_id': denial_trace})}\\n\\n\"]),\n                media_type=\"text/event-stream\",\n            )",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-03-25"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P0",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1162",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:40.613922+00:00",
+          "finished_at": "2026-05-04T09:11:54.830933+00:00",
+          "tool_calls": 7,
+          "input_tokens": 22437,
+          "output_tokens": 1019,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": null,
+      "last_error": {
+        "stage": "uploading",
+        "message": "create_issue failed: Priority name 'P0 - Must Have' is not valid",
+        "traceback": null,
+        "failure_class": null,
+        "occurred_at": "2026-05-04T10:26:02.871950+00:00"
+      },
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "e8c18e053f51557b",
+        "external_id": "CORE-MOBILE-001",
+        "source_line_start": 193,
+        "source_line_end": 196,
+        "raw_title": "Drawer sidebar at <768 px",
+        "raw_body": "- **What's broken:** Inventory advertises an explicit `<768 px` mobile breakpoint that opens a drawer-style sidebar with a dismissable backdrop. Frontend has 1000 px and 600 px gates only — no 768 px breakpoint, no drawer styling, no backdrop dismissal handler.\n- **Affected files (likely):** centralfrontend `src/components/Sidebar/*` and the global media-query stylesheet (path varies by frontend layout — grep for `@media (max-width: 1000px)` to find the existing breakpoints)",
+        "hinted_priority": "P2",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "src/components/Sidebar/*"
+        ],
+        "labels": [
+          "real-product-gap"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "e8c18e053f51557b",
+        "summary": "Central frontend sidebar has no <768px drawer mode or dismissable backdrop",
+        "description_md": "### Symptom\nThe mobile sidebar behavior advertised for widths below 768 px is absent. The sidebar remains the fixed desktop panel, and there is no drawer/backdrop interaction for small screens.\n\n### Where\n- `apps/centralfrontend/src/components/Sidebar.tsx:1-260` — sidebar rendering logic only distinguishes collapsed vs expanded desktop navigation; no mobile drawer state or backdrop handling appears in this component.\n- `apps/centralfrontend/src/global.css:37-52` — `.sidebar` is fixed at 220 px wide with desktop layout rules.\n- `apps/centralfrontend/src/global.css:118-120` — `.sidebar-collapsed .main-content` only accounts for the 48 px collapsed desktop variant.\n- `apps/centralfrontend/src/global.css:3455-3458` and `apps/centralfrontend/src/components/ActivityFeed.tsx:154-156` — nearby drawer patterns in the codebase use a backdrop element with click-to-close behavior, but the sidebar does not follow that pattern.\n\n### Code snippet\n```tsx\nexport function Sidebar({ collapsed = false, onToggleCollapse, features = [] }: SidebarProps) {\n  const [providers, setProviders] = useState<ProviderInfo[]>([]);\n  const [providersOpen, setProvidersOpen] = useState(() => {\n    try {\n      const v = localStorage.getItem('central:sidebar:providersOpen');\n      return v === '1';\n    } catch {\n      return false;\n    }\n  });\n  useEffect(() => {\n    try { localStorage.setItem('central:sidebar:providersOpen', providersOpen ? '1' : '0'); } catch { /* ignore */ }\n  }, [providersOpen]);\n  const [navOpen, setNavOpen] = useState(true);\n  const [appsOpen, setAppsOpen] = useState(true);\n  const [adminOpen, setAdminOpen] = useState(true);\n  const [apps, setApps] = useState<AppInfo[]>([]);\n  const [appHealth, setAppHealth] = useState<Record<string, AppHealthInfo>>({});\n  const [activePopover, setActivePopover] = useState<string | null>(null);\n\n  const load = useCallback(() => {\n    fetchProviders().then(p => setProviders(p)).catch(() => {});\n    fetchApps().then(a => setApps(a)).catch(() => {});\n    fetchAppHealth().then(h => setAppHealth(h)).catch(() => {});\n  }, []);\n\n  useEffect(() => { load(); }, [load]);\n\n  useEffect(() => {\n    const onUpdate = () => { fetchProviders().then(p => setProviders(p)).catch(() => {}); };\n    window.addEventListener('providers-updated', onUpdate);\n    return () => window.removeEventListener('providers-updated', onUpdate);\n  }, []);\n\n  const connected = providers.filter(p => p.connected);\n\n  const handleConnect = (name: string) => {\n    if (TOKEN_PROVIDERS.has(name)) {\n      handleRefresh(name);\n    } else {\n      window.location.href = getProviderAuthUrl(name);\n    }\n  };\n```\n\n### Reproduction steps\n1. Open the central frontend in a viewport narrower than 768 px.\n2. Observe the sidebar presentation and navigation behavior.\n3. Attempt to dismiss the sidebar by interacting with the page background.\n4. Compare the result with the documented mobile drawer behavior.\n\n### Expected behavior\nAt widths below 768 px, the sidebar is presented as a drawer-style panel with a dismissable backdrop.\n\n### Actual behavior\nThe sidebar code and stylesheet only define the fixed desktop sidebar and the 48 px collapsed variant; no 768 px breakpoint, drawer styling, or backdrop dismissal handler is present.\n\n### Last toucher\nEvgeny Kagan on 2025-03-05\n\n### Related\n- `apps/centralfrontend/src/components/ActivityFeed.tsx` and `apps/centralfrontend/src/views/SkillsFlowsPage.tsx` show existing drawer/backdrop interaction patterns elsewhere in the frontend.\n- `apps/centralfrontend/src/global.css` contains the only sidebar layout rules and only desktop/collapsed sizing.\n",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open the central frontend in a viewport narrower than 768 px."
+          },
+          {
+            "order": 2,
+            "text": "Observe the sidebar presentation and navigation behavior."
+          },
+          {
+            "order": 3,
+            "text": "Attempt to dismiss the sidebar by interacting with the page background."
+          },
+          {
+            "order": 4,
+            "text": "Compare the result with the documented mobile drawer behavior."
+          }
+        ],
+        "expected_behavior": "At widths below 768 px, the sidebar is presented as a drawer-style panel with a dismissable backdrop.",
+        "actual_behavior": "The sidebar remains the fixed desktop panel; the codebase has no 768 px breakpoint, drawer styling, or backdrop dismissal handler for the sidebar.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/components/Sidebar.tsx",
+            "line_start": 1,
+            "line_end": 260,
+            "commit_sha": "56e7935195ddd17cd1684743197fada538cdb98c",
+            "snippet": "import { useState, useEffect, useCallback } from 'react';\nimport { Link } from 'react-router-dom';\nimport {\n  fetchProviders,\n  fetchApps,\n  getProviderAuthUrl,\n  disconnectProvider as apiDisconnect,\n  refreshProvider as apiRefresh,\n  fetchAppHealth,\n  invalidateProviderCache,\n  type ProviderInfo,\n  type AppHealthInfo,\n  type AppInfo,\n} from '../api';\n\nconst PROVIDER_ICONS: Record<string, string> = {\n  mail: '\\u{1F4E7}',\n  'message-square': '\\u{1F4AC}',\n  folder: '\\u{1F4C2}',\n  search: '\\u{1F50D}',\n};\n\nconst APP_ICON_MAP: Record<string, string> = {\n  scales: '\\u{2696}\\u{FE0F}',\n  chart: '\\u{1F4CA}',\n  calendar: '\\u{1F4C5}',\n  brain: '\\u{1F9E0}',\n  shield: '\\u{1F6E1}\\u{FE0F}',\n  bot: '\\u{1F916}',\n  clipboard: '\\u{1F4CB}',\n  folder: '\\u{1F4C2}',\n};\n\nconst TOKEN_PROVIDERS = new Set(['outlook', 'teams']);\n\ninterface SidebarProps {\n  collapsed?: boolean;\n  onToggleCollapse?: () => void;\n  features?: string[];\n}\n\nexport function Sidebar({ collapsed = false, onToggleCollapse, features = [] }: SidebarProps) {\n  const [providers, setProviders] = useState<ProviderInfo[]>([]);\n  const [providersOpen, setProvidersOpen] = useState(() => {\n    try {\n      const v = localStorage.getItem('central:sidebar:providersOpen');\n      return v === '1';\n    } catch {\n      return false;\n    }\n  });\n  useEffect(() => {\n    try { localStorage.setItem('central:sidebar:providersOpen', providersOpen ? '1' : '0'); } catch { /* ignore */ }\n  }, [providersOpen]);\n  const [navOpen, setNavOpen] = useState(true);\n  const [appsOpen, setAppsOpen] = useState(true);\n  const [adminOpen, setAdminOpen] = useState(true);\n  const [apps, setApps] = useState<AppInfo[]>([]);\n  const [appHealth, setAppHealth] = useState<Record<string, AppHealthInfo>>({});\n  const [activePopover, setActivePopover] = useState<string | null>(null);\n\n  const load = useCallback(() => {\n    fetchProviders().then(p => setProviders(p)).catch(() => {});\n    fetchApps().then(a => setApps(a)).catch(() => {});\n    fetchAppHealth().then(h => setAppHealth(h)).catch(() => {});\n  }, []);\n\n  useEffect(() => { load(); }, [load]);\n\n  useEffect(() => {\n    const onUpdate = () => { fetchProviders().then(p => setProviders(p)).catch(() => {}); };\n    window.addEventListener('providers-updated', onUpdate);\n    return () => window.removeEventListener('providers-updated', onUpdate);\n  }, []);\n\n  const connected = providers.filter(p => p.connected);\n\n  const handleConnect = (name: string) => {\n    if (TOKEN_PROVIDERS.has(name)) {\n      handleRefresh(name);\n    } else {\n      window.location.href = getProviderAuthUrl(name);\n    }\n  };",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2025-03-05"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/global.css",
+            "line_start": 37,
+            "line_end": 52,
+            "commit_sha": "56e7935195ddd17cd1684743197fada538cdb98c",
+            "snippet": ".sidebar {\n  position: fixed;\n  top: 48px;\n  left: 0;\n  bottom: 0;\n  width: 220px;\n  transition: width 0.15s ease;\n  background: var(--surface);\n  border-right: 1px solid var(--border-subtle);\n  display: flex;\n  flex-direction: column;\n  overflow-y: auto;\n  overflow-x: hidden;\n  z-index: 50;\n}",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2025-03-05"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/global.css",
+            "line_start": 118,
+            "line_end": 120,
+            "commit_sha": "56e7935195ddd17cd1684743197fada538cdb98c",
+            "snippet": ".sidebar-collapsed .main-content {\n  margin-left: 48px;\n  width: calc(100vw - 48px);\n}",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2025-03-05"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/global.css",
+            "line_start": 3455,
+            "line_end": 3458,
+            "commit_sha": "56e7935195ddd17cd1684743197fada538cdb98c",
+            "snippet": ".activity-backdrop {\n  position: fixed;\n  inset: 0;\n  background: rgba(0, 0, 0, 0.35);",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2025-03-05"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/components/ActivityFeed.tsx",
+            "line_start": 154,
+            "line_end": 156,
+            "commit_sha": "56e7935195ddd17cd1684743197fada538cdb98c",
+            "snippet": "    <>\n      <div className=\"activity-backdrop\" onClick={onClose} />\n      <div className=\"activity-drawer\">",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2025-03-05"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P2",
+        "assignee_hint": null,
+        "components": [
+          "centralfrontend",
+          "Sidebar"
+        ],
+        "labels": [
+          "real-product-gap"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1235",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:54.472897+00:00",
+          "finished_at": "2026-05-04T09:12:22.878057+00:00",
+          "tool_calls": 16,
+          "input_tokens": 84531,
+          "output_tokens": 3328,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1310",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1310",
+        "uploaded_at": "2026-05-04T10:26:04.898310+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "a2f3f2083e6aad17",
+        "external_id": "CORE-MOBILE-002",
+        "source_line_start": 197,
+        "source_line_end": 200,
+        "raw_title": "Tablet 768–1024 px collapsible sidebar",
+        "raw_body": "- **What's broken:** Tablet breakpoint should collapse the sidebar to icons and reflow chat. Same root cause: no 768–1023 px gate exists in the frontend stylesheet.\n- **Affected files (likely):** Same files as CORE-MOBILE-001.",
+        "hinted_priority": "P2",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [],
+        "labels": [
+          "real-product-gap"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "a2f3f2083e6aad17",
+        "summary": "Tablet widths 768–1024px do not collapse the sidebar or reflow chat layout",
+        "description_md": "## Symptom\nOn tablet-sized viewports between 768px and 1023px, the frontend keeps the full sidebar layout instead of collapsing to the icon rail and reflowing the chat area.\n\n## Where\n- `apps/centralfrontend/src/global.css:32-120` — layout rules for `.app-shell`, `.sidebar`, `.main-content`, `.sidebar-collapsed`, and `.route-layer--chat`.\n- `apps/centralfrontend/src/views/ChatPage.tsx:371-383` — chat page renders the two-column chat layout inside `.chat-layout`.\n- `apps/centralfrontend/src/components/Sidebar.tsx:69-150` — sidebar markup includes both full-width navigation and the collapsed icon rail.\n\n## Code snippet\n```css\n.app-shell {\n  display: flex;\n  height: 100%;\n}\n\n.sidebar {\n  position: fixed;\n  top: 48px;\n  left: 0;\n  bottom: 0;\n  width: 220px;\n  transition: width 0.15s ease;\n  background: var(--surface);\n  border-right: 1px solid var(--border-subtle);\n  display: flex;\n  flex-direction: column;\n  overflow-y: auto;\n  overflow-x: hidden;\n  z-index: 50;\n}\n\n.sidebar--collapsed {\n  width: 48px;\n  align-items: center;\n  padding-top: 4px;\n  gap: 2px;\n}\n\n.main-content {\n  margin-left: 220px;\n  margin-top: 48px;\n  width: calc(100vw - 220px);\n  height: calc(100vh - 48px);\n  overflow: hidden;\n  display: flex;\n  flex-direction: column;\n  transition: margin-left 0.15s ease, width 0.15s ease;\n}\n\n.sidebar-collapsed .main-content {\n  margin-left: 48px;\n  width: calc(100vw - 48px);\n}\n\n.route-layer {\n  flex: 1;\n  min-height: 0;\n  display: flex;\n  flex-direction: column;\n  overflow: hidden;\n}\n\n.route-layer--chat {\n  flex-direction: row;\n}\n```\n\n## Reproduction steps\n1. Open the frontend in a browser.\n2. Resize the viewport to a tablet width between 768px and 1023px.\n3. Navigate to the chat view.\n4. Observe the sidebar and chat layout.\n\n## Expected behavior\nAt tablet widths in the 768px–1023px range, the sidebar is in its collapsed icon-only presentation and the chat area reflows to the narrower available width.\n\n## Actual behavior\nThe stylesheet contains no tablet breakpoint gate for 768px–1023px, so the desktop sidebar layout remains in effect and the chat area does not switch to the tablet-collapsed presentation.\n\n## Last toucher\nEvgeny Kagan on 2025-03-24\n\n## Related\n- `apps/centralfrontend/src/components/chat/ChatHistory.tsx:492-504` — collapsed chat history UI.\n- `apps/centralfrontend/src/global.css:1223-1244` — chat history collapsed width rules.\n- CORE-MOBILE-001 appears to share the same responsive-layout root cause.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open the frontend in a browser."
+          },
+          {
+            "order": 2,
+            "text": "Resize the viewport to a tablet width between 768px and 1023px."
+          },
+          {
+            "order": 3,
+            "text": "Navigate to the chat view."
+          },
+          {
+            "order": 4,
+            "text": "Observe the sidebar and chat layout."
+          }
+        ],
+        "expected_behavior": null,
+        "actual_behavior": null,
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/global.css",
+            "line_start": 32,
+            "line_end": 120,
+            "commit_sha": null,
+            "snippet": ".app-shell {\n  display: flex;\n  height: 100%;\n}\n\n.sidebar {\n  position: fixed;\n  top: 48px;\n  left: 0;\n  bottom: 0;\n  width: 220px;\n  transition: width 0.15s ease;\n  background: var(--surface);\n  border-right: 1px solid var(--border-subtle);\n  display: flex;\n  flex-direction: column;\n  overflow-y: auto;\n  overflow-x: hidden;\n  z-index: 50;\n}\n\n.sidebar--collapsed {\n  width: 48px;\n  align-items: center;\n  padding-top: 4px;\n  gap: 2px;\n}\n\n.main-content {\n  margin-left: 220px;\n  margin-top: 48px;\n  width: calc(100vw - 220px);\n  height: calc(100vh - 48px);\n  overflow: hidden;\n  display: flex;\n  flex-direction: column;\n  transition: margin-left 0.15s ease, width 0.15s ease;\n}\n\n.sidebar-collapsed .main-content {\n  margin-left: 48px;\n  width: calc(100vw - 48px);\n}\n\n.route-layer {\n  flex: 1;\n  min-height: 0;\n  display: flex;\n  flex-direction: column;\n  overflow: hidden;\n}\n\n.route-layer--chat {\n  flex-direction: row;\n}",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2025-03-24"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/views/ChatPage.tsx",
+            "line_start": 371,
+            "line_end": 383,
+            "commit_sha": null,
+            "snippet": "    <div className=\"chat-layout\">\n      <ChatHistory\n        sessions={sessions}\n        archivedSessions={archivedSessions}\n        selectedSessionId={selectedSessionId}\n        onSelectSession={handleSelectSession}\n        onNewChat={handleNewChat}\n        onArchiveSession={handleArchiveSession}\n        onDeleteSession={handleDeleteSession}\n        onRenameSession={handleRenameSession}\n        onPinSession={handlePinSession}\n        onUnarchiveSession={handleUnarchiveSession}\n      />\n      <div className=\"chat-main\">",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2025-03-24"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/components/Sidebar.tsx",
+            "line_start": 69,
+            "line_end": 150,
+            "commit_sha": null,
+            "snippet": "    <nav className=\"sidebar\">\n      {showProviders && (\n        <>\n          <div\n            className=\"sidebar-section sidebar-section--toggle\"\n            onClick={() => setProvidersOpen(v => !v)}\n            style={{ padding: '10px 16px' }}\n          >\n            <span>Data Providers</span>\n            <span className=\"sidebar-section-meta\">\n              <span className=\"sidebar-provider-count\">\n                {connected.length}/{providers.length}\n              </span>\n              <span className={`sidebar-chevron${providersOpen ? ' open' : ''}`}>\n                &#9654;\n              </span>\n            </span>\n          </div>\n          {providersOpen && (\n            <div className=\"sidebar-providers\">\n              {providers.map(p => (\n                <div\n                  key={p.id}\n                  className={`sp-item${connected.includes(p.id) ? ' connected' : ''}`}\n                  onClick={() => onToggleProvider(p.id)}\n                >\n                  <span className=\"sp-name\">{p.name}</span>\n                  <span className=\"sp-status\">{connected.includes(p.id) ? 'Connected' : 'Disconnected'}</span>\n                </div>\n              ))}\n            </div>\n          )}\n        </>\n      )}\n\n      <div className=\"sidebar-section\">Navigation</div>\n      <div className=\"sidebar-nav\">\n        <Link",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2025-03-24"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P2",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1235",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:54.875916+00:00",
+          "finished_at": "2026-05-04T09:12:17.430727+00:00",
+          "tool_calls": 11,
+          "input_tokens": 107840,
+          "output_tokens": 2372,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1311",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1311",
+        "uploaded_at": "2026-05-04T10:26:05.268776+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "41c4edc839afd6ab",
+        "external_id": "CORE-MOBILE-006",
+        "source_line_start": 201,
+        "source_line_end": 204,
+        "raw_title": "Swipe-right pin gesture",
+        "raw_body": "- **What's broken:** Test asserts the UI fires a `POST /api/sessions/{id}/pin` from a swipe-right touch handler. Pin endpoint exists in the backend; the frontend touch-event handler is unimplemented.\n- **Affected files (likely):** centralfrontend's session-list component and a touch-gesture utility module.",
+        "hinted_priority": "P3",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [],
+        "labels": [
+          "real-product-gap"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "41c4edc839afd6ab",
+        "summary": "Swipe-right pin gesture is missing from the chat session list, so the frontend never triggers the pin action from touch input.",
+        "description_md": "## Symptom\nA swipe-right gesture on a chat session row does not trigger pinning. The UI only exposes pin through the explicit pin button, while the touch gesture path described by the bug record is absent.\n\n## Where\n- `apps/centralfrontend/src/components/chat/ChatHistory.tsx:220-265` — session row rendering and action buttons; no touch gesture handler is wired into the row.\n- `apps/centralfrontend/src/components/chat/ChatHistory.tsx:431-435` — the existing pin action handler is mouse-driven and calls the pin API from a click path.\n- `apps/centralfrontend/src/api.ts:552-553` — the frontend pin API helper targets `PATCH /api/chat/sessions/{sessionId}/pin`.\n\n## Code snippet\n`apps/centralfrontend/src/components/chat/ChatHistory.tsx:431-435`\n```tsx\n  const handlePin = async (e: React.MouseEvent, id: string) => {\n    e.stopPropagation();\n    const prev = sessions;\n    setSessions(s => s.map(x => x.id === id ? { ...x, is_pinned: !x.is_pinned } : x));\n    try { await pinSession(id); }\n```\n\n## Reproduction steps\n1. Open the chat history/session list in the frontend.\n2. Swipe a session row to the right on a touch device or touch-emulation environment.\n3. Observe whether the session becomes pinned and whether the pin request is sent.\n\n## Expected behavior\nA right-swipe on a session row results in the session being pinned and the frontend issuing the pin request for that session.\n\n## Actual behavior\nThe session row does not react to the swipe-right gesture. Pinning is only reachable through the explicit pin button, and the touch gesture path remains unimplemented.\n\n## Last toucher\nEvgeny Kagan on 2026-04-06\n\n## Related\n- `apps/centralfrontend/src/components/chat/ChatHistory.tsx` contains the session list UI and pin button.\n- `apps/centralfrontend/src/api.ts` contains the pin-session API helper.\n- The bug record mentions a touch-gesture utility module, but no implemented swipe-right handler was found in the frontend code paths inspected.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open the chat history/session list in the frontend."
+          },
+          {
+            "order": 2,
+            "text": "Swipe a session row to the right on a touch device or touch-emulation environment."
+          },
+          {
+            "order": 3,
+            "text": "Observe whether the session becomes pinned and whether the pin request is sent."
+          }
+        ],
+        "expected_behavior": "A right-swipe on a session row results in the session being pinned and the frontend issuing the pin request for that session.",
+        "actual_behavior": "The session row does not react to the swipe-right gesture. Pinning is only reachable through the explicit pin button, and the touch gesture path remains unimplemented.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/components/chat/ChatHistory.tsx",
+            "line_start": 220,
+            "line_end": 265,
+            "commit_sha": "36c9fc6ba7abe07bbe4f9b7ed5d8073785201b53",
+            "snippet": "      className={`ch-item${s.id === activeSessionId ? ' ch-item--active' : ''}${stateClass}`}\n      onClick={() => onSelectSession(s.id)}\n      title={isStreaming ? 'Reply in progress…' : isCompleted ? 'New reply ready' : undefined}\n    >\n      {editingId === s.id ? (\n        <div className=\"ch-edit-row\">\n          <input\n            ref={editRef}\n            className=\"ch-edit-input\"\n            value={editTitle}\n            onChange={e => setEditTitle(e.target.value)}\n            onKeyDown={e => { if (e.key === 'Enter') confirmRename(); if (e.key === 'Escape') cancelRename(); }}\n          />\n          <button className=\"ch-edit-action\" onClick={confirmRename}><Check size={12} /></button>\n          <button className=\"ch-edit-action\" onClick={cancelRename}><X size={12} /></button>\n        </div>\n      ) : (\n        <>\n          {isStreaming ? (\n            <span className=\"ch-icon ch-icon--streaming\" aria-hidden>\n              <span className=\"ch-spinner\" />\n            </span>\n          ) : isCompleted ? (\n            <span className=\"ch-icon ch-icon--completed\" aria-hidden />\n          ) : (\n            icon || <MessageSquare size={14} className=\"ch-icon\" />\n          )}\n          <span className=\"ch-title\">{s.title}</span>\n          {showShareBadge && (s.share_count ?? 0) > 0 && (\n            <span className=\"ch-shared-badge\" title={`Shared with ${s.share_count} ${s.share_count === 1 ? 'person' : 'people'}`}>\n              <Users size={10} /> {s.share_count}\n            </span>\n          )}\n          <div className=\"ch-actions\">\n            <button className=\"ch-action\" onClick={(e) => handlePin(e, s.id)} title={s.is_pinned ? 'Unpin' : 'Pin'}>\n              <Pin size={12} />\n            </button>\n            <button className=\"ch-action\" onClick={(e) => startShare(e, s)} title=\"Share\">\n              <Share2 size={12} />\n            </button>\n            <button className=\"ch-action\" onClick={(e) => startRename(e, s)} title=\"Rename\">\n              <PenLine size={12} />\n            </button>\n            <button className=\"ch-action ch-action--archive\" onClick={(e) => handleArchive(e, s.id)} title=\"Archive\">\n              <Archive size={12} />\n            </button>\n            <button className=\"ch-action ch-action--delete\" onClick={(e) => handleDelete(e, s.id)} title=\"Delete\">\n              <Trash2 size={12} />\n            </button>\n          </div>\n        </>\n      )}\n    </div>",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-04-06"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/components/chat/ChatHistory.tsx",
+            "line_start": 431,
+            "line_end": 435,
+            "commit_sha": "36c9fc6ba7abe07bbe4f9b7ed5d8073785201b53",
+            "snippet": "  const handlePin = async (e: React.MouseEvent, id: string) => {\n    e.stopPropagation();\n    const prev = sessions;\n    setSessions(s => s.map(x => x.id === id ? { ...x, is_pinned: !x.is_pinned } : x));\n    try { await pinSession(id); }",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-04-06"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/api.ts",
+            "line_start": 552,
+            "line_end": 553,
+            "commit_sha": "36c9fc6ba7abe07bbe4f9b7ed5d8073785201b53",
+            "snippet": "export async function pinSession(sessionId: string): Promise<ChatSession> {\n  return apiFetch(`/api/chat/sessions/${sessionId}/pin`, { method: 'PATCH' });",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-04-06"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P3",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [
+          "real-product-gap"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1235",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:11:55.234980+00:00",
+          "finished_at": "2026-05-04T09:12:20.054289+00:00",
+          "tool_calls": 14,
+          "input_tokens": 157941,
+          "output_tokens": 2430,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1318",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1318",
+        "uploaded_at": "2026-05-04T10:26:10.800648+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "999657755d0bd2d6",
+        "external_id": "CORE-MOBILE-007",
+        "source_line_start": 205,
+        "source_line_end": 208,
+        "raw_title": "Long-press fork/delete",
+        "raw_body": "- **What's broken:** Long-press on a flow card should open a fork/delete action sheet; the `POST /api/flows/{id}/fork` endpoint exists, the touch handler is unimplemented.\n- **Affected files (likely):** centralfrontend's flow card component.",
+        "hinted_priority": "P3",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [],
+        "labels": [
+          "real-product-gap"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "999657755d0bd2d6",
+        "summary": "Flow cards lack the long-press fork/delete action sheet on mobile, so touch users cannot access those actions.",
+        "description_md": "## Symptom\nLong-pressing a flow card on mobile does not open the fork/delete action sheet described by the product behavior. The card currently exposes only tap-driven controls in the gallery view.\n\n## Where\n- `apps/centralfrontend/src/views/SkillsFlowsPage.tsx:468-520` — flow card markup in the gallery grid; no long-press/touch handler is wired on the card container.\n- `apps/centralfrontend/src/views/SkillsFlowsPage.tsx:330-363` — `handleFork` and `handleDelete` exist as action handlers, but they are only invoked from other UI paths.\n- `apps/centralfrontend/src/views/SkillsFlowsPage.tsx:485-490` — the visible card actions currently include only the favorite button in the header.\n\n## Code snippet\n```tsx\n          {/* Flow cards grid */}\n          <div className=\"sf-grid\">\n            {filteredFlows.map(flow => (\n              <div key={flow.flow_id} className={`sf-flow-card${isFeatured(flow) ? ' sf-flow-card--featured' : ''}`}>\n                {isFeatured(flow) && (\n                  <div className=\"sf-featured-badge\">{'\\u2B50'} Featured</div>\n                )}\n                <div className=\"sf-flow-card-header\">\n                  <span className=\"sf-flow-icon\">\n                    {FLOW_ICONS[flow.icon] || '\\u{1F916}'}\n                  </span>\n                  <div className=\"sf-flow-info\">\n                    <div className=\"sf-flow-name\">{flow.name}</div>\n                    <div className=\"sf-flow-meta\">\n                      {flow.category} &middot; {flow.steps.length} steps &middot; {flow.usage_count} runs &middot; by {flow.created_by.split('@')[0]}\n                    </div>\n                  </div>\n                  <div className=\"sf-flow-actions\">\n                    <button\n                      className={`sf-fav-btn${flow.is_favorite ? ' sf-fav-btn--active' : ''}`}\n                      onClick={() => handleFavorite(flow.flow_id)}\n                      title={flow.is_favorite ? 'Remove favorite' : 'Add favorite'}\n                    >\n                      {flow.is_favorite ? '\\u2605' : '\\u2606'}\n                    </button>\n                  </div>\n                </div>\n```\n\n## Reproduction steps\n1. Open the central frontend flow gallery on a mobile device or touch emulator.\n2. Press and hold a flow card.\n3. Observe that no fork/delete action sheet appears.\n4. Compare with the expected mobile interaction for flow-card actions.\n\n## Expected behavior\nLong-pressing a flow card opens an action sheet that exposes fork and delete actions for that flow.\n\n## Actual behavior\nThe flow card has no long-press/touch interaction wired to open any action sheet, so fork/delete are not reachable through the described mobile gesture.\n\n## Last toucher\nEvgeny Kagan on 2026-05-03\n\n## Related\n- `apps/centralfrontend/src/views/SkillsFlowsPage.tsx:330-363` contains the existing fork/delete handlers.\n- `apps/centralfrontend/src/views/SkillsFlowsPage.tsx:468-541` is the gallery card rendering area.\n- `apps/centralfrontend/src/global.css:4649-4651` begins the flow-card styling block.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open the central frontend flow gallery on a mobile device or touch emulator."
+          },
+          {
+            "order": 2,
+            "text": "Press and hold any flow card."
+          },
+          {
+            "order": 3,
+            "text": "Observe that no fork/delete action sheet appears."
+          }
+        ],
+        "expected_behavior": "Long-pressing a flow card opens an action sheet with fork and delete actions.",
+        "actual_behavior": "Long-pressing a flow card does not open any action sheet, and the card exposes no touch handler for that gesture.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/views/SkillsFlowsPage.tsx",
+            "line_start": 468,
+            "line_end": 520,
+            "commit_sha": null,
+            "snippet": "          {/* Flow cards grid */}\n          <div className=\"sf-grid\">\n            {filteredFlows.map(flow => (\n              <div key={flow.flow_id} className={`sf-flow-card${isFeatured(flow) ? ' sf-flow-card--featured' : ''}`}>\n                {isFeatured(flow) && (\n                  <div className=\"sf-featured-badge\">{'\\u2B50'} Featured</div>\n                )}\n                <div className=\"sf-flow-card-header\">\n                  <span className=\"sf-flow-icon\">\n                    {FLOW_ICONS[flow.icon] || '\\u{1F916}'}\n                  </span>\n                  <div className=\"sf-flow-info\">\n                    <div className=\"sf-flow-name\">{flow.name}</div>\n                    <div className=\"sf-flow-meta\">\n                      {flow.category} &middot; {flow.steps.length} steps &middot; {flow.usage_count} runs &middot; by {flow.created_by.split('@')[0]}\n                    </div>\n                  </div>\n                  <div className=\"sf-flow-actions\">\n                    <button\n                      className={`sf-fav-btn${flow.is_favorite ? ' sf-fav-btn--active' : ''}`}\n                      onClick={() => handleFavorite(flow.flow_id)}\n                      title={flow.is_favorite ? 'Remove favorite' : 'Add favorite'}\n                    >\n                      {flow.is_favorite ? '\\u2605' : '\\u2606'}\n                    </button>\n                  </div>\n                </div>",
+            "blame_author": null,
+            "blame_date": null
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P3",
+        "assignee_hint": null,
+        "components": [
+          "centralfrontend"
+        ],
+        "labels": [
+          "real-product-gap"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1235",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:12:02.751961+00:00",
+          "finished_at": "2026-05-04T09:12:34.364921+00:00",
+          "tool_calls": 17,
+          "input_tokens": 101826,
+          "output_tokens": 2079,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1319",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1319",
+        "uploaded_at": "2026-05-04T10:26:11.790067+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "8781946182eae02a",
+        "external_id": "CORE-MOBILE-008",
+        "source_line_start": 209,
+        "source_line_end": 214,
+        "raw_title": "Long-press to rearrange dashboard widgets",
+        "raw_body": "- **What's broken:** Long-press / drag handlers for widget rearrange not yet wired in centralfrontend; backend `PUT /api/dashboard/widgets/{id}/position` exists.\n- **Affected files (likely):** centralfrontend's dashboard widget grid component.",
+        "hinted_priority": "P3",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "_core"
+        ],
+        "hinted_components": [],
+        "hinted_files": [],
+        "labels": [
+          "real-product-gap"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "b7801f5",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "8781946182eae02a",
+        "summary": "Dashboard widgets expose drag styling and a save-position API, but the frontend has no long-press drag wiring for rearranging widgets.",
+        "description_md": "## Symptom\nThe dashboard shows widget cards with a drag-handle affordance in edit mode, but there is no long-press/drag interaction that actually reorders widgets in the centralfrontend UI.\n\n## Where\n- `apps/centralfrontend/src/views/DashboardPage.tsx:235-259` renders `ResponsiveGridLayout` with `isDraggable={editing}` and `draggableHandle=\".widget-drag-handle\"`, but no long-press or drag-start wiring is present in the page logic.\n- `apps/centralfrontend/src/components/dashboard/WidgetCard.tsx:68-76` renders the visible drag handle (`GripVertical`) only as a static span.\n- `apps/centralfrontend/src/api.ts:409-415` contains the client call for `PUT/PATCH /api/dashboard/widgets/{id}/position`, showing backend support for position updates.\n- `apps/centralbackend/app/dashboard/ARCHITECTURE.md:176-180` documents the widget position endpoint as part of the dashboard API.\n\n## Code snippet\n```tsx\n          <ResponsiveGridLayout\n            width={width}\n            layouts={layouts}\n            breakpoints={BREAKPOINTS}\n            cols={COLS}\n            rowHeight={ROW_HEIGHT}\n            isDraggable={editing}\n            isResizable={editing}\n            compactType=\"vertical\"\n            margin={[16, 16]}\n            containerPadding={[0, 0]}\n            onLayoutChange={handleLayoutChange}\n            draggableHandle=\".widget-drag-handle\"\n          >\n            {widgets.map(w => (\n              <div key={w.id}>\n                <WidgetCard\n                  widget={w}\n                  onRefresh={handleRefresh}\n                  onDelete={handleDelete}\n                  editing={editing}\n                />\n              </div>\n            ))}\n          </ResponsiveGridLayout>\n```\n\n## Reproduction steps\n1. Open the dashboard in centralfrontend with at least one widget present.\n2. Enter edit mode.\n3. Long-press or drag the widget handle.\n4. Observe that the widget grid does not expose a wired rearrange interaction from the page logic.\n\n## Expected behavior\nIn edit mode, widget cards can be rearranged through the dashboard UI, and the new positions are captured for persistence through the widget position endpoint.\n\n## Actual behavior\nThe page renders a drag handle and a position-update API exists, but the frontend page does not contain long-press/drag wiring for widget rearrangement beyond the static grid props.\n\n## Last toucher\nEvgeny Kagan on 2026-03-22\n\n## Related\n- `apps/centralfrontend/src/components/dashboard/WidgetCard.tsx` for the drag-handle UI.\n- `apps/centralfrontend/src/api.ts` for widget position persistence.\n- `apps/centralbackend/app/dashboard/ARCHITECTURE.md` for the documented dashboard widget API.\n",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Open the dashboard in centralfrontend with one or more widgets loaded."
+          },
+          {
+            "order": 2,
+            "text": "Switch the dashboard into edit mode."
+          },
+          {
+            "order": 3,
+            "text": "Attempt to long-press or drag the widget handle to rearrange widgets."
+          },
+          {
+            "order": 4,
+            "text": "Observe that the dashboard does not present a wired rearrange interaction from the frontend page logic."
+          }
+        ],
+        "expected_behavior": "In edit mode, dashboard widgets can be rearranged from the frontend and the resulting positions are observable through the dashboard UI and position persistence flow.",
+        "actual_behavior": "The dashboard UI shows a drag handle and edit-mode grid props, but no long-press/drag wiring is present in the frontend page logic, so widget rearrangement is not exposed as a working interaction.",
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/views/DashboardPage.tsx",
+            "line_start": 235,
+            "line_end": 259,
+            "commit_sha": "62f6120bf4eba13043774e71e3894205fe0fa6da",
+            "snippet": "          <ResponsiveGridLayout\n            width={width}\n            layouts={layouts}\n            breakpoints={BREAKPOINTS}\n            cols={COLS}\n            rowHeight={ROW_HEIGHT}\n            isDraggable={editing}\n            isResizable={editing}\n            compactType=\"vertical\"\n            margin={[16, 16]}\n            containerPadding={[0, 0]}\n            onLayoutChange={handleLayoutChange}\n            draggableHandle=\".widget-drag-handle\"\n          >\n            {widgets.map(w => (\n              <div key={w.id}>\n                <WidgetCard\n                  widget={w}\n                  onRefresh={handleRefresh}\n                  onDelete={handleDelete}\n                  editing={editing}\n                />\n              </div>\n            ))}\n          </ResponsiveGridLayout>",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-03-22"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/components/dashboard/WidgetCard.tsx",
+            "line_start": 68,
+            "line_end": 76,
+            "commit_sha": "62f6120bf4eba13043774e71e3894205fe0fa6da",
+            "snippet": "      <div className=\"widget-header\">\n        <div className=\"widget-title-row\">\n          {editing && (\n            <span className=\"widget-drag-handle\" title=\"Drag to move\">\n              <GripVertical size={16} />\n            </span>\n          )}\n          <span className=\"widget-badge\">{widget.viz_type}</span>\n          <h3 className=\"widget-title\">{widget.title}</h3>\n        </div>",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-03-22"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralfrontend/src/api.ts",
+            "line_start": 409,
+            "line_end": 415,
+            "commit_sha": "62f6120bf4eba13043774e71e3894205fe0fa6da",
+            "snippet": "export async function updateWidgetPosition(\n  id: string,\n  position: Record<string, number>,\n): Promise<DashboardWidget> {\n  return apiFetch(`/api/dashboard/widgets/${id}/position`, {\n    method: 'PATCH',\n    headers: { 'Content-Type': 'application/json' },",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-03-22"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/dashboard/ARCHITECTURE.md",
+            "line_start": 176,
+            "line_end": 180,
+            "commit_sha": "62f6120bf4eba13043774e71e3894205fe0fa6da",
+            "snippet": "| GET | `/api/dashboard/widgets` | List current user's widgets |\n| POST | `/api/dashboard/visualize` | Create widget (calls Visualizer LLM once) |\n| DELETE | `/api/dashboard/widgets/{id}` | Delete widget (ownership check) |\n| POST | `/api/dashboard/widgets/{id}/refresh` | Refresh from data_endpoint (no LLM) |\n| PATCH | `/api/dashboard/widgets/{id}/position` | Update grid position (ownership check) |",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-03-22"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P3",
+        "assignee_hint": null,
+        "components": [
+          "centralfrontend",
+          "dashboard"
+        ],
+        "labels": [
+          "real-product-gap"
+        ],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1235",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:12:17.467708+00:00",
+          "finished_at": "2026-05-04T09:12:50.233806+00:00",
+          "tool_calls": 22,
+          "input_tokens": 92104,
+          "output_tokens": 2670,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1320",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1320",
+        "uploaded_at": "2026-05-04T10:26:12.463580+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "1ea533a9c6192fdc",
+        "external_id": "ARB-AGENT-001",
+        "source_line_start": 279,
+        "source_line_end": 283,
+        "raw_title": "Full dispatch fires all six SMEs",
+        "raw_body": "- **What's broken:** Test posts a request that touches every pillar (Network/Storage/Power/Physical/Security/Operations) and expects one `orchestrator_start` + six `agent_start` + six `agent_end` events within 30 s. Times out at 30 s.\n- **Hypothesis:** Stack staleness (was passing at FINAL); also possible the LLM cassette for the 6-SME parallel run is missing or stale. Bounce and re-record.\n- **Affected files (likely):** `apps/centarb_backend/app/agent/orchestrator.py` (or equivalent — check `apps/centarb_backend/app/agent.py` for the multi-SME dispatch)",
+        "hinted_priority": "P0",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "vibe_coding/centarb"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centarb_backend/app/agent/orchestrator.py",
+          "apps/centarb_backend/app/agent.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "vibe_coding/centarb",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "7cfb1e0",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "1ea533a9c6192fdc",
+        "summary": "Full-dispatch SME extraction times out before all six agent events complete",
+        "description_md": "## Symptom\nA request that exercises all six pillars (Network, Storage, Power, Physical, Security, Operations) times out after 30 seconds instead of completing the expected `orchestrator_start` plus six `agent_start` and six `agent_end` events.\n\n## Where\n- `apps/centarb_backend/app/agents/orchestrator_graph.py:480-527` — the orchestrator emits `orchestrator_start` and `agent_start` events for dispatched SMEs.\n- `apps/centarb_backend/app/llm/calls/sme_extraction.py:1156-1165` — the SME extraction flow emits `agent_start` for all six categories immediately.\n\n## Code snippet\n```python\n    # Emit agent_start for all 6 immediately\n    for cat in SME_CATEGORIES:\n        yield {\n            \"type\": \"agent_start\",\n            \"agent_name\": SME_DISPLAY_NAMES[cat],\n            \"category\": cat,\n            \"deviation_count\": cat_counts.get(cat, 0),\n            \"done\": False,\n        }\n\n    # Run all 6 in parallel\n    threads = []\n    for cat in SME_CATEGORIES:\n        t = threading.Thread(\n            target=run_sme,\n            args=(cat,),\n            daemon=True,\n        )\n        threads.append(t)\n        t.start()\n```\n\n## Reproduction steps\n1. Submit a request that contains deviations across all six pillars.\n2. Observe the SSE stream for the run.\n3. Wait up to 30 seconds for the full dispatch to finish.\n4. Note that the stream does not complete with six `agent_end` events in time.\n\n## Expected behavior\nThe full-dispatch run completes within the test timeout and produces one `orchestrator_start`, six `agent_start`, and six `agent_end` events.\n\n## Actual behavior\nThe full-dispatch run stalls long enough to hit the 30-second timeout before all six SME completions are observed.\n\n## Last toucher\nEvgeny Kagan on 2026-03-27\n\n## Related\n- `apps/centarb_backend/app/agents/orchestrator_graph.py` contains the orchestrator-side event emission for dispatched SMEs.\n- `apps/centarb_backend/app/demo_mock.py` has a parallel mock flow with the same event vocabulary.\n- The bug record references a stale cassette or stack state for the six-SME parallel run.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Submit a request that contains deviations across all six pillars."
+          },
+          {
+            "order": 2,
+            "text": "Observe the SSE stream for the run."
+          },
+          {
+            "order": 3,
+            "text": "Wait up to 30 seconds for the full dispatch to finish."
+          },
+          {
+            "order": 4,
+            "text": "Note that the stream does not complete with six `agent_end` events in time."
+          }
+        ],
+        "expected_behavior": null,
+        "actual_behavior": null,
+        "code_references": [
+          {
+            "repo_alias": "vibe_coding/centarb",
+            "repo_url": null,
+            "file_path": "apps/centarb_backend/app/agents/orchestrator_graph.py",
+            "line_start": 480,
+            "line_end": 527,
+            "commit_sha": null,
+            "snippet": "    skipped = []\n\n    logger.info(\n        \"Smart dispatch: dispatching %s, skipping %s (counts: %s)\",\n        dispatched, skipped, categories_with_counts,\n    )\n\n    # --- Phase 1: Orchestrator announces ---\n    yield {\n        \"type\": \"orchestrator_start\",\n        \"agent_name\": \"Orchestration Manager\",\n        \"total_agents\": len(dispatched),\n        \"agents\": [\n            {\n                \"agent_id\": agent_ids[cat],\n                \"agent_name\": SME_DISPLAY_NAMES[cat],\n                \"category\": cat,\n                \"deviation_count\": (categories_with_counts or {}).get(cat, 0),\n            }\n            for cat in SME_CATEGORIES\n        ],\n        \"done\": False,\n    }\n\n    # Emit agent_skipped for categories with no deviations\n    for cat in skipped:\n        yield {\n            \"type\": \"agent_skipped\",\n            \"agent_id\": agent_ids[cat],\n            \"agent_name\": SME_DISPLAY_NAMES[cat],\n            \"category\": cat,\n            \"reason\": f\"No {cat} deviations in this request\",\n            \"done\": False,\n        }\n\n    # Emit agent_start only for dispatched SMEs\n    for cat in dispatched:\n        yield {\n            \"type\": \"agent_start\",\n            \"agent_id\": agent_ids[cat],\n            \"agent_name\": SME_DISPLAY_NAMES[cat],\n            \"category\": cat,\n            \"deviation_count\": (categories_with_counts or {}).get(cat, 0),\n            \"done\": False,\n        }\n\n    # Run dispatched SMEs in parallel threads with a shared event queue\n    sme_r",
+            "blame_author": null,
+            "blame_date": null
+          },
+          {
+            "repo_alias": "vibe_coding/centarb",
+            "repo_url": null,
+            "file_path": "apps/centarb_backend/app/llm/calls/sme_extraction.py",
+            "line_start": 1156,
+            "line_end": 1165,
+            "commit_sha": null,
+            "snippet": "    # Emit agent_start for all 6 immediately\n    for cat in SME_CATEGORIES:\n        yield {\n            \"type\": \"agent_start\",\n            \"agent_name\": SME_DISPLAY_NAMES[cat],\n            \"category\": cat,\n            \"deviation_count\": cat_counts.get(cat, 0),\n            \"done\": False,\n        }\n\n    # Run all 6 in parallel\n    threads = []\n    for cat in SME_CATEGORIES:\n        t = threading.Thread(\n            target=run_sme,\n            args=(cat,),\n            daemon=True,\n        )\n        threads.append(t)\n        t.start()",
+            "blame_author": "Evgeny Kagan",
+            "blame_date": "2026-03-27"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P0",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1184",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:12:20.109406+00:00",
+          "finished_at": "2026-05-04T09:12:44.407025+00:00",
+          "tool_calls": 12,
+          "input_tokens": 42905,
+          "output_tokens": 1953,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "vibe_coding/centarb"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1336",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1336",
+        "uploaded_at": "2026-05-04T10:27:46.361732+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 2
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "4b7b6ec69d98158a",
+        "external_id": "ARB-AUTH-001",
+        "source_line_start": 284,
+        "source_line_end": 290,
+        "raw_title": "`arb:sme` cannot access ARB-type management endpoints",
+        "raw_body": "- **What's broken:** Test asserts `arb:sme` calling `POST /arb-types` returns 403, but observed 201 Created with the new ARB type written to the DB. **The fix in A-2 set `_require_admin` to return 403 for non-admin authenticated users — but the route handler for `POST /arb-types` does not call `_require_admin`.** The Depends/router-level guard is missing on this specific endpoint family.\n- **What's needed:** Wrap `POST /arb-types`, `PUT /arb-types/{id}`, `DELETE /arb-types/{id}`, `POST /arb-types/generate-from-ppt`, `POST /arb-types/{id}/deviation-catalog/generate` with `Depends(_require_admin)` (or call it inline at the top of each handler the way `_require_admin` already supports). The spec is clear that anything in the ARB-type management family is admin-only.\n- **Affected files:** `apps/centarb_backend/app/main.py` (the `@app.post(\"/arb-types\", …)` route and siblings)",
+        "hinted_priority": "P0",
+        "hinted_assignee": null,
+        "hinted_repos": [
+          "vibe_coding/centarb"
+        ],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centarb_backend/app/main.py"
+        ],
+        "labels": [
+          "real-product-gap"
+        ],
+        "inherited_module": {
+          "repo_alias": "vibe_coding/centarb",
+          "branch": "2026-05-03_Auto_Fixes",
+          "commit_sha": "7cfb1e0",
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": "What's needed: Wrap `POST /arb-types`, `PUT /arb-types/{id}`, `DELETE /arb-types/{id}`, `POST /arb-types/generate-from-ppt`, `POST /arb-types/{id}/deviation-catalog/generate` with `Depends(_require_admin)` (or call it inline at the top of each handler the way `_require_admin` already supports). The spec is clear that anything in the ARB-type management family is admin-only.",
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "4b7b6ec69d98158a",
+        "summary": "ARB-type management endpoints allow arb:sme users to create and modify ARB types instead of returning 403",
+        "description_md": "## Symptom\nA non-admin authenticated user with role `arb:sme` can call ARB-type management endpoints and receive success responses. The bug record specifically reports `POST /arb-types` returning `201 Created` and writing a new ARB type to the database instead of `403`.\n\n## Where\n- `apps/centarb_backend/app/main.py:2706-2715` — `POST /arb-types`\n- `apps/centarb_backend/app/main.py:2735-2744` — `PUT /arb-types/{type_id}`\n- `apps/centarb_backend/app/main.py:2766-2778` — `DELETE /arb-types/{type_id}`\n- `apps/centarb_backend/app/main.py:2620-2635` — `POST /arb-types/generate-from-ppt`\n- `apps/centarb_backend/app/main.py:3630-3636` — `POST /arb-types/{type_id}/deviation-catalog/generate`\n\n## Code snippet\n```python\n@app.post(\"/arb-types\", response_model=ArbTypeOut, status_code=201)\ndef create_arb_type(\n    payload: ArbTypeCreate, request: Request, session: Session = Depends(get_session)\n) -> ArbTypeOut:\n    \"\"\"Create an ARB type configuration.\"\"\"\n    _require_admin(request, session)\n\n    existing = session.query(ArbType).filter(ArbType.name == payload.name).first()\n    if existing:\n        raise HTTPException(status_code=409, detail=\"ARB type already exists\")\n\n    arb_type = ArbType(\n        id=uuid.uuid4(),\n        name=payload.name,\n        description=payload.description,\n        status=payload.status,\n    )\n    session.add(arb_type)\n    session.commit()\n    session.refresh(arb_type)\n    arb_type.status = _normalize_arb_type_status(arb_type.status)\n    return arb_type\n```\n\n## Reproduction steps\n1. Authenticate as a user whose role is `arb:sme`.\n2. Send `POST /arb-types` with a valid ARB type payload.\n3. Observe the HTTP response and the database state.\n4. Repeat with `PUT /arb-types/{id}`, `DELETE /arb-types/{id}`, `POST /arb-types/generate-from-ppt`, and `POST /arb-types/{id}/deviation-catalog/generate`.\n\n## Expected behavior\nARB-type management endpoints are admin-only. Non-admin authenticated users, including `arb:sme`, receive `403 Forbidden` and no ARB-type management action is performed.\n\n## Actual behavior\nThe ARB-type management handlers are reachable by `arb:sme` callers and can return success responses such as `201 Created`, allowing ARB type creation and related management actions.\n\n## Last toucher\n`Guy Keinan` on `2026-05-03` (commit `c643ee6491c6adc4641869b6fca6cf2feda3eea9`)\n\n## Related\n- `_require_admin` is defined in `apps/centarb_backend/app/main.py:813-817` and is already used by other admin-only routes in the same file.\n- Nearby admin-gated routes include `/api/roles`, `/api/roles/{email}`, and other management endpoints in `main.py`.\n- Bug ID: `ARB-AUTH-003` is referenced in the `_require_admin` docstring as the admin/SME authorization spec.\n",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Authenticate as a user whose role is arb:sme."
+          },
+          {
+            "order": 2,
+            "text": "Send POST /arb-types with a valid ARB type payload."
+          },
+          {
+            "order": 3,
+            "text": "Observe the HTTP response and the database state."
+          },
+          {
+            "order": 4,
+            "text": "Repeat with PUT /arb-types/{id}, DELETE /arb-types/{id}, POST /arb-types/generate-from-ppt, and POST /arb-types/{id}/deviation-catalog/generate."
+          }
+        ],
+        "expected_behavior": "ARB-type management endpoints are admin-only. Non-admin authenticated users, including arb:sme, receive 403 Forbidden and no ARB-type management action is performed.",
+        "actual_behavior": "The ARB-type management handlers are reachable by arb:sme callers and can return success responses such as 201 Created, allowing ARB type creation and related management actions.",
+        "code_references": [
+          {
+            "repo_alias": "vibe_coding/centarb",
+            "repo_url": null,
+            "file_path": "apps/centarb_backend/app/main.py",
+            "line_start": 2706,
+            "line_end": 2715,
+            "commit_sha": "c643ee6491c6adc4641869b6fca6cf2feda3eea9",
+            "snippet": "@app.post(\"/arb-types\", response_model=ArbTypeOut, status_code=201)\ndef create_arb_type(\n    payload: ArbTypeCreate, request: Request, session: Session = Depends(get_session)\n) -> ArbTypeOut:\n    \"\"\"Create an ARB type configuration.\"\"\"\n    _require_admin(request, session)\n\n    existing = session.query(ArbType).filter(ArbType.name == payload.name).first()\n    if existing:\n        raise HTTPException(status_code=409, detail=\"ARB type already exists\")",
+            "blame_author": "Guy Keinan",
+            "blame_date": "2026-05-03"
+          },
+          {
+            "repo_alias": "vibe_coding/centarb",
+            "repo_url": null,
+            "file_path": "apps/centarb_backend/app/main.py",
+            "line_start": 2735,
+            "line_end": 2744,
+            "commit_sha": "c643ee6491c6adc4641869b6fca6cf2feda3eea9",
+            "snippet": "@app.put(\"/arb-types/{type_id}\", response_model=ArbTypeOut)\ndef update_arb_type(\n    type_id: uuid.UUID, payload: ArbTypeUpdate, request: Request, session: Session = Depends(get_session)\n) -> ArbTypeOut:\n    \"\"\"Update an existing ARB type.\"\"\"\n    _require_admin(request, session)\n\n    arb_type = session.query(ArbType).filter(ArbType.id == type_id).first()\n    if not arb_type:\n        raise HTTPException(status_code=404, detail=\"ARB type not found\")",
+            "blame_author": "Guy Keinan",
+            "blame_date": "2026-05-03"
+          },
+          {
+            "repo_alias": "vibe_coding/centarb",
+            "repo_url": null,
+            "file_path": "apps/centarb_backend/app/main.py",
+            "line_start": 2766,
+            "line_end": 2778,
+            "commit_sha": "c643ee6491c6adc4641869b6fca6cf2feda3eea9",
+            "snippet": "@app.delete(\"/arb-types/{type_id}\")\ndef delete_arb_type(\n    type_id: uuid.UUID,\n    request: Request,\n    force: bool = Query(default=False),\n    session: Session = Depends(get_session),\n):\n    \"\"\"Delete an ARB type and all associated data.\n\n    Pass ?force=true to delete even when requests are attached.\n    \"\"\"\n    _require_admin(request, session)",
+            "blame_author": "Guy Keinan",
+            "blame_date": "2026-05-03"
+          },
+          {
+            "repo_alias": "vibe_coding/centarb",
+            "repo_url": null,
+            "file_path": "apps/centarb_backend/app/main.py",
+            "line_start": 2620,
+            "line_end": 2635,
+            "commit_sha": "c643ee6491c6adc4641869b6fca6cf2feda3eea9",
+            "snippet": "@app.post(\"/arb-types/generate-from-ppt\")\ndef generate_arb_type_from_ppt(\n    request: Request,\n    file: UploadFile = File(...),\n    session: Session = Depends(get_session),\n):\n    \"\"\"Generate an ARB type template from a PowerPoint file.\n\n    Returns an event stream with phase updates and the final generated template JSON.\n    \"\"\"\n    _require_admin(request, session)\n    import sys\n    import tempfile",
+            "blame_author": "Guy Keinan",
+            "blame_date": "2026-05-03"
+          },
+          {
+            "repo_alias": "vibe_coding/centarb",
+            "repo_url": null,
+            "file_path": "apps/centarb_backend/app/main.py",
+            "line_start": 3630,
+            "line_end": 3636,
+            "commit_sha": "c643ee6491c6adc4641869b6fca6cf2feda3eea9",
+            "snippet": "@app.post(\"/arb-types/{type_id}/deviation-catalog/generate\")\ndef generate_type_deviation_catalog(\n    type_id: uuid.UUID, request: Request, session: Session = Depends(get_session)\n):\n    \"\"\"Start catalog generation in background. Returns run_id to poll progress.\"\"\"\n    _require_admin(request, session)\n    import threading",
+            "blame_author": "Guy Keinan",
+            "blame_date": "2026-05-03"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P0",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [
+          "real-product-gap",
+          "authorization",
+          "arb-types"
+        ],
+        "affected_versions": [],
+        "epic_key": null,
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T07:57:03.640407+00:00",
+          "finished_at": "2026-05-04T07:58:13.602264+00:00",
+          "tool_calls": 20,
+          "input_tokens": 78021,
+          "output_tokens": 3055,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "vibe_coding/centarb"
+          ],
+          "truncated": false,
+          "prompt_hash": "9a06a6b5721b46ab"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1291",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1291",
+        "uploaded_at": "2026-05-04T08:10:00.059497+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 5
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "4e84eb745caa2220",
+        "external_id": "X-OBS-001",
+        "source_line_start": 374,
+        "source_line_end": 378,
+        "raw_title": "Single chat populates 8 trace tables joinable by `trace_id`",
+        "raw_body": "- **What's broken:** Test posts a single chat and expects ≥ 1 row in each of the 8 documented trace tables (`orchestrator_runs`, `llm_runs`, `tool_traces`, `a2a_traces`, `audit_logs`, `classification_traces`, plus two Cent-App-side trace tables) all joinable by `trace_id`. Times out at 30 s.\n- **Hypothesis:** Stale stack. Fix C-17 (trace_id propagation migration) shipped — table schema is correct on FINAL.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/graph.py` (trace_id seeding) plus the 5 trace-models touched in fix C-17",
+        "hinted_priority": "P1",
+        "hinted_assignee": null,
+        "hinted_repos": [],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/graph.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": null,
+          "commit_sha": null,
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "4e84eb745caa2220",
+        "summary": "Single-chat trace fanout stalls before all documented trace tables are populated and joinable by trace_id",
+        "description_md": "## Symptom\nA test that posts one chat and waits for rows in the documented trace tables times out after 30 seconds. The expected fanout is at least one row in each of the eight trace tables, all joinable by `trace_id`.\n\n## Where\n- `apps/centralbackend/app/orchestrator/classifier.py:193-195` seeds `classification.trace_id` before logging the classification trace.\n- `apps/centralbackend/app/orchestrator/graph.py:100-108` carries `classification_trace_id` out of classification state.\n- `apps/centralbackend/app/orchestrator/graph.py:858-860` passes `classification_trace_id` into the orchestrator-run logger.\n- `apps/centralbackend/app/orchestrator/graph.py:1050-1052` passes `classification_trace_id` into the final orchestrator-run logger.\n- `apps/centralbackend/app/llm_logging.py:340-392` persists `classification_trace_id` on `orchestrator_runs`.\n- `apps/centralbackend/app/models/orchestrator_run.py:35-42` defines the `classification_trace_id` and `trace_id` columns on `orchestrator_runs`.\n\n## Code snippet\n```python\n        classification = IntentClassification(\n            app_id=parsed.get(\"app_id\", FALLBACK_APP_ID),\n            confidence=float(parsed.get(\"confidence\", 0.0)),\n            reasoning=parsed.get(\"reasoning\", \"\"),\n            entities=parsed.get(\"entities\", {}),\n            query_skills=[s for s in raw_skills if isinstance(s, str)],\n            needs_personal_context=bool(parsed.get(\"needs_personal_context\", False)),\n            personal_entities=personal_entities,\n            topical_keywords=topical_keywords,\n            search_terms=search_terms,\n            time_window_days=time_window_days,\n        )\n\n        ct_id = uuid.uuid4()\n        classification.trace_id = ct_id\n        fire_and_forget(log_classification_trace(\n            row_id=ct_id,\n            llm_run_id=run_id,\n            user_message=user_message,\n            app_id=classification.app_id,\n            confidence=classification.confidence,\n            reasoning=classification.reasoning,\n            entities=classification.entities,\n            query_skills=classification.query_skills,\n            session_id=session_id,\n            user_email=user_email,\n```\n\n## Reproduction steps\n1. Start the stack with the observability tables present.\n2. Post a single chat message through the central backend.\n3. Wait for the test harness to observe rows in the eight documented trace tables.\n4. Observe that the wait exceeds 30 seconds and the test times out.\n\n## Expected behavior\nA single chat produces at least one row in each documented trace table, and the rows can be joined by `trace_id`.\n\n## Actual behavior\nThe single-chat flow does not complete the full trace fanout within the test window, so the harness never observes the full set of joinable trace rows.\n\n## Last toucher\navivriftin5 on 2026-05-03\n\n## Related\n- `apps/centralbackend/app/admin/llm_usage.py:513-583` joins `orchestrator_runs` to `classification_traces` via `classification_trace_id`.\n- `apps/centralbackend/app/models/orchestrator_run.py` is the central row tying the pipeline together.\n- The bug body references the C-17 trace_id propagation migration and the five trace models touched there.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Start the central backend with the observability schema loaded."
+          },
+          {
+            "order": 2,
+            "text": "Submit one chat message through the normal chat path."
+          },
+          {
+            "order": 3,
+            "text": "Wait for the test to detect rows in the eight documented trace tables joined by `trace_id`."
+          },
+          {
+            "order": 4,
+            "text": "Observe that the wait reaches the 30-second timeout without the full set of rows appearing."
+          }
+        ],
+        "expected_behavior": null,
+        "actual_behavior": null,
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/classifier.py",
+            "line_start": 193,
+            "line_end": 195,
+            "commit_sha": "b7801f5e483b3156475d1279ac10d8fe3159095a",
+            "snippet": "        ct_id = uuid.uuid4()\n        classification.trace_id = ct_id\n        fire_and_forget(log_classification_trace(",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 100,
+            "line_end": 108,
+            "commit_sha": null,
+            "snippet": "    result: dict[str, Any] = {\n        \"matched_apps\": [app_match],\n        \"is_multi_app\": False,\n        \"intent_confidence\": classification.confidence,\n        \"intent_reasoning\": classification.reasoning,\n        \"query_skills\": classification.query_skills,\n        \"classification_trace_id\": getattr(classification, \"trace_id\", None),\n        # Personal Context Enrichment routing fields (Phase 2)\n        \"needs_personal_context\": classification.needs_personal_context,",
+            "blame_author": null,
+            "blame_date": null
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 858,
+            "line_end": 860,
+            "commit_sha": null,
+            "snippet": "            route_taken=actual_route, app_id=actual_app, confidence=confidence,\n            classification_trace_id=final_state.get(\"classification_trace_id\"),\n            classifier_model=settings.CENTRAL_CLASSIFIER_MODEL or settings.CENTRAL_LLM_MODEL,",
+            "blame_author": null,
+            "blame_date": null
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 1050,
+            "line_end": 1052,
+            "commit_sha": null,
+            "snippet": "        app_id=app_id,\n        confidence=confidence,\n        classification_trace_id=final_state.get(\"classification_trace_id\"),",
+            "blame_author": null,
+            "blame_date": null
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/llm_logging.py",
+            "line_start": 340,
+            "line_end": 392,
+            "commit_sha": null,
+            "snippet": "async def log_orchestrator_run(\n    *,\n    session_id: str,\n    user_message: str,\n    request_id: str | None = None,\n    user_email: str | None = None,\n    message_id: str | None = None,\n    conversation_depth: int | None = None,\n    total_duration_ms: int | None = None,\n    classify_ms: int | None = None,\n    agent_ms: int | None = None,\n    compose_ms: int | None = None,\n    title_ms: int | None = None,\n    classification_trace_id: uuid.UUID | None = None,\n    route_taken: str | None = None,\n    app_id: str | None = None,\n    confidence: float | None = None,\n    tools_available: int | None = None,\n    tools_called: int | None = None,\n    tool_names: list[str] | None = None,\n    agent_iterations: int | None = None,\n    recursion_limit_hit: bool = False,\n    response_length: int | None = None,\n    has_insight_data: bool = False,\n    has_evidence_refs: bool = False,\n    has_suggested_actions: bool = False,\n    classifier_model: str | None = None,\n    agent_model: str | None = None,\n    skills_loaded: list[str] | None = None,\n    query_skills: list[str] | None = None,\n    had_error: bool = False,\n    error_stage: str | None = None,\n    error_message: str | None = None,\n    personal_context: dict | None = None,\n) -> uuid.UUID | None:\n    \"\"\"Write one orchestrator run capturing the end-to-end pipeline trace.\"\"\"\n    try:\n        row = OrchestratorRun(\n            session_id=session_id,\n            request_id=request_id,\n            user_email=user_email,\n            message_id=message_id,\n            user_message=user_message,\n            conversation_depth=conversation_depth,\n            total_duration_ms=total_duration_ms,\n            classify_ms=classify_ms,\n            agent_ms=agent_ms,\n            compose_ms=compose_ms,\n            title_ms=title_ms,\n            classification_trace_id=classification_trace_id,",
+            "blame_author": null,
+            "blame_date": null
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/models/orchestrator_run.py",
+            "line_start": 35,
+            "line_end": 42,
+            "commit_sha": null,
+            "snippet": "    classification_trace_id: Mapped[uuid.UUID | None] = mapped_column(\n        UUID(as_uuid=True), nullable=True,\n    )\n    # SEC §1.1 'Get a useful error' — request-scoped trace id surfaced to\n    # the UI on errors and used to join all five observability tables.\n    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)\n    route_taken: Mapped[str | None] = mapped_column(String(20), nullable=True)",
+            "blame_author": null,
+            "blame_date": null
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P1",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1179",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:12:22.915104+00:00",
+          "finished_at": "2026-05-04T09:12:43.976296+00:00",
+          "tool_calls": 11,
+          "input_tokens": 46340,
+          "output_tokens": 2501,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1327",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1327",
+        "uploaded_at": "2026-05-04T10:26:18.936289+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 4
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "903cdcc9122bf8fd",
+        "external_id": "X-OBS-005",
+        "source_line_start": 379,
+        "source_line_end": 383,
+        "raw_title": "Fire-and-forget logging swallows DB outage",
+        "raw_body": "- **What's broken:** With the audit DB intentionally unreachable, the chat should still return 200 SSE with a valid answer, and `orchestrator_runs` should be missing the row (drop, don't crash). Test times out before any event arrives.\n- **Hypothesis:** Stale stack — possibly the test's audit-DB-down fixture is leaving the audit DB connection in a bad state for the rest of the test session.\n- **Affected files (likely):** `apps/centralbackend/app/llm_logging.py`, `apps/centralbackend/app/audit.py` (the fire-and-forget try/swallow blocks)",
+        "hinted_priority": "P1",
+        "hinted_assignee": null,
+        "hinted_repos": [],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/llm_logging.py",
+          "apps/centralbackend/app/audit.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": null,
+          "commit_sha": null,
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "903cdcc9122bf8fd",
+        "summary": "Audit and LLM observability writes can block chat responses when the audit DB is unreachable, causing SSE timeouts instead of a 200 response.",
+        "description_md": "## Symptom\nWith the audit DB intentionally unreachable, the chat request times out before any SSE event arrives. The expected observable outcome is a 200 SSE response with a valid answer, while `orchestrator_runs` has no inserted row.\n\n## Where\n- `apps/centralbackend/app/llm_logging.py:44-51` — `fire_and_forget()` schedules background logging tasks and only handles `RuntimeError` from missing event loop.\n- `apps/centralbackend/app/llm_logging.py:342-453` — `log_orchestrator_run()` and `log_user_feedback()` perform async DB writes and swallow exceptions after awaiting `get_session()` / `flush()`.\n- `apps/centralbackend/app/audit.py:103-161` — `AuditMiddleware.dispatch()` and `log_action()` perform DB writes around request handling and swallow exceptions after the request has already been processed.\n\n## Code snippet\n```python\nasync def log_orchestrator_run(\n    *,\n    session_id: str,\n    user_message: str,\n    request_id: str | None = None,\n    user_email: str | None = None,\n    message_id: str | None = None,\n    conversation_depth: int | None = None,\n    total_duration_ms: int | None = None,\n    classify_ms: int | None = None,\n    agent_ms: int | None = None,\n    compose_ms: int | None = None,\n    title_ms: int | None = None,\n    classification_trace_id: uuid.UUID | None = None,\n    route_taken: str | None = None,\n    app_id: str | None = None,\n    confidence: float | None = None,\n    tools_available: int | None = None,\n    tools_called: int | None = None,\n    tool_names: list[str] | None = None,\n    agent_iterations: int | None = None,\n    recursion_limit_hit: bool = False,\n    response_length: int | None = None,\n    has_insight_data: bool = False,\n    has_evidence_refs: bool = False,\n    has_suggested_actions: bool = False,\n    classifier_model: str | None = None,\n    agent_model: str | None = None,\n    skills_loaded: list[str] | None = None,\n    query_skills: list[str] | None = None,\n    had_error: bool = False,\n    error_stage: str | None = None,\n    error_message: str | None = None,\n    personal_context: dict | None = None,\n) -> uuid.UUID | None:\n    \"\"\"Write one orchestrator run capturing the end-to-end pipeline trace.\"\"\"\n    try:\n        row = OrchestratorRun(\n            session_id=session_id,\n            request_id=request_id,\n            user_email=user_email,\n            message_id=message_id,\n            user_message=user_message,\n            conversation_depth=conversation_depth,\n            total_duration_ms=total_duration_ms,\n            classify_ms=classify_ms,\n            agent_ms=agent_ms,\n            compose_ms=compose_ms,\n            title_ms=title_ms,\n            classification_trace_id=classification_trace_id,\n            route_taken=route_taken,\n            app_id=app_id,\n            confidence=confidence,\n            tools_available=tools_available,\n            tools_called=tools_called,\n            tool_names=tool_names,\n            agent_iterations=agent_iterations,\n            recursion_limit_hit=recursion_limit_hit,\n            response_length=response_length,\n            has_insight_data=has_insight_data,\n            has_evidence_refs=has_evidence_refs,\n            has_suggested_actions=has_suggested_actions,\n            classifier_model=classifier_model,\n            agent_model=agent_model,\n            skills_loaded=skills_loaded,\n            query_skills=query_skills,\n            had_error=had_error,\n            error_stage=error_stage,\n            error_message=error_message,\n            personal_context=personal_context,\n        )\n        async with get_session() as db:\n            db.add(row)\n            await db.flush()\n            return row.id\n    except Exception:\n        logger.exception(\"Failed to log orchestrator run\")\n        return None\n```\n\n## Reproduction steps\n1. Run the chat flow with the audit DB unavailable.\n2. Observe the request stream for the chat endpoint.\n3. Wait for the first SSE event.\n4. Check whether `orchestrator_runs` contains a row for the run.\n\n## Expected behavior\nThe chat request completes with HTTP 200 and SSE output even when audit/observability storage is unavailable. The run record is absent when the DB write cannot complete.\n\n## Actual behavior\nThe request stalls long enough for the test to time out before any SSE event is observed. The run record is not persisted when the DB is unreachable.\n\n## Last toucher\n- `llm_logging.py`: Evgeny Kagan on 2026-04-27\n- `audit.py`: Evgeny Kagan on 2026-04-27\n\n## Related\n- `CHANGELOG.md:484-489` documents the fire-and-forget observability behavior and the removal of FK constraints for independent background writes.\n- `apps/centralbackend/app/admin/llm_usage.py:588-590` depends on `orchestrator_runs.created_at` being written at run end for trace queries.\n- Nearby observability models and admin trace queries are in `apps/centralbackend/app/admin/llm_usage.py`.\n",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Run the chat endpoint with the audit database intentionally unreachable."
+          },
+          {
+            "order": 2,
+            "text": "Watch the SSE stream for the response."
+          },
+          {
+            "order": 3,
+            "text": "Wait for the first event from the stream."
+          },
+          {
+            "order": 4,
+            "text": "Inspect `orchestrator_runs` for the current run identifier."
+          }
+        ],
+        "expected_behavior": null,
+        "actual_behavior": null,
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/llm_logging.py",
+            "line_start": 44,
+            "line_end": 51,
+            "commit_sha": null,
+            "snippet": "def fire_and_forget(coro: Any) -> None:\n    \"\"\"Schedule a coroutine as a background task — caller never blocks on DB writes.\"\"\"\n    try:\n        task = asyncio.create_task(coro)\n        _background_tasks.add(task)\n        task.add_done_callback(_background_tasks.discard)\n    except RuntimeError:\n        logger.warning(\"fire_and_forget: no event loop — dropping log coroutine\")",
+            "blame_author": null,
+            "blame_date": null
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/llm_logging.py",
+            "line_start": 342,
+            "line_end": 453,
+            "commit_sha": null,
+            "snippet": "async def log_orchestrator_run(\n    *,\n    session_id: str,\n    user_message: str,\n    request_id: str | None = None,\n    user_email: str | None = None,\n    message_id: str | None = None,\n    conversation_depth: int | None = None,\n    total_duration_ms: int | None = None,\n    classify_ms: int | None = None,\n    agent_ms: int | None = None,\n    compose_ms: int | None = None,\n    title_ms: int | None = None,\n    classification_trace_id: uuid.UUID | None = None,\n    route_taken: str | None = None,\n    app_id: str | None = None,\n    confidence: float | None = None,\n    tools_available: int | None = None,\n    tools_called: int | None = None,\n    tool_names: list[str] | None = None,\n    agent_iterations: int | None = None,\n    recursion_limit_hit: bool = False,\n    response_length: int | None = None,\n    has_insight_data: bool = False,\n    has_evidence_refs: bool = False,\n    has_suggested_actions: bool = False,\n    classifier_model: str | None = None,\n    agent_model: str | None = None,\n    skills_loaded: list[str] | None = None,\n    query_skills: list[str] | None = None,\n    had_error: bool = False,\n    error_stage: str | None = None,\n    error_message: str | None = None,\n    personal_context: dict | None = None,\n) -> uuid.UUID | None:\n    \"\"\"Write one orchestrator run capturing the end-to-end pipeline trace.\"\"\"\n    try:\n        row = OrchestratorRun(\n            session_id=session_id,\n            request_id=request_id,\n            user_email=user_email,\n            message_id=message_id,\n            user_message=user_message,\n            conversation_depth=conversation_depth,\n            total_duration_ms=total_duration_ms,\n            classify_ms=classify_ms,\n            agent_ms=agent_ms,\n            compose_ms=compose_ms,\n            title_ms=title_ms,\n            classification_trace_id=classification_trace_id,\n            route_taken=route_taken,\n            app_id=app_id,\n            confidence=confidence,\n            tools_available=tools_available,\n            tools_called=tools_called,\n            tool_names=tool_names,\n            agent_iterations=agent_iterations,\n            recursion_limit_hit=recursion_limit_hit,\n            response_length=response_length,\n            has_insight_data=has_insight_data,\n            has_evidence_refs=has_evidence_refs,\n            has_suggested_actions=has_suggested_actions,\n            classifier_model=classifier_model,\n            agent_model=agent_model,\n            skills_loaded=skills_loaded,\n            query_skills=query_skills,\n            had_error=had_error,\n            error_stage=error_stage,\n            error_message=error_message,\n            personal_context=personal_context,\n        )\n        async with get_session() as db:\n            db.add(row)\n            await db.flush()\n            return row.id\n    except Exception:\n        logger.exception(\"Failed to log orchestrator run\")\n        return None",
+            "blame_author": null,
+            "blame_date": null
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/audit.py",
+            "line_start": 103,
+            "line_end": 161,
+            "commit_sha": null,
+            "snippet": "class AuditMiddleware(BaseHTTPMiddleware):\n    \"\"\"Logs every mutating request (POST/PUT/PATCH/DELETE) with user identity.\n\n    GET requests and high-frequency validation endpoints are skipped.\n    \"\"\"\n\n    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:\n        path = request.url.path\n\n        if request.method == \"GET\":\n            return await call_next(request)\n        if path in _SKIP_PATHS or any(path.startswith(p) for p in _SKIP_PREFIXES):\n            return await call_next(request)\n\n        t0 = time.monotonic()\n        response = await call_next(request)\n        duration_ms = int((time.monotonic() - t0) * 1000)\n\n        email = _get_user_email(request)\n\n        try:\n            async with get_session() as db:\n                db.add(AuditLog(\n                    user_email=email,\n                    action=f\"http.{request.method}\",\n                    http_method=request.method,\n                    http_path=path,\n                    status=response.status_code,\n                    duration_ms=duration_ms,\n                    ip_address=_client_ip(request),\n                ))\n        except Exception:\n            logger.exception(\"Failed to write audit log for %s %s\", request.method, path)\n\n        return response",
+            "blame_author": null,
+            "blame_date": null
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P1",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1184",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:12:34.403941+00:00",
+          "finished_at": "2026-05-04T09:12:58.628102+00:00",
+          "tool_calls": 13,
+          "input_tokens": 190654,
+          "output_tokens": 3141,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1328",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1328",
+        "uploaded_at": "2026-05-04T10:26:19.232163+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 4
+    },
+    {
+      "stage": "uploaded",
+      "parsed": {
+        "bug_id": "ec7e36a45a10ebbb",
+        "external_id": "X-PERF-002",
+        "source_line_start": 384,
+        "source_line_end": 388,
+        "raw_title": "First chat response token p95 ≤ 5 s",
+        "raw_body": "- **What's broken:** Performance probe — first content token must arrive within 5 s p95. Times out at 30 s, so first token never arrives.\n- **Hypothesis:** Stale stack or LLM provider latency. Bounce + re-run.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/graph.py`, `apps/centralbackend/app/orchestrator/agent.py`",
+        "hinted_priority": "P2",
+        "hinted_assignee": null,
+        "hinted_repos": [],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/graph.py",
+          "apps/centralbackend/app/orchestrator/agent.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": null,
+          "commit_sha": null,
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "ec7e36a45a10ebbb",
+        "summary": "Orchestrator chat streaming can exceed the 5s first-token latency budget and time out before any content is emitted.",
+        "description_md": "## Symptom\nThe performance probe reports that the first content token does not arrive within the 5 s p95 budget. The run times out at 30 s, so no first token is observed.\n\n## Where\n- `apps/centralbackend/app/orchestrator/agent.py:67-74` — the LLM is created with `streaming=True` and `max_tokens=4096`.\n- `apps/centralbackend/app/orchestrator/agent.py:799-814` — the streaming loop waits on `agent.astream_events(...)` before any event is processed.\n- `apps/centralbackend/app/orchestrator/graph.py:1-5` — the orchestrator graph routes requests through `load_context → classify_intent → [fallback | a2a_delegate] → compose_result → update_context → END`, so the first user-visible output depends on the downstream delegate/composer path.\n\n## Code snippet\n```python\ndef _get_llm() -> ChatOpenAI:\n    return ChatOpenAI(\n        base_url=settings.CENTRAL_LLM_BASE_URL,\n        api_key=settings.CENTRAL_LLM_API_KEY,\n        model=settings.CENTRAL_LLM_MODEL,\n        temperature=0.1,\n        max_tokens=4096,\n        streaming=True,\n    )\n```\n\n## Reproduction steps\n1. Start the central backend and open the chat path that uses the orchestrator.\n2. Send a message that triggers the orchestrator streaming response.\n3. Observe the SSE/chat stream timing.\n4. Note that no first content token arrives before the 5 s p95 threshold, and the request eventually times out around 30 s.\n\n## Expected behavior\nThe first content token is observable within 5 s at p95 for the chat response stream.\n\n## Actual behavior\nThe chat stream does not emit a first content token within the 5 s p95 budget, and the request times out before any content is seen.\n\n## Last toucher\navivriftin5 on 2026-05-03T00:14:00+03:00\n\n## Related\n- `apps/centralbackend/app/orchestrator/agent.py` contains the streaming SSE loop for chat responses.\n- `apps/centralbackend/app/orchestrator/graph.py` contains the request-routing graph that feeds the response path.\n- `apps/centralbackend/app/orchestrator/personal_context.py` has a separate timeout budget for enrichment work, which is adjacent to the latency-sensitive chat path.\n",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Start the central backend and open the chat path that uses the orchestrator."
+          },
+          {
+            "order": 2,
+            "text": "Send a message that triggers the orchestrator streaming response."
+          },
+          {
+            "order": 3,
+            "text": "Observe the SSE/chat stream timing."
+          },
+          {
+            "order": 4,
+            "text": "Note that no first content token arrives before the 5 s p95 threshold, and the request eventually times out around 30 s."
+          }
+        ],
+        "expected_behavior": null,
+        "actual_behavior": null,
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/agent.py",
+            "line_start": 67,
+            "line_end": 74,
+            "commit_sha": null,
+            "snippet": "def _get_llm() -> ChatOpenAI:\n    return ChatOpenAI(\n        base_url=settings.CENTRAL_LLM_BASE_URL,\n        api_key=settings.CENTRAL_LLM_API_KEY,\n        model=settings.CENTRAL_LLM_MODEL,\n        temperature=0.1,\n        max_tokens=4096,\n        streaming=True,\n    )",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03T00:14:00+03:00"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/graph.py",
+            "line_start": 1,
+            "line_end": 5,
+            "commit_sha": null,
+            "snippet": "\"\"\"Orchestrator LangGraph — simplified StateGraph for request lifecycle.\n\nADR-011 flow (A2A-only for apps, MCP for shared providers via fallback):\n  load_context → classify_intent → [fallback | a2a_delegate]\n  a2a_delegate → compose_result → update_context → END",
+            "blame_author": "avivriftin5",
+            "blame_date": "2026-05-03T00:14:00+03:00"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P2",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1179",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:12:44.011597+00:00",
+          "finished_at": "2026-05-04T09:13:58.403198+00:00",
+          "tool_calls": 20,
+          "input_tokens": 203157,
+          "output_tokens": 1942,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": {
+        "jira_key": "CENTPM-1329",
+        "jira_url": "https://jirasw.nvidia.com/browse/CENTPM-1329",
+        "uploaded_at": "2026-05-04T10:26:20.051716+00:00",
+        "response_etag": null
+      },
+      "last_error": null,
+      "attempts": 4
+    },
+    {
+      "stage": "failed",
+      "parsed": {
+        "bug_id": "9c6bbbb885f420d1",
+        "external_id": "X-SEC-009",
+        "source_line_start": 389,
+        "source_line_end": 395,
+        "raw_title": "Rate limit boundary 30 chat / 60 s",
+        "raw_body": "- **What's broken:** Test posts exactly 30 chat messages in 60 s (all should 200), then a 31st (should 429 with `Retry-After`), then waits past the window and posts a 32nd (should 200). Times out at 30 s — likely the very first chat in the burst is hanging.\n- **Hypothesis:** Stale stack; closely related to X-PERF-002.\n- **Affected files (likely):** `apps/centralbackend/app/orchestrator/chat_router.py` (`check_chat_rate_limit`)",
+        "hinted_priority": "P0",
+        "hinted_assignee": null,
+        "hinted_repos": [],
+        "hinted_components": [],
+        "hinted_files": [
+          "apps/centralbackend/app/orchestrator/chat_router.py"
+        ],
+        "labels": [
+          "timeout-suspected-stale"
+        ],
+        "inherited_module": {
+          "repo_alias": "_core",
+          "branch": null,
+          "commit_sha": null,
+          "repo_url": null
+        },
+        "closed_section": false,
+        "removed_fix_text": null,
+        "affected_test_ids": []
+      },
+      "enriched": {
+        "bug_id": "9c6bbbb885f420d1",
+        "summary": "Chat rate limiting hangs on the first request in the burst instead of returning responses within the 60-second boundary",
+        "description_md": "## Symptom\nA burst test that posts 30 chat messages within 60 seconds does not complete; it times out around 30 seconds, and the first chat request in the burst appears to hang. The scenario also expects a 31st request to be rate-limited with `429` and `Retry-After`, then a later request after the window to succeed.\n\n## Where\n- `apps/centralbackend/app/orchestrator/chat_router.py:285-288` — `/api/chat` calls `check_chat_rate_limit(request)` before any chat handling.\n- `apps/centralbackend/app/rate_limit.py:30-41` — in-memory sliding-window limiter for `/api/chat`, including the `len(hits) >= _CHAT_LIMIT` check and timestamp pruning.\n\n## Code snippet\n```python\ndef check_chat_rate_limit(request: Request) -> None:\n    \"\"\"Raise HTTP 429 if this IP has exceeded 30 requests/minute.\"\"\"\n    ip = _get_client_ip(request)\n    now = time.monotonic()\n    hits = [t for t in _chat_hits[ip] if now - t < _CHAT_WINDOW]\n    _chat_hits[ip] = hits\n    if len(hits) >= _CHAT_LIMIT:\n        raise HTTPException(\n            status_code=429,\n            detail=f\"Rate limit exceeded: {_CHAT_LIMIT} requests per {_CHAT_WINDOW}s\",\n        )\n    _chat_hits[ip].append(now)\n```\n\n## Reproduction steps\n1. Send 30 `/api/chat` requests from the same client within 60 seconds.\n2. Observe that each of the first 30 requests is expected to complete successfully.\n3. Send a 31st `/api/chat` request before the 60-second window expires.\n4. Wait until the 60-second window has passed.\n5. Send a 32nd `/api/chat` request.\n\n## Expected behavior\nThe first 30 requests complete successfully, the 31st request is rejected with HTTP 429 and a `Retry-After` response, and a later request after the window completes successfully.\n\n## Actual behavior\nThe burst test times out at about 30 seconds, with the first chat request in the burst appearing to stall instead of completing normally. The rate-limit path in the code only raises a 429 when the in-memory hit count reaches the limit; no `Retry-After` response is present in the shown limiter code.\n\n## Last toucher\nGuy Keinan on 2026-04-28\n\n## Related\n- `apps/centralbackend/app/orchestrator/chat_router.py` for the `/api/chat` entrypoint.\n- `apps/centralbackend/app/rate_limit.py` for the limiter logic.\n- Related label: `timeout-suspected-stale`.\n- Hypothesis in the bug record references X-PERF-002.",
+        "reproduction_steps": [
+          {
+            "order": 1,
+            "text": "Send 30 `/api/chat` requests from the same client within 60 seconds."
+          },
+          {
+            "order": 2,
+            "text": "Observe that each of the first 30 requests is expected to complete successfully."
+          },
+          {
+            "order": 3,
+            "text": "Send a 31st `/api/chat` request before the 60-second window expires."
+          },
+          {
+            "order": 4,
+            "text": "Wait until the 60-second window has passed."
+          },
+          {
+            "order": 5,
+            "text": "Send a 32nd `/api/chat` request."
+          }
+        ],
+        "expected_behavior": null,
+        "actual_behavior": null,
+        "code_references": [
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/orchestrator/chat_router.py",
+            "line_start": 285,
+            "line_end": 288,
+            "commit_sha": "2163da97af36a278bf1cb456141f6a5b20ff880a",
+            "snippet": "@router.post(\"/api/chat\")\nasync def chat(body: ChatRequest, request: FastAPIRequest, user: UserInfo = Depends(get_current_user)):\n    \"\"\"Stream orchestrator response as SSE events.\"\"\"\n    check_chat_rate_limit(request)",
+            "blame_author": "Guy Keinan",
+            "blame_date": "2026-04-28"
+          },
+          {
+            "repo_alias": "_core",
+            "repo_url": null,
+            "file_path": "apps/centralbackend/app/rate_limit.py",
+            "line_start": 30,
+            "line_end": 41,
+            "commit_sha": "2163da97af36a278bf1cb456141f6a5b20ff880a",
+            "snippet": "def check_chat_rate_limit(request: Request) -> None:\n    \"\"\"Raise HTTP 429 if this IP has exceeded 30 requests/minute.\"\"\"\n    ip = _get_client_ip(request)\n    now = time.monotonic()\n    hits = [t for t in _chat_hits[ip] if now - t < _CHAT_WINDOW]\n    _chat_hits[ip] = hits\n    if len(hits) >= _CHAT_LIMIT:\n        raise HTTPException(\n            status_code=429,\n            detail=f\"Rate limit exceeded: {_CHAT_LIMIT} requests per {_CHAT_WINDOW}s\",\n        )\n    _chat_hits[ip].append(now)",
+            "blame_author": "Guy Keinan",
+            "blame_date": "2026-04-28"
+          }
+        ],
+        "relevant_logs": null,
+        "priority": "P0",
+        "assignee_hint": null,
+        "components": [],
+        "labels": [],
+        "affected_versions": [],
+        "epic_key": "CENTPM-1184",
+        "enrichment_meta": {
+          "model": "openai/openai/gpt-5.4-mini",
+          "started_at": "2026-05-04T09:12:44.449229+00:00",
+          "finished_at": "2026-05-04T09:12:59.353776+00:00",
+          "tool_calls": 8,
+          "input_tokens": 31168,
+          "output_tokens": 1476,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "repos_touched": [
+            "_core"
+          ],
+          "truncated": false,
+          "prompt_hash": "c7b01016aaf65e87"
+        }
+      },
+      "upload": null,
+      "last_error": {
+        "stage": "uploading",
+        "message": "create_issue failed: Priority name 'P0 - Must Have' is not valid",
+        "traceback": null,
+        "failure_class": null,
+        "occurred_at": "2026-05-04T10:26:18.792592+00:00"
+      },
+      "attempts": 4
+    }
+  ]
+}

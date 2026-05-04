@@ -1,0 +1,44 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# uv
+.venv/
+
+# Tool state files
+*.state.json
+*.state.json.tmp
+*.state.json.bak*
+.cache/
+.logs/
+
+# User local overrides (shipped example is `configs/example.user.yaml`)
+/f2j.yaml
+
+# Example input files (drop-in zone; keep dir but ignore contents)
+examples/*
+!examples/README.md
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

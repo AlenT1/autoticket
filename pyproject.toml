@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "file-to-jira-tickets"
+version = "0.1.0"
+description = "Parse markdown bug lists and upload them as Jira tickets, enriched with code context by AI agents."
+requires-python = ">=3.11"
+authors = [{ name = "NVIDIA" }]
+license = { text = "Proprietary" }
+readme = "README.md"
+dependencies = [
+    # Anthropic Python SDK; we drive the tool-use loop ourselves rather than
+    # depending on claude-agent-sdk, which adds 75 MB and an extra abstraction
+    # over the same primitives.
+    "anthropic>=0.40.0",
+    # OpenAI Python SDK; used when enrichment.provider="openai_compatible" to
+    # talk to NVIDIA Inference Hub or any OpenAI-protocol endpoint. Pulls in
+    # `httpx` and a few small deps (~5 MB total).
+    "openai>=1.50",
+    "atlassian-python-api>=3.41.0",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "typer>=0.12",
+    "rich>=13.7",
+    "structlog>=24.1",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "markdown-it-py>=3.0",
+    "filelock>=3.13",
+    "tenacity>=8.2",
+    "charset-normalizer>=3.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-recording>=0.13",
+    "vcrpy>=6.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+f2j = "file_to_jira.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/file_to_jira"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"configs/default.yaml" = "file_to_jira/_data/default.yaml"
+"prompts/enrichment_system.md" = "file_to_jira/_data/enrichment_system.md"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "live: requires live credentials (RUN_LIVE=1 to enable)",
+]

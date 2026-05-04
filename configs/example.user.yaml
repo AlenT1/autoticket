@@ -1,0 +1,77 @@
+# Copy this file to ./f2j.yaml (or ~/.config/f2j/config.yaml) and fill in.
+# Only override what you need to change from defaults.
+
+# ---- LLM provider --------------------------------------------------------
+# Pick one of:
+#   provider: "anthropic"          # public Anthropic API; needs ANTHROPIC_API_KEY
+#   provider: "openai_compatible"  # NVIDIA Inference Hub, Azure OpenAI, vLLM, etc.
+#
+# NVIDIA Inference Hub example (recommended for NVIDIA operators):
+enrichment:
+  provider: "openai_compatible"
+
+openai_compatible:
+  base_url: "https://inference-api.nvidia.com/v1"
+  api_key_env: "NVIDIA_LLM_API_KEY"
+  model: "openai/openai/gpt-5.4-mini"
+  temperature: 0.0
+
+jira:
+  url: "https://jirasw.nvidia.com"
+  project_key: "BUG"                   # ← set your Jira project
+  issue_type: "Bug"
+  default_assignee: "yourname"         # ← Jira username
+
+  # Run `f2j jira fields --project BUG` to discover field IDs, then fill these in.
+  # The structure is per-issue-type; "bug" is required, others are optional now.
+  field_map:
+    bug:
+      summary: "summary"
+      description: "description"
+      priority: "priority"
+      # severity: "customfield_12345"
+      # found_in_build: "customfield_12347"
+
+  # H2 module name in input MD → Jira component name.
+  module_to_component:
+    _core: "Core"
+    vibe_coding/centarb: "CentARB"
+    _apps_centprojects: "CentProjects"
+    _libs_centsdk: "centsdk"
+
+repo_aliases:
+  # Aliases match the short names that appear in source MD (e.g. `_core`).
+  # Pick auth strategy:
+  #   - glab          : delegate to `glab repo clone` (recommended for NVIDIA GitLab)
+  #   - https-token   : git clone with token from token_env
+  #   - ssh-default   : use the user's existing SSH agent
+  _core:
+    url: "https://gitlab-master.nvidia.com/<group>/_core.git"
+    auth: "glab"
+    default_branch: "main"
+
+  vibe_coding/centarb:
+    url: "https://gitlab-master.nvidia.com/<group>/centarb.git"
+    auth: "glab"
+    default_branch: "main"
+
+  _apps_centprojects:
+    url: "https://gitlab-master.nvidia.com/<group>/_apps_centprojects.git"
+    auth: "glab"
+    default_branch: "main"
+
+  _libs_centsdk:
+    url: "https://gitlab-master.nvidia.com/<group>/_libs_centsdk.git"
+    auth: "glab"
+    default_branch: "main"
+
+# Uncomment if NVIDIA internal CA is needed for direct git over HTTPS:
+# git_auth:
+#   ca_bundle: "C:/path/to/nvidia-ca-bundle.pem"
+
+# Per-repo context docs the agent should consult during enrichment.
+# enrichment:
+#   context_docs:
+#     _core:
+#       - "NVIS_Central_Test_Plan.md"
+#       - "NVIS_Central_Feature_Inventory.md"
