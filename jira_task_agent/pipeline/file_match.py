@@ -32,11 +32,13 @@ from .matcher import (
     MatcherResult,
     compute_matcher_prompt_sha,
     compute_project_topology_sha,
+    epic_candidates_from_tree,
     file_epic_result_from_json,
     file_epic_result_to_json,
     match,
     match_grouped,
     run_matcher,
+    task_candidates_from_children,
 )
 
 
@@ -44,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 Extraction = ExtractionResult | MultiExtractionResult
 EPIC_DIRTY_PREFIX = "<epic>:"
-_DESCRIPTION_PREVIEW_CHARS = 3000
 
 
 @dataclass(frozen=True)
@@ -170,35 +171,160 @@ def _try_partial(
 
     dirty_epic_idxs, dirty_task_anchors = _split_dirty(dirty)
     sections = _sections_of(ext)
-    s1_decisions = _refresh_dirty_epics(
-        sections, cached_frs, dirty_epic_idxs, project_tree,
+    processed = _processed_section_indexes(
+        sections, cached_frs, dirty_epic_idxs, dirty_task_anchors,
     )
+    if not processed:
+        return None
+
+    s1_decisions = _stage1_match(sections, processed, project_tree)
     candidates_by_key = {
-        e.get("key"): _task_candidates(e.get("children") or [])
+        e.get("key"): task_candidates_from_children(e.get("children") or [])
         for e in (project_tree.get("epics") or []) if e.get("key")
     }
 
-    out_frs = [
-        _build_section_result(
-            ext=ext, idx=i, section=section,
-            cached_frs=cached_frs,
-            s1_decisions=s1_decisions,
-            dirty_task_anchors=dirty_task_anchors,
-            candidates_by_key=candidates_by_key,
-            batch_size=batch_size, max_workers=max_workers,
-        )
-        for i, section in enumerate(sections)
-    ]
+    out_frs: list[FileEpicResult] = []
+    for i, section in enumerate(sections):
+        if i in processed:
+            cached = cached_frs[i] if i < len(cached_frs) else None
+            out_frs.append(_build_processed_section(
+                ext, i, section,
+                s1_decision=s1_decisions[i], cached_fr=cached,
+                dirty_task_anchors=dirty_task_anchors,
+                candidates_by_key=candidates_by_key,
+                batch_size=batch_size, max_workers=max_workers,
+            ))
+        else:
+            out_frs.append(cached_frs[i])
+
     _persist_match(
         cache, drive_file, ext.file_id,
         content_sha=content_sha, prompt_sha=prompt_sha,
         topology_sha=topology_sha, results=out_frs,
     )
     logger.info(
-        "matcher partial: %s — %d dirty epic(s), %d dirty task(s)",
-        ext.file_name, len(dirty_epic_idxs), len(dirty_task_anchors),
+        "matcher partial: %s — %d processed section(s)",
+        ext.file_name, len(processed),
     )
     return out_frs
+
+
+def _processed_section_indexes(
+    sections: list[_Section],
+    cached_frs: list[FileEpicResult],
+    dirty_epic_idxs: set[int],
+    dirty_task_anchors: set[str],
+) -> set[int]:
+    """A section is processed if its epic or any of its tasks is in
+    dirty, or it is brand new (beyond the cached state)."""
+    out: set[int] = set()
+    for i, section in enumerate(sections):
+        if i >= len(cached_frs) or i in dirty_epic_idxs:
+            out.add(i)
+            continue
+        if any(
+            t.source_anchor and t.source_anchor in dirty_task_anchors
+            for t in section.tasks
+        ):
+            out.add(i)
+    return out
+
+
+def _stage1_match(
+    sections: list[_Section],
+    processed: set[int],
+    project_tree: dict,
+) -> dict[int, MatchDecision]:
+    """Re-pair every processed section's epic against the full project
+    tree. Brand-new sections, dirty-epic sections, and sections with
+    only dirty tasks all flow through here so the matcher always sees
+    the section's epic context plus the live tree."""
+    indexes = sorted(processed)
+    items = [
+        MatchInput(summary=sections[i].summary, description=sections[i].description)
+        for i in indexes
+    ]
+    decisions = match(
+        items=items, candidates=epic_candidates_from_tree(project_tree), kind="epic",
+    )
+    return dict(zip(indexes, decisions))
+
+
+def _build_processed_section(
+    ext: Extraction,
+    idx: int,
+    section: _Section,
+    *,
+    s1_decision: MatchDecision,
+    cached_fr: FileEpicResult | None,
+    dirty_task_anchors: set[str],
+    candidates_by_key: dict[str, list[MatchInput]],
+    batch_size: int,
+    max_workers: int,
+) -> FileEpicResult:
+    matched_key = s1_decision.candidate_key
+    task_anchors = [t.source_anchor or None for t in section.tasks]
+
+    if matched_key is None:
+        return _file_epic_result(
+            ext, idx, section, s1_decision,
+            task_decisions=[
+                MatchDecision(j, None, 0.0, "no matched epic")
+                for j in range(len(section.tasks))
+            ],
+            task_anchors=task_anchors,
+            orphan_keys=[],
+        )
+
+    candidates = candidates_by_key.get(matched_key, [])
+    epic_unchanged = (
+        cached_fr is not None and cached_fr.matched_jira_key == matched_key
+    )
+    if epic_unchanged:
+        task_decisions = _stage2_partial(
+            tasks=section.tasks, cached_fr=cached_fr,
+            candidates=candidates, dirty_task_anchors=dirty_task_anchors,
+            file_id=ext.file_id, idx=idx, matched_key=matched_key,
+            batch_size=batch_size, max_workers=max_workers,
+        )
+    else:
+        task_decisions = _stage2_full(
+            section.tasks, candidates, ext.file_id, idx, matched_key,
+            batch_size=batch_size, max_workers=max_workers,
+        )
+    used = {d.candidate_key for d in task_decisions if d.candidate_key}
+    return _file_epic_result(
+        ext, idx, section, s1_decision,
+        task_decisions=task_decisions,
+        task_anchors=task_anchors,
+        orphan_keys=[c.key for c in candidates if c.key not in used],
+    )
+
+
+def _file_epic_result(
+    ext: Extraction,
+    idx: int,
+    section: _Section,
+    s1_decision: MatchDecision,
+    *,
+    task_decisions: list[MatchDecision],
+    task_anchors: list[str | None],
+    orphan_keys: list[str],
+) -> FileEpicResult:
+    return FileEpicResult(
+        file_id=ext.file_id,
+        file_name=ext.file_name,
+        section_index=idx,
+        extracted_epic_summary=section.summary,
+        extracted_epic_description=section.description,
+        extracted_epic_assignee_raw=section.assignee_name,
+        matched_jira_key=s1_decision.candidate_key,
+        epic_match_confidence=s1_decision.confidence,
+        epic_match_reason=s1_decision.reason,
+        task_decisions=task_decisions,
+        task_anchors=task_anchors,
+        orphan_keys=orphan_keys,
+    )
 
 
 def _run_fresh(
@@ -290,124 +416,6 @@ def _sections_of(ext: Extraction) -> list[_Section]:
     )]
 
 
-def _epic_candidates(project_tree: dict) -> list[MatchInput]:
-    return [
-        MatchInput(
-            key=e.get("key"),
-            summary=(e.get("summary") or "").strip(),
-            description=(e.get("description") or "")[:_DESCRIPTION_PREVIEW_CHARS],
-            children=[
-                {
-                    "key": c.get("key"),
-                    "summary": (c.get("summary") or "").strip(),
-                    "status": c.get("status"),
-                }
-                for c in (e.get("children") or [])
-                if c.get("key")
-            ],
-        )
-        for e in (project_tree.get("epics") or [])
-        if e.get("key") and e.get("summary")
-    ]
-
-
-def _task_candidates(children: list[dict]) -> list[MatchInput]:
-    return [
-        MatchInput(
-            key=c.get("key"),
-            summary=(c.get("summary") or "").strip(),
-            description=(c.get("description") or "")[:_DESCRIPTION_PREVIEW_CHARS],
-        )
-        for c in children
-        if c.get("key")
-    ]
-
-
-def _refresh_dirty_epics(
-    sections: list[_Section],
-    cached_frs: list[FileEpicResult],
-    dirty_epic_idxs: set[int],
-    project_tree: dict,
-) -> dict[int, MatchDecision]:
-    indexes = [
-        i for i in range(len(sections))
-        if i in dirty_epic_idxs or i >= len(cached_frs)
-    ]
-    if not indexes:
-        return {}
-    items = [
-        MatchInput(summary=sections[i].summary, description=sections[i].description)
-        for i in indexes
-    ]
-    decisions = match(items=items, candidates=_epic_candidates(project_tree), kind="epic")
-    return dict(zip(indexes, decisions))
-
-
-def _build_section_result(
-    *,
-    ext: Extraction,
-    idx: int,
-    section: _Section,
-    cached_frs: list[FileEpicResult],
-    s1_decisions: dict[int, MatchDecision],
-    dirty_task_anchors: set[str],
-    candidates_by_key: dict[str, list[MatchInput]],
-    batch_size: int,
-    max_workers: int,
-) -> FileEpicResult:
-    fresh_decision = s1_decisions.get(idx)
-    if fresh_decision is not None:
-        matched_key = fresh_decision.candidate_key
-        epic_conf = fresh_decision.confidence
-        epic_reason = fresh_decision.reason
-    else:
-        cached = cached_frs[idx]
-        matched_key = cached.matched_jira_key
-        epic_conf = cached.epic_match_confidence
-        epic_reason = cached.epic_match_reason
-
-    task_anchors = [t.source_anchor or None for t in section.tasks]
-    if matched_key is None:
-        task_decisions = [
-            MatchDecision(
-                item_index=j, candidate_key=None,
-                confidence=0.0, reason="no matched epic",
-            )
-            for j in range(len(section.tasks))
-        ]
-        orphan_keys: list[str] = []
-    else:
-        candidates = candidates_by_key.get(matched_key, [])
-        epic_freshly_matched = idx in s1_decisions or idx >= len(cached_frs)
-        if epic_freshly_matched:
-            task_decisions = _stage2_full(
-                section.tasks, candidates, ext.file_id, idx, matched_key,
-                batch_size=batch_size, max_workers=max_workers,
-            )
-        else:
-            task_decisions = _stage2_partial(
-                tasks=section.tasks,
-                cached_fr=cached_frs[idx],
-                candidates=candidates,
-                dirty_task_anchors=dirty_task_anchors,
-                file_id=ext.file_id, idx=idx, matched_key=matched_key,
-                batch_size=batch_size, max_workers=max_workers,
-            )
-        used = {d.candidate_key for d in task_decisions if d.candidate_key}
-        orphan_keys = [c.key for c in candidates if c.key not in used]
-
-    return FileEpicResult(
-        file_id=ext.file_id, file_name=ext.file_name, section_index=idx,
-        extracted_epic_summary=section.summary,
-        extracted_epic_description=section.description,
-        extracted_epic_assignee_raw=section.assignee_name,
-        matched_jira_key=matched_key,
-        epic_match_confidence=epic_conf,
-        epic_match_reason=epic_reason,
-        task_decisions=task_decisions,
-        task_anchors=task_anchors,
-        orphan_keys=orphan_keys,
-    )
 
 
 def _stage2_full(

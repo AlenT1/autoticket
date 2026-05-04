@@ -430,11 +430,14 @@ def test_run_matcher_end_to_end_stubbed(monkeypatch):
     assert fr2.task_decisions[0].candidate_key == "CENTPM-2.1"
     assert fr2.orphan_keys == []
 
-    # multi_epic[1] → no match → no Stage-2 call for this group
+    # multi_epic[1] → no match → no Stage-2 LLM call, but task decisions
+    # are populated with default no-match entries so the reconciler can
+    # emit `create_task` for them under the new epic.
     assert fr3.file_id == "F2"
     assert fr3.section_index == 1
     assert fr3.matched_jira_key is None
-    assert fr3.task_decisions == []
+    assert len(fr3.task_decisions) == 1
+    assert fr3.task_decisions[0].candidate_key is None
     assert fr3.orphan_keys == []
 
     # Two LLM calls total: 1 epic + 1 grouped task call (both matched

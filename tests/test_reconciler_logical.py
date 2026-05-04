@@ -1,15 +1,9 @@
-"""Phase 1 — logical tests for the reconciler.
+"""Logical tests for the reconciler + dirty filter.
 
-After the matcher refactor, the reconciler is pure logic — no LLM
-calls. Tests construct a `MatcherResult` directly and call
-`build_plans_from_match` to verify Action emission for each scenario:
-
-  - empty Jira project    → all `create_*`
-  - matched epic + content unchanged → `noop`
-  - partial-match + extra child → some `noop`/`update_task`/`create_task`
-                                 + `orphan`
-  - matched epic with non-agent description → `update_epic`
-  - multi-epic file       → multiple groups, distinct match decisions
+The reconciler operates on a `list[DirtySection]` produced upstream
+by `pipeline.dirty_filter.filter_dirty`. Body comparison is gone: every
+dirty item produces a write action with the extracted body. These
+tests cover the action-mapping contract for each input shape.
 """
 from __future__ import annotations
 
@@ -18,7 +12,11 @@ from datetime import datetime, timezone
 import pytest
 
 from jira_task_agent.drive.client import DriveFile
-from jira_task_agent.pipeline import reconciler
+from jira_task_agent.pipeline.dirty_filter import (
+    DirtySection,
+    DirtyTask,
+    filter_dirty,
+)
 from jira_task_agent.pipeline.extractor import (
     AGENT_MARKER,
     ExtractedEpic,
@@ -32,20 +30,12 @@ from jira_task_agent.pipeline.matcher import (
     MatchDecision,
     MatcherResult,
 )
+from jira_task_agent.pipeline.reconciler import build_plans_from_dirty
 
 from .conftest import MockJiraClient
 
 
-PROJECT = "DEMO"
-DRIVE_URL = "https://drive.google.com/file/d/DEMO_FILE/view"
-
-
-# ----------------------------------------------------------------------
-# fixtures
-# ----------------------------------------------------------------------
-
-
-def _drive_file(name: str = "V_Demo_Tasks.md", file_id: str | None = None) -> DriveFile:
+def _drive_file(name: str = "F.md", file_id: str | None = None) -> DriveFile:
     return DriveFile(
         id=file_id or name,
         name=name,
@@ -53,560 +43,430 @@ def _drive_file(name: str = "V_Demo_Tasks.md", file_id: str | None = None) -> Dr
         created_time=datetime(2026, 4, 27, tzinfo=timezone.utc),
         modified_time=datetime(2026, 4, 27, tzinfo=timezone.utc),
         size=1000,
-        creator_name=None,
-        creator_email=None,
+        creator_name=None, creator_email=None,
         last_modifying_user_name="Saar",
         last_modifying_user_email=None,
         parents=[],
-        web_view_link=DRIVE_URL,
+        web_view_link="http://drive/F",
     )
 
 
-def _task_description(text: str = "Body of task.") -> str:
+def _task_desc(body: str = "body") -> str:
     return (
-        f"{text}\n\n"
-        "### Acceptance criteria\n"
-        "- It works\n\n"
-        "### Definition of Done\n"
-        "- [ ] Code merged\n"
-        "- [ ] Tests pass\n"
-        "- [ ] Reviewed\n\n"
+        f"{body}\n\n### Definition of Done\n"
+        "- [ ] one\n- [ ] two\n- [ ] three\n\n"
         f"{AGENT_MARKER}"
     )
 
 
-def _extraction(
-    *,
-    file_id: str = "V_Demo_Tasks.md",
-    file_name: str = "V_Demo_Tasks.md",
-    epic_summary: str = "Demo epic",
-    task_summaries: list[str] | None = None,
-) -> ExtractionResult:
-    task_summaries = task_summaries or ["Task A", "Task B", "Task C"]
-    return ExtractionResult(
-        file_id=file_id,
-        file_name=file_name,
-        epic=ExtractedEpic(
-            summary=epic_summary,
-            description=f"Epic body.\n\n{AGENT_MARKER}",
-            assignee_name="Saar",
-        ),
-        tasks=[
-            ExtractedTask(
-                summary=s,
-                description=_task_description(f"Body of {s}."),
-                source_anchor=f"anchor-{i}",
-                assignee_name="Saar",
-            )
-            for i, s in enumerate(task_summaries)
-        ],
+def _t(summary: str, anchor: str) -> ExtractedTask:
+    return ExtractedTask(
+        summary=summary, description=_task_desc(summary),
+        source_anchor=anchor, assignee_name="Saar",
     )
 
 
-def _file_result(
-    *,
-    file_id: str,
-    file_name: str,
+def _section(
+    file_id: str = "F1",
+    file_name: str = "F.md",
     section_index: int = 0,
-    epic_summary: str = "Demo epic",
-    epic_description: str | None = None,
+    role: str = "single_epic",
     matched_jira_key: str | None = None,
-    task_decisions: list[MatchDecision] | None = None,
+    epic_summary: str = "Demo epic title",
+    epic_dirty: bool = True,
+    tasks: list[DirtyTask] | None = None,
     orphan_keys: list[str] | None = None,
-) -> FileEpicResult:
-    return FileEpicResult(
+) -> DirtySection:
+    return DirtySection(
+        drive_file=_drive_file(file_name, file_id),
         file_id=file_id,
         file_name=file_name,
         section_index=section_index,
-        extracted_epic_summary=epic_summary,
-        extracted_epic_description=(
-            epic_description if epic_description is not None
-            else f"Epic body.\n\n{AGENT_MARKER}"
-        ),
-        extracted_epic_assignee_raw="Saar",
+        role=role,
         matched_jira_key=matched_jira_key,
         epic_match_confidence=0.95 if matched_jira_key else 0.0,
         epic_match_reason="stub",
-        task_decisions=task_decisions or [],
+        extracted_epic_summary=epic_summary,
+        extracted_epic_description=f"Epic body.\n\n{AGENT_MARKER}",
+        extracted_epic_assignee_raw="Saar",
+        epic_dirty=epic_dirty,
+        tasks=tasks or [],
         orphan_keys=orphan_keys or [],
     )
 
 
-def _live_issue(
+def _dirty_task(summary: str, anchor: str, candidate_key: str | None) -> DirtyTask:
+    return DirtyTask(
+        extracted=_t(summary, anchor),
+        decision=MatchDecision(
+            item_index=0, candidate_key=candidate_key,
+            confidence=0.95 if candidate_key else 0.0,
+            reason="stub",
+        ),
+    )
+
+
+def _open_status_client(
+    matched_keys: list[str] = (),
     *,
-    key: str,
-    summary: str,
-    description: str,
-    assignee_username: str | None = "sriftin",
-    issue_type: str = "Task",
-) -> dict:
-    """Raw Jira-shaped issue (with `fields` nested) — matches the shape
-    `_normalize_issue` and the reconciler's downstream code expect."""
-    return {
-        "id": "1",
-        "key": key,
-        "self": "(mock)",
-        "fields": {
-            "summary": summary,
-            "description": description,
-            "assignee": {
-                "name": assignee_username,
-                "displayName": "Saar Riftin",
-                "emailAddress": "sriftin@nvidia.com",
-            } if assignee_username else None,
-            "reporter": {
-                "name": "sriftin",
-                "displayName": "Saar Riftin",
+    status: str = "Open",
+) -> MockJiraClient:
+    """MockJiraClient that returns matched epics in the given status."""
+    issues = {
+        k: {
+            "id": "1", "key": k, "self": "(mock)",
+            "fields": {
+                "summary": f"{k} live summary",
+                "description": "live description",
+                "assignee": {"name": "sriftin", "displayName": "Saar"},
+                "reporter": {"name": "sriftin", "displayName": "Saar"},
+                "issuetype": {"name": "Epic"},
+                "status": {"name": status},
+                "labels": ["ai-generated"],
+                "priority": None,
+                "created": "2026-04-01T00:00:00.000+0000",
+                "updated": "2026-04-27T00:00:00.000+0000",
             },
-            "labels": ["ai-generated"],
-            "issuetype": {"name": issue_type},
-            "status": {"name": "Open"},
-            "priority": None,
-            "created": "2026-04-01T00:00:00.000+0000",
-            "updated": "2026-04-27T00:00:00.000+0000",
-        },
+        }
+        for k in matched_keys
     }
-
-
-def _pre_converted_task_desc(body: str) -> str:
-    from jira_task_agent.jira.client import JiraClient
-    return JiraClient._md_to_jira_wiki(_task_description(body))
+    return MockJiraClient(issues=issues)
 
 
 # ----------------------------------------------------------------------
-# scenarios
+# build_plans_from_dirty — action mapping per dirty section
 # ----------------------------------------------------------------------
 
 
-def test_empty_project_all_creates():
-    """No Jira match → 1 create_epic + N create_task."""
-    client = MockJiraClient(static_map={"saar": "sriftin"})
-    extraction = _extraction(task_summaries=["A", "B", "C"])
-    matcher_result = MatcherResult(
-        file_results=[
-            _file_result(
-                file_id=extraction.file_id,
-                file_name=extraction.file_name,
-                matched_jira_key=None,
-            )
-        ]
-    )
-
-    plans = reconciler.build_plans_from_match(
-        matcher_result, [(_drive_file(), extraction)], client=client
-    )
-
-    assert len(plans) == 1
-    plan = plans[0]
-    assert plan.role == "single_epic"
-    assert len(plan.groups) == 1
-    grp = plan.groups[0]
-    assert grp.epic_action.kind == "create_epic"
-    assert [a.kind for a in grp.task_actions] == ["create_task"] * 3
-
-
-def test_matched_epic_unchanged_content_is_noop():
-    """Match found, content equal on both sides → noop epic + noop tasks."""
-    client = MockJiraClient(
-        issues={
-            "DEMO-100": _live_issue(
-                key="DEMO-100",
-                summary="Demo epic",
-                description=f"Epic body.\n\n{AGENT_MARKER}",
-            ),
-            "DEMO-101": _live_issue(
-                key="DEMO-101", summary="Task A",
-                description=_pre_converted_task_desc("Body of Task A."),
-            ),
-            "DEMO-102": _live_issue(
-                key="DEMO-102", summary="Task B",
-                description=_pre_converted_task_desc("Body of Task B."),
-            ),
-        },
-        children_by_epic={
-            "DEMO-100": [
-                _live_issue(
-                    key="DEMO-101", summary="Task A",
-                    description=_pre_converted_task_desc("Body of Task A."),
-                ),
-                _live_issue(
-                    key="DEMO-102", summary="Task B",
-                    description=_pre_converted_task_desc("Body of Task B."),
-                ),
-            ]
-        },
-        static_map={"saar": "sriftin"},
-    )
-
-    extraction = _extraction(task_summaries=["Task A", "Task B"])
-    matcher_result = MatcherResult(
-        file_results=[
-            _file_result(
-                file_id=extraction.file_id,
-                file_name=extraction.file_name,
-                matched_jira_key="DEMO-100",
-                task_decisions=[
-                    MatchDecision(item_index=0, candidate_key="DEMO-101",
-                                  confidence=0.95, reason="A → 101"),
-                    MatchDecision(item_index=1, candidate_key="DEMO-102",
-                                  confidence=0.95, reason="B → 102"),
-                ],
-                orphan_keys=[],
-            )
-        ]
-    )
-
-    plans = reconciler.build_plans_from_match(
-        matcher_result, [(_drive_file(), extraction)], client=client
-    )
-
-    grp = plans[0].groups[0]
-    assert grp.epic_action.kind == "noop"
-    assert grp.epic_action.target_key == "DEMO-100"
-    assert [a.kind for a in grp.task_actions] == ["noop", "noop"]
-
-
-def test_partial_match_creates_orphans_and_new():
-    """2 of 3 extracted tasks match existing children; 1 existing child
-    has no extracted counterpart → 2 noop + 1 create_task + 1 orphan."""
-    client = MockJiraClient(
-        issues={
-            "DEMO-100": _live_issue(
-                key="DEMO-100", summary="Demo epic",
-                description=f"Epic body.\n\n{AGENT_MARKER}",
-            ),
-            "DEMO-101": _live_issue(
-                key="DEMO-101", summary="Task A",
-                description=_pre_converted_task_desc("Body of Task A."),
-            ),
-            "DEMO-102": _live_issue(
-                key="DEMO-102", summary="Task B",
-                description=_pre_converted_task_desc("Body of Task B."),
-            ),
-            "DEMO-103": _live_issue(
-                key="DEMO-103", summary="Old task no longer in doc",
-                description=_pre_converted_task_desc("This was once relevant."),
-            ),
-        },
-        children_by_epic={
-            "DEMO-100": [
-                _live_issue(
-                    key="DEMO-101", summary="Task A",
-                    description=_pre_converted_task_desc("Body of Task A."),
-                ),
-                _live_issue(
-                    key="DEMO-102", summary="Task B",
-                    description=_pre_converted_task_desc("Body of Task B."),
-                ),
-                _live_issue(
-                    key="DEMO-103",
-                    summary="Old task no longer in doc",
-                    description=_pre_converted_task_desc("This was once relevant."),
-                ),
-            ]
-        },
-        static_map={"saar": "sriftin"},
-    )
-
-    extraction = _extraction(
-        task_summaries=["Task A", "Task B", "New Task C added in doc"]
-    )
-    matcher_result = MatcherResult(
-        file_results=[
-            _file_result(
-                file_id=extraction.file_id,
-                file_name=extraction.file_name,
-                matched_jira_key="DEMO-100",
-                task_decisions=[
-                    MatchDecision(item_index=0, candidate_key="DEMO-101",
-                                  confidence=0.95, reason="A → 101"),
-                    MatchDecision(item_index=1, candidate_key="DEMO-102",
-                                  confidence=0.95, reason="B → 102"),
-                    MatchDecision(item_index=2, candidate_key=None,
-                                  confidence=0.0, reason="new task"),
-                ],
-                orphan_keys=["DEMO-103"],
-            )
-        ]
-    )
-
-    plans = reconciler.build_plans_from_match(
-        matcher_result, [(_drive_file(), extraction)], client=client
-    )
-
-    grp = plans[0].groups[0]
-    kinds = [a.kind for a in grp.task_actions]
-    assert kinds.count("noop") == 2
-    assert kinds.count("create_task") == 1
-    assert kinds.count("orphan") == 1
-    orphan = next(a for a in grp.task_actions if a.kind == "orphan")
-    assert orphan.target_key == "DEMO-103"
-
-
-def test_matched_epic_is_updated_regardless_of_prior_author():
-    """A matched epic gets updated when the doc changes. The doc is
-    the source of truth. The changelog comment informs the human
-    reviewer; their previous body remains in Jira's edit history."""
-    client = MockJiraClient(
-        issues={
-            "DEMO-100": _live_issue(
-                key="DEMO-100", summary="Demo epic",
-                description="Manually rewritten description, no marker.",
-            ),
-        },
-        children_by_epic={"DEMO-100": []},
-        static_map={"saar": "sriftin"},
-    )
-
-    extraction = _extraction(task_summaries=["A"])
-    matcher_result = MatcherResult(
-        file_results=[
-            _file_result(
-                file_id=extraction.file_id,
-                file_name=extraction.file_name,
-                matched_jira_key="DEMO-100",
-                task_decisions=[
-                    MatchDecision(item_index=0, candidate_key=None,
-                                  confidence=0.0, reason="no children to match"),
-                ],
-                orphan_keys=[],
-            )
-        ]
-    )
-
-    plans = reconciler.build_plans_from_match(
-        matcher_result, [(_drive_file(), extraction)], client=client
-    )
-
-    grp = plans[0].groups[0]
-    assert grp.epic_action.kind == "update_epic"
-    assert grp.epic_action.target_key == "DEMO-100"
-    # No-rename rule: live summary is preserved.
-    assert grp.epic_action.summary == "Demo epic"
-    # Description is the agent's new content (with marker stamped on).
-    assert AGENT_MARKER in (grp.epic_action.description or "")
-
-
-def test_skip_completed_epic_suppresses_task_actions():
-    """Matched epic is in a completed status (e.g. In Staging) → emit
-    `skip_completed_epic` and produce ZERO task actions, regardless of
-    what the matcher said about individual tasks. Doc is presumed stale."""
-    client = MockJiraClient(
-        issues={
-            "DEMO-100": {
-                "id": "1",
-                "key": "DEMO-100",
-                "self": "(mock)",
-                "fields": {
-                    "summary": "Demo epic",
-                    "description": f"Original epic body.\n\n{AGENT_MARKER}",
-                    "issuetype": {"name": "Epic"},
-                    "status": {"name": "In Staging"},  # completed-ish
-                    "assignee": None,
-                    "reporter": {"name": "sriftin", "displayName": "Saar"},
-                    "labels": ["ai-generated"],
-                    "priority": None,
-                    "created": "2026-04-01T00:00:00.000+0000",
-                    "updated": "2026-04-27T00:00:00.000+0000",
-                },
-            },
-        },
-        children_by_epic={"DEMO-100": []},
-        static_map={"saar": "sriftin"},
-    )
-
-    extraction = _extraction(task_summaries=["A", "B", "C"])
-    matcher_result = MatcherResult(
-        file_results=[
-            _file_result(
-                file_id=extraction.file_id,
-                file_name=extraction.file_name,
-                matched_jira_key="DEMO-100",
-                # Even if the matcher had matched something, the status
-                # guard suppresses task actions entirely.
-                task_decisions=[
-                    MatchDecision(item_index=0, candidate_key=None,
-                                  confidence=0.0, reason="-"),
-                    MatchDecision(item_index=1, candidate_key=None,
-                                  confidence=0.0, reason="-"),
-                    MatchDecision(item_index=2, candidate_key=None,
-                                  confidence=0.0, reason="-"),
-                ],
-                orphan_keys=[],
-            )
-        ]
-    )
-
-    plans = reconciler.build_plans_from_match(
-        matcher_result, [(_drive_file(), extraction)], client=client
-    )
-
-    grp = plans[0].groups[0]
-    assert grp.epic_action.kind == "skip_completed_epic"
-    assert grp.epic_action.target_key == "DEMO-100"
-    assert "In Staging" in (grp.epic_action.note or "")
-    # The whole point: no task actions emitted.
-    assert grp.task_actions == []
-
-
-def test_covered_by_rollup_when_multiple_tasks_match_same_candidate():
-    """Two extracted tasks both match CENTPM-1239-style rollup → both
-    become `covered_by_rollup` (not duplicate creates)."""
-    client = MockJiraClient(
-        issues={
-            "DEMO-100": _live_issue(
-                key="DEMO-100", summary="Demo epic",
-                description=f"Epic body.\n\n{AGENT_MARKER}",
-            ),
-            "DEMO-ROLLUP": _live_issue(
-                key="DEMO-ROLLUP", summary="Big rollup",
-                description=_pre_converted_task_desc(
-                    "Implemented scope:\n- step alpha\n- step beta\n- step gamma."
-                ),
-            ),
-        },
-        children_by_epic={
-            "DEMO-100": [
-                _live_issue(
-                    key="DEMO-ROLLUP", summary="Big rollup",
-                    description=_pre_converted_task_desc(
-                        "Implemented scope:\n- step alpha\n- step beta\n- step gamma."
-                    ),
-                ),
-            ]
-        },
-        static_map={"saar": "sriftin"},
-    )
-
-    extraction = _extraction(task_summaries=["step alpha", "step beta", "step gamma"])
-    matcher_result = MatcherResult(
-        file_results=[
-            _file_result(
-                file_id=extraction.file_id,
-                file_name=extraction.file_name,
-                matched_jira_key="DEMO-100",
-                # Matcher cited DEMO-ROLLUP for ALL THREE extracted tasks
-                # — rollup pattern.
-                task_decisions=[
-                    MatchDecision(item_index=0, candidate_key="DEMO-ROLLUP",
-                                  confidence=0.9, reason="bullet alpha"),
-                    MatchDecision(item_index=1, candidate_key="DEMO-ROLLUP",
-                                  confidence=0.88, reason="bullet beta"),
-                    MatchDecision(item_index=2, candidate_key="DEMO-ROLLUP",
-                                  confidence=0.85, reason="bullet gamma"),
-                ],
-                orphan_keys=[],  # DEMO-ROLLUP is matched (just multi-cited)
-            )
-        ]
-    )
-
-    plans = reconciler.build_plans_from_match(
-        matcher_result, [(_drive_file(), extraction)], client=client
-    )
-    grp = plans[0].groups[0]
-
-    assert grp.epic_action.kind in {"noop", "update_epic"}
-    # All three tasks → covered_by_rollup (none should be create_task).
-    assert [a.kind for a in grp.task_actions] == ["covered_by_rollup"] * 3
-    for a in grp.task_actions:
-        assert a.target_key == "DEMO-ROLLUP"
-        assert "covered by the rollup issue DEMO-ROLLUP" in (a.note or "")
-
-
-def test_multi_epic_two_groups():
-    """One multi_epic file → two FileEpicResults → one ReconcilePlan with 2 EpicGroups."""
-    client = MockJiraClient(
-        issues={
-            "DEMO-200": _live_issue(
-                key="DEMO-200", summary="Security Hardening",
-                description=f"Epic body.\n\n{AGENT_MARKER}",
-            ),
-            "DEMO-201": _live_issue(
-                key="DEMO-201", summary="Production Setup",
-                description=f"Epic body.\n\n{AGENT_MARKER}",
-            ),
-        },
-        children_by_epic={"DEMO-200": [], "DEMO-201": []},
-        static_map={"saar": "sriftin"},
-    )
-
-    multi = MultiExtractionResult(
-        file_id="May1.md",
-        file_name="May1.md",
-        epics=[
-            ExtractedEpicWithTasks(
-                summary="Production Security Hardening",
-                description=f"Section A.\n\n{AGENT_MARKER}",
-                assignee_name="Sharon",
-                tasks=[
-                    ExtractedTask(
-                        summary="JWT secret",
-                        description=_task_description("Generate JWT secret."),
-                        source_anchor="SEC-1",
-                        assignee_name="Sharon",
-                    ),
-                ],
-            ),
-            ExtractedEpicWithTasks(
-                summary="Production Environment Setup",
-                description=f"Section B.\n\n{AGENT_MARKER}",
-                assignee_name="Yuval",
-                tasks=[
-                    ExtractedTask(
-                        summary="Provision PostgreSQL",
-                        description=_task_description("Provision DB."),
-                        source_anchor="ENV-1",
-                        assignee_name="Yuval",
-                    ),
-                ],
-            ),
+def test_brand_new_epic_emits_create_epic_and_creates():
+    section = _section(
+        matched_jira_key=None,
+        tasks=[
+            _dirty_task("Task A", "a1", candidate_key=None),
+            _dirty_task("Task B", "a2", candidate_key=None),
         ],
     )
+    plans = build_plans_from_dirty([section], client=_open_status_client())
 
-    matcher_result = MatcherResult(
-        file_results=[
-            _file_result(
-                file_id="May1.md",
-                file_name="May1.md",
-                section_index=0,
-                epic_summary="Production Security Hardening",
-                epic_description=f"Section A.\n\n{AGENT_MARKER}",
-                matched_jira_key="DEMO-200",
-                task_decisions=[
-                    MatchDecision(item_index=0, candidate_key=None,
-                                  confidence=0.0, reason="no children"),
-                ],
-                orphan_keys=[],
-            ),
-            _file_result(
-                file_id="May1.md",
-                file_name="May1.md",
-                section_index=1,
-                epic_summary="Production Environment Setup",
-                epic_description=f"Section B.\n\n{AGENT_MARKER}",
-                matched_jira_key="DEMO-201",
-                task_decisions=[
-                    MatchDecision(item_index=0, candidate_key=None,
-                                  confidence=0.0, reason="no children"),
-                ],
-                orphan_keys=[],
-            ),
-        ]
+    assert len(plans) == 1
+    group = plans[0].groups[0]
+    assert group.epic_action.kind == "create_epic"
+    assert group.epic_action.summary == "Demo epic title"
+    assert {a.kind for a in group.task_actions} == {"create_task"}
+    assert {a.summary for a in group.task_actions} == {"Task A", "Task B"}
+
+
+def test_dirty_matched_epic_emits_update_epic_with_new_summary_and_description():
+    section = _section(
+        matched_jira_key="DEMO-100",
+        epic_summary="New epic title",
+        epic_dirty=True,
+        tasks=[],
+    )
+    plans = build_plans_from_dirty(
+        [section], client=_open_status_client(["DEMO-100"]),
     )
 
-    plans = reconciler.build_plans_from_match(
-        matcher_result, [(_drive_file(name="May1.md", file_id="May1.md"), multi)],
-        client=client,
+    epic_action = plans[0].groups[0].epic_action
+    assert epic_action.kind == "update_epic"
+    assert epic_action.target_key == "DEMO-100"
+    assert epic_action.summary == "New epic title"
+    assert epic_action.description.endswith(AGENT_MARKER)
+
+
+def test_clean_matched_epic_with_dirty_tasks_emits_noop_epic():
+    """When the epic body itself isn't dirty but its tasks are, the epic
+    action is a noop (no Jira write) but its target_key flows down so
+    dirty tasks can attach under it."""
+    section = _section(
+        matched_jira_key="DEMO-100",
+        epic_dirty=False,
+        tasks=[_dirty_task("Edited task", "a", candidate_key="DEMO-201")],
+    )
+    plans = build_plans_from_dirty(
+        [section], client=_open_status_client(["DEMO-100"]),
+    )
+    group = plans[0].groups[0]
+    assert group.epic_action.kind == "noop"
+    assert group.epic_action.target_key == "DEMO-100"
+    assert len(group.task_actions) == 1
+    assert group.task_actions[0].kind == "update_task"
+    assert group.task_actions[0].epic_key == "DEMO-100"
+
+
+def test_completed_status_suppresses_task_actions():
+    section = _section(
+        matched_jira_key="DEMO-100",
+        tasks=[_dirty_task("Task", "a1", candidate_key="DEMO-101")],
+    )
+    plans = build_plans_from_dirty(
+        [section], client=_open_status_client(["DEMO-100"], status="Done"),
+    )
+
+    group = plans[0].groups[0]
+    assert group.epic_action.kind == "skip_completed_epic"
+    assert group.task_actions == []
+
+
+def test_dirty_task_with_match_emits_update_task():
+    section = _section(
+        matched_jira_key="DEMO-100",
+        tasks=[_dirty_task("UI fix", "ui-1", candidate_key="DEMO-201")],
+    )
+    plans = build_plans_from_dirty(
+        [section], client=_open_status_client(["DEMO-100"]),
+    )
+
+    task_actions = plans[0].groups[0].task_actions
+    assert len(task_actions) == 1
+    a = task_actions[0]
+    assert a.kind == "update_task"
+    assert a.target_key == "DEMO-201"
+    assert a.summary == "UI fix"
+
+
+def test_dirty_task_without_match_emits_create_task():
+    section = _section(
+        matched_jira_key="DEMO-100",
+        tasks=[_dirty_task("Brand new", "new-1", candidate_key=None)],
+    )
+    plans = build_plans_from_dirty(
+        [section], client=_open_status_client(["DEMO-100"]),
+    )
+
+    task_actions = plans[0].groups[0].task_actions
+    assert len(task_actions) == 1
+    a = task_actions[0]
+    assert a.kind == "create_task"
+    assert a.summary == "Brand new"
+
+
+def test_rollup_when_two_dirty_tasks_share_one_candidate_key():
+    section = _section(
+        matched_jira_key="DEMO-100",
+        tasks=[
+            _dirty_task("Sub-task A", "a", candidate_key="DEMO-201"),
+            _dirty_task("Sub-task B", "b", candidate_key="DEMO-201"),
+        ],
+    )
+    plans = build_plans_from_dirty(
+        [section], client=_open_status_client(["DEMO-100"]),
+    )
+
+    kinds = [a.kind for a in plans[0].groups[0].task_actions]
+    assert kinds == ["covered_by_rollup", "covered_by_rollup"]
+
+
+def test_orphan_keys_surfaced_for_unconsumed_children():
+    section = _section(
+        matched_jira_key="DEMO-100",
+        tasks=[_dirty_task("Task", "a", candidate_key="DEMO-201")],
+        orphan_keys=["DEMO-202", "DEMO-203", "DEMO-201"],
+    )
+    plans = build_plans_from_dirty(
+        [section], client=_open_status_client(["DEMO-100"]),
+    )
+
+    actions = plans[0].groups[0].task_actions
+    orphans = [a for a in actions if a.kind == "orphan"]
+    assert sorted(a.target_key for a in orphans) == ["DEMO-202", "DEMO-203"]
+
+
+def test_multi_epic_two_sections_one_per_group():
+    sections = [
+        _section(
+            file_id="F1", file_name="F.md", section_index=0,
+            role="multi_epic",
+            matched_jira_key="DEMO-100",
+            epic_summary="Section A epic",
+            tasks=[_dirty_task("A1", "a", candidate_key="DEMO-201")],
+        ),
+        _section(
+            file_id="F1", file_name="F.md", section_index=1,
+            role="multi_epic",
+            matched_jira_key=None,
+            epic_summary="Section B epic",
+            tasks=[_dirty_task("B1", "b", candidate_key=None)],
+        ),
+    ]
+    plans = build_plans_from_dirty(
+        sections, client=_open_status_client(["DEMO-100"]),
     )
 
     assert len(plans) == 1
     plan = plans[0]
     assert plan.role == "multi_epic"
     assert len(plan.groups) == 2
-    assert plan.groups[0].epic_action.target_key == "DEMO-200"
-    assert plan.groups[1].epic_action.target_key == "DEMO-201"
-    # Each section has 1 create_task (no children to match).
-    assert all(
-        g.task_actions and g.task_actions[0].kind == "create_task"
-        for g in plan.groups
+    assert plan.groups[0].epic_action.kind == "update_epic"
+    assert plan.groups[1].epic_action.kind == "create_epic"
+
+
+def test_empty_input_returns_empty_plans():
+    assert build_plans_from_dirty([], client=_open_status_client()) == []
+
+
+# ----------------------------------------------------------------------
+# filter_dirty — produces the right DirtySection list
+# ----------------------------------------------------------------------
+
+
+def _ext(tasks: list[ExtractedTask]) -> ExtractionResult:
+    return ExtractionResult(
+        file_id="F1", file_name="F.md",
+        epic=ExtractedEpic(
+            summary="E",
+            description=f"x\n\n{AGENT_MARKER}",
+            assignee_name="Saar",
+        ),
+        tasks=tasks,
     )
+
+
+def _multi_ext(epics: list[tuple[str, list[ExtractedTask]]]) -> MultiExtractionResult:
+    return MultiExtractionResult(
+        file_id="F1", file_name="F.md",
+        epics=[
+            ExtractedEpicWithTasks(
+                summary=s, description=f"d\n\n{AGENT_MARKER}",
+                assignee_name="Saar", tasks=ts,
+            )
+            for s, ts in epics
+        ],
+    )
+
+
+def _fr(
+    section_index: int = 0,
+    matched_key: str | None = None,
+    decisions: list[MatchDecision] | None = None,
+    orphans: list[str] | None = None,
+) -> FileEpicResult:
+    return FileEpicResult(
+        file_id="F1", file_name="F.md",
+        section_index=section_index,
+        extracted_epic_summary="E",
+        extracted_epic_description=f"d\n\n{AGENT_MARKER}",
+        extracted_epic_assignee_raw="Saar",
+        matched_jira_key=matched_key,
+        epic_match_confidence=0.95 if matched_key else 0.0,
+        epic_match_reason="stub",
+        task_decisions=decisions or [],
+        task_anchors=[],
+        orphan_keys=orphans or [],
+    )
+
+
+def test_filter_cold_path_keeps_everything():
+    ext = _ext([_t("T1", "a1"), _t("T2", "a2")])
+    fr = _fr(matched_key="DEMO-100", decisions=[
+        MatchDecision(0, "DEMO-201", 0.9, "ok"),
+        MatchDecision(1, None, 0.0, "no match"),
+    ])
+    result = filter_dirty(
+        MatcherResult(file_results=[fr]),
+        [(_drive_file(file_id="F1"), ext)],
+        dirty_anchors_per_file=None,
+    )
+    assert len(result) == 1
+    assert len(result[0].tasks) == 2
+
+
+def test_filter_empty_dirty_drops_section():
+    ext = _ext([_t("T", "a")])
+    fr = _fr(matched_key="DEMO-100", decisions=[MatchDecision(0, "X", 0.9, "ok")])
+    result = filter_dirty(
+        MatcherResult(file_results=[fr]),
+        [(_drive_file(file_id="F1"), ext)],
+        dirty_anchors_per_file={"F1": set()},
+    )
+    assert result == []
+
+
+def test_filter_keeps_only_dirty_tasks():
+    ext = _ext([_t("T1", "a1"), _t("T2", "a2"), _t("T3", "a3")])
+    fr = _fr(matched_key="DEMO-100", decisions=[
+        MatchDecision(0, "X1", 0.9, "ok"),
+        MatchDecision(1, "X2", 0.9, "ok"),
+        MatchDecision(2, "X3", 0.9, "ok"),
+    ])
+    result = filter_dirty(
+        MatcherResult(file_results=[fr]),
+        [(_drive_file(file_id="F1"), ext)],
+        dirty_anchors_per_file={"F1": {"a2"}},
+    )
+    assert len(result) == 1
+    section = result[0]
+    assert len(section.tasks) == 1
+    assert section.tasks[0].extracted.source_anchor == "a2"
+
+
+def test_filter_keeps_section_with_dirty_epic_token_even_if_no_dirty_task():
+    ext = _ext([_t("T", "a")])
+    fr = _fr(matched_key="DEMO-100", decisions=[MatchDecision(0, "X", 0.9, "ok")])
+    result = filter_dirty(
+        MatcherResult(file_results=[fr]),
+        [(_drive_file(file_id="F1"), ext)],
+        dirty_anchors_per_file={"F1": {"<epic>:0"}},
+    )
+    assert len(result) == 1
+    assert result[0].tasks == []
+
+
+def test_filter_drops_unmatched_cached_section_with_no_dirty_content():
+    """An existing cached section that didn't pair with a Jira epic in
+    the cold run is not re-created on every warm run unless its content
+    is actually dirty. Brand-new sections appear in dirty via <epic>:N."""
+    ext = _ext([_t("T", "a")])
+    fr = _fr(matched_key=None, decisions=[MatchDecision(0, None, 0.0, "no")])
+    result = filter_dirty(
+        MatcherResult(file_results=[fr]),
+        [(_drive_file(file_id="F1"), ext)],
+        dirty_anchors_per_file={"F1": {"some-other-anchor"}},
+    )
+    assert result == []
+
+
+def test_filter_keeps_section_when_its_task_is_dirty_even_unmatched():
+    ext = _ext([_t("T", "a")])
+    fr = _fr(matched_key=None, decisions=[MatchDecision(0, None, 0.0, "no")])
+    result = filter_dirty(
+        MatcherResult(file_results=[fr]),
+        [(_drive_file(file_id="F1"), ext)],
+        dirty_anchors_per_file={"F1": {"a"}},
+    )
+    assert len(result) == 1
+    assert result[0].matched_jira_key is None
+    assert len(result[0].tasks) == 1
+    assert result[0].epic_dirty is False  # only the task was dirty
+
+
+def test_filter_marks_epic_dirty_when_epic_token_in_dirty():
+    ext = _ext([_t("T", "a")])
+    fr = _fr(matched_key="DEMO-100", decisions=[MatchDecision(0, "X", 0.9, "ok")])
+    result = filter_dirty(
+        MatcherResult(file_results=[fr]),
+        [(_drive_file(file_id="F1"), ext)],
+        dirty_anchors_per_file={"F1": {"<epic>:0"}},
+    )
+    assert result[0].epic_dirty is True
+
+
+def test_filter_drops_clean_sections_in_multi_epic():
+    ext = _multi_ext([
+        ("Section A", [_t("A1", "a1")]),
+        ("Section B", [_t("B1", "b1")]),
+    ])
+    frs = [
+        _fr(section_index=0, matched_key="DEMO-100",
+            decisions=[MatchDecision(0, "X1", 0.9, "ok")]),
+        _fr(section_index=1, matched_key="DEMO-200",
+            decisions=[MatchDecision(0, "X2", 0.9, "ok")]),
+    ]
+    result = filter_dirty(
+        MatcherResult(file_results=frs),
+        [(_drive_file(file_id="F1"), ext)],
+        dirty_anchors_per_file={"F1": {"b1"}},
+    )
+    assert len(result) == 1
+    assert result[0].section_index == 1
+    assert result[0].tasks[0].extracted.source_anchor == "b1"

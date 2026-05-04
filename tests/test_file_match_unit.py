@@ -173,7 +173,11 @@ def test_cache_hit_reuses_cached_results(monkeypatch):
     assert result.file_results[0].matched_jira_key == "CENTPM-100"
 
 
-def test_partial_only_dirty_task_runs_stage2(monkeypatch):
+def test_partial_only_dirty_task_reruns_stage1_and_dirty_stage2(monkeypatch):
+    """Even when only a task is dirty, Stage 1 re-pairs the section's
+    epic against the full project tree (so a cached miss can self-heal).
+    Stage 2 runs only for the dirty task when Stage 1 confirms the
+    cached match."""
     cache = Cache()
     ext = _single([_t("T1", "a1"), _t("T2", "a2")])
     cached_decisions = [
@@ -191,10 +195,15 @@ def test_partial_only_dirty_task_runs_stage2(monkeypatch):
         ]},
     ])
 
-    monkeypatch.setattr(file_match, "match", _bomb)
+    s1_calls = {"items": []}
+    def _fake_match(items, candidates, *, kind):
+        s1_calls["items"].extend(items)
+        assert kind == "epic"
+        return [MatchDecision(0, "CENTPM-100", 0.95, "stage1 confirmed")]
+    monkeypatch.setattr(file_match, "match", _fake_match)
     monkeypatch.setattr(file_match, "run_matcher", _bomb)
-    sent: list = []
 
+    sent: list = []
     def _fake_grouped(groups, *, kind, batch_size, max_workers):
         sent.extend(groups)
         return [
@@ -216,8 +225,9 @@ def test_partial_only_dirty_task_runs_stage2(monkeypatch):
         on_cache_hits_match=lambda: None,
         dirty_anchors_per_file={"F1": {"a1"}},
     )
-    assert len(sent) == 1
-    assert len(sent[0].items) == 1
+
+    assert len(s1_calls["items"]) == 1
+    assert len(sent) == 1 and len(sent[0].items) == 1
     assert sent[0].items[0].summary == "T1"
 
     fr = result.file_results[0]
@@ -225,6 +235,56 @@ def test_partial_only_dirty_task_runs_stage2(monkeypatch):
     assert fr.task_decisions[0].candidate_key == "CENTPM-101"
     assert fr.task_decisions[1].reason == "cached B"
     assert fr.task_decisions[1].candidate_key == "CENTPM-102"
+
+
+def test_partial_self_heals_cached_none_via_stage1(monkeypatch):
+    """A section cached with matched_jira_key=None gets re-paired when
+    a task under it goes dirty — the cached miss self-heals."""
+    cache = Cache()
+    ext = _single([_t("T", "a")])
+    _seed(cache, "F1", ext, [_fr(
+        "F1", 0, None, [MatchDecision(0, None, 0.0, "no match")],
+        anchors=["a"],
+    )])
+
+    project = _project([
+        {"key": "CENTPM-100", "summary": "Real epic", "description": "",
+         "children": [
+             {"key": "CENTPM-101", "summary": "T", "status": "Backlog", "description": ""},
+         ]},
+    ])
+
+    monkeypatch.setattr(
+        file_match, "match",
+        lambda items, candidates, *, kind: [
+            MatchDecision(0, "CENTPM-100", 0.95, "stage1 found it")
+        ],
+    )
+    monkeypatch.setattr(file_match, "run_matcher", _bomb)
+    monkeypatch.setattr(
+        file_match, "match_grouped",
+        lambda groups, **kw: [
+            GroupResult(
+                group_id=g.group_id,
+                decisions=[
+                    MatchDecision(i, "CENTPM-101", 0.99, "found")
+                    for i in range(len(g.items))
+                ],
+            )
+            for g in groups
+        ],
+    )
+
+    result = match_with_cache(
+        [(_df(), ext)], project, cache,
+        content_shas={"F1": "NEW"},
+        use_cache=True, matcher_batch_size=4, matcher_max_workers=3,
+        on_cache_hits_match=lambda: None,
+        dirty_anchors_per_file={"F1": {"a"}},
+    )
+    fr = result.file_results[0]
+    assert fr.matched_jira_key == "CENTPM-100"
+    assert fr.task_decisions[0].candidate_key == "CENTPM-101"
 
 
 def test_partial_dirty_epic_reruns_stage1_and_stage2(monkeypatch):
@@ -455,7 +515,12 @@ def test_partial_persists_so_rerun_is_cache_hit(monkeypatch):
         ]},
     ])
 
-    monkeypatch.setattr(file_match, "match", _bomb)
+    monkeypatch.setattr(
+        file_match, "match",
+        lambda items, candidates, *, kind: [
+            MatchDecision(0, "CENTPM-100", 0.95, "stage1 confirmed")
+        ],
+    )
     monkeypatch.setattr(file_match, "run_matcher", _bomb)
     monkeypatch.setattr(file_match, "match_grouped", lambda groups, **kw: [
         GroupResult(

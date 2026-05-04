@@ -33,6 +33,7 @@ from .pipeline.classifier import ClassifyResult, classify_file
 from .pipeline.commenter import format_update_comment
 from .pipeline.context_bundler import bundle_root_context
 from .pipeline.dedupe import find_duplicate_copies
+from .pipeline.dirty_filter import filter_dirty
 from .pipeline.file_extract import extract_or_reuse
 from .pipeline.file_match import match_with_cache
 from .pipeline.reconciler import (
@@ -40,7 +41,7 @@ from .pipeline.reconciler import (
     EpicGroup,
     ProjectEpicsIndex,
     ReconcilePlan,
-    build_plans_from_match,
+    build_plans_from_dirty,
 )
 from .state import State, load as load_state, save as save_state
 
@@ -313,14 +314,12 @@ def run_once(
         report.finished_at = datetime.now(tz=timezone.utc)
         return report
 
-    # 9. Build ReconcilePlans -----------------------------------------------
+    # 9. Filter to dirty + build ReconcilePlans ---------------------------
     try:
-        plans = build_plans_from_match(
-            matcher_result,
-            extractions,
-            client=jira,
-            dirty_anchors_per_file=dirty_anchors_per_file,
+        dirty_sections = filter_dirty(
+            matcher_result, extractions, dirty_anchors_per_file,
         )
+        plans = build_plans_from_dirty(dirty_sections, client=jira)
     except Exception as e:  # noqa: BLE001
         report.errors.append(f"build_plans failed: {e}")
         report.finished_at = datetime.now(tz=timezone.utc)
@@ -526,8 +525,8 @@ def _comment_for(action: Action, *, drive_file: DriveFile, jira: JiraClient) -> 
         assignee_username=live.get("assignee_username"),
         fallback_username=live.get("reporter_username"),
         drive_file=drive_file,
-        before_summary=action.before_summary,
+        before_summary=live.get("summary"),
         after_summary=action.summary,
-        before_description=action.before_description,
+        before_description=live.get("description"),
         after_description=action.description,
     )

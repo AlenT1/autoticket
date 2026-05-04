@@ -56,6 +56,42 @@ def _min_confidence(kind: str) -> float:
     return _MIN_CONFIDENCE_BY_KIND.get(kind, _DEFAULT_MIN_CONFIDENCE)
 
 
+def epic_candidates_from_tree(project_tree: dict) -> list["MatchInput"]:
+    """`MatchInput`s for every epic in the project tree, with children
+    summaries + statuses inlined for Stage 1 disambiguation."""
+    return [
+        MatchInput(
+            key=e.get("key"),
+            summary=(e.get("summary") or "").strip(),
+            description=(e.get("description") or "")[:_DESCRIPTION_PREVIEW_CHARS],
+            children=[
+                {
+                    "key": c.get("key"),
+                    "summary": (c.get("summary") or "").strip(),
+                    "status": c.get("status"),
+                }
+                for c in (e.get("children") or [])
+                if c.get("key")
+            ],
+        )
+        for e in (project_tree.get("epics") or [])
+        if e.get("key") and e.get("summary")
+    ]
+
+
+def task_candidates_from_children(children: list[dict]) -> list["MatchInput"]:
+    """`MatchInput`s for an epic's children, used as Stage 2 candidates."""
+    return [
+        MatchInput(
+            key=c.get("key"),
+            summary=(c.get("summary") or "").strip(),
+            description=(c.get("description") or "")[:_DESCRIPTION_PREVIEW_CHARS],
+        )
+        for c in children
+        if c.get("key")
+    ]
+
+
 @dataclass
 class MatchDecision:
     item_index: int
@@ -486,30 +522,10 @@ def run_matcher(
     if not file_results:
         return MatcherResult(file_results=[])
 
-    # ---- STAGE 1: epic match (one flat call) ----
     project_epics_raw = project_tree.get("epics") or []
-    epic_candidates = [
-        MatchInput(
-            key=e.get("key"),
-            summary=(e.get("summary") or "").strip(),
-            description=(e.get("description") or "")[:_DESCRIPTION_PREVIEW_CHARS],
-            children=[
-                {
-                    "key": c.get("key"),
-                    "summary": (c.get("summary") or "").strip(),
-                    "status": c.get("status"),
-                }
-                for c in (e.get("children") or [])
-                if c.get("key")
-            ],
-        )
-        for e in project_epics_raw
-        if e.get("key") and e.get("summary")
-    ]
-
     epic_decisions = match(
         items=epic_match_inputs,
-        candidates=epic_candidates,
+        candidates=epic_candidates_from_tree(project_tree),
         kind="epic",
     )
 
@@ -518,8 +534,25 @@ def run_matcher(
         fr.epic_match_confidence = dec.confidence
         fr.epic_match_reason = dec.reason
 
-    # ---- STAGE 2: grouped task match for matched epics only ----
-    children_by_key: dict[str, list[dict]] = {
+    _run_stage2(
+        file_results, extracted_tasks_per_result, project_epics_raw,
+        batch_size=batch_size, max_workers=max_workers,
+    )
+    return MatcherResult(file_results=file_results)
+
+
+def _run_stage2(
+    file_results: list[FileEpicResult],
+    extracted_tasks_per_result: list[list[object]],
+    project_epics_raw: list[dict],
+    *,
+    batch_size: int,
+    max_workers: int,
+) -> None:
+    """Populate `file_results[*].task_decisions` (and orphan_keys) via
+    Stage 2. Sections whose Stage 1 returned no Jira pairing get default
+    no-match decisions so the reconciler can still emit `create_task`."""
+    children_by_key = {
         e.get("key"): (e.get("children") or [])
         for e in project_epics_raw
         if e.get("key")
@@ -528,62 +561,57 @@ def run_matcher(
     matched_groups: list[GroupInput] = []
     matched_indexes: list[int] = []
     for idx, fr in enumerate(file_results):
-        if fr.matched_jira_key is None:
-            continue
         tasks = extracted_tasks_per_result[idx]
+        if fr.matched_jira_key is None:
+            fr.task_decisions = [
+                MatchDecision(
+                    item_index=j, candidate_key=None, confidence=0.0,
+                    reason="no matched epic; will be created with new epic",
+                )
+                for j in range(len(tasks))
+            ]
+            continue
         if not tasks:
             continue
-        children = children_by_key.get(fr.matched_jira_key, [])
-        items = [
-            MatchInput(summary=t.summary, description=t.description) for t in tasks
-        ]
-        candidates = [
-            MatchInput(
-                key=c.get("key"),
-                summary=(c.get("summary") or "").strip(),
-                description=(c.get("description") or "")[:_DESCRIPTION_PREVIEW_CHARS],
-            )
-            for c in children
-            if c.get("key")
-        ]
-        # Unique group_id per (file, section, matched_key) — protects
-        # against ever having two extracted epics map to the same Jira key
-        # (Stage-1 prevents this, but the unique id is a cheap safety net).
         gid = f"{fr.file_id}#{fr.section_index}@{fr.matched_jira_key}"
-        matched_groups.append(
-            GroupInput(group_id=gid, items=items, candidates=candidates)
-        )
+        matched_groups.append(GroupInput(
+            group_id=gid,
+            items=[
+                MatchInput(summary=t.summary, description=t.description)
+                for t in tasks
+            ],
+            candidates=task_candidates_from_children(
+                children_by_key.get(fr.matched_jira_key, [])
+            ),
+        ))
         matched_indexes.append(idx)
 
-    if matched_groups:
-        group_results = match_grouped(
-            matched_groups,
-            kind="task",
-            batch_size=batch_size,
-            max_workers=max_workers,
-        )
-        results_by_id = {gr.group_id: gr for gr in group_results}
-        for idx, gi in zip(matched_indexes, matched_groups):
-            fr = file_results[idx]
-            gr = results_by_id.get(gi.group_id)
-            if gr is None:
-                fr.task_decisions = [
-                    MatchDecision(
-                        item_index=i,
-                        candidate_key=None,
-                        confidence=0.0,
-                        reason="no group result returned",
-                    )
-                    for i in range(len(gi.items))
-                ]
-                continue
-            fr.task_decisions = gr.decisions
-            used_keys = {d.candidate_key for d in gr.decisions if d.candidate_key}
-            fr.orphan_keys = [
-                c.key for c in gi.candidates if c.key and c.key not in used_keys
-            ]
+    if not matched_groups:
+        return
 
-    return MatcherResult(file_results=file_results)
+    results_by_id = {
+        gr.group_id: gr for gr in match_grouped(
+            matched_groups, kind="task",
+            batch_size=batch_size, max_workers=max_workers,
+        )
+    }
+    for idx, gi in zip(matched_indexes, matched_groups):
+        fr = file_results[idx]
+        gr = results_by_id.get(gi.group_id)
+        if gr is None:
+            fr.task_decisions = [
+                MatchDecision(
+                    item_index=i, candidate_key=None, confidence=0.0,
+                    reason="no group result returned",
+                )
+                for i in range(len(gi.items))
+            ]
+            continue
+        fr.task_decisions = gr.decisions
+        used_keys = {d.candidate_key for d in gr.decisions if d.candidate_key}
+        fr.orphan_keys = [
+            c.key for c in gi.candidates if c.key and c.key not in used_keys
+        ]
 
 
 # ----------------------------------------------------------------------

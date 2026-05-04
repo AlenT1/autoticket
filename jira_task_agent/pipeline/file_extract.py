@@ -337,10 +337,10 @@ def _merge_multi(
         )
     new_epics.extend(new_subepic_bodies)
 
-    by_section = {ep.summary: i for i, ep in enumerate(new_epics)}
+    by_section = {_normalize_section(ep.summary): i for i, ep in enumerate(new_epics)}
     for label, fresh in zip(added_labels, added_bodies):
         section = label.get("section")
-        idx = by_section.get(section) if section else None
+        idx = by_section.get(_normalize_section(section)) if section else None
         if idx is None:
             logger.warning(
                 "added task %r section=%r unmapped; routing to first sub-epic",
@@ -409,6 +409,14 @@ def _all_tasks(ext: Extraction) -> list[ExtractedTask]:
 
 def _norm(s: str | None) -> str:
     return (s or "").replace(AGENT_MARKER, "").strip()
+
+
+def _normalize_section(s: str | None) -> str:
+    """Case- and whitespace-insensitive key for matching section names
+    across the diff prompt's `section` field and the targeted prompt's
+    sub-epic `summary`. The two LLM calls don't always echo identical
+    casing/spacing for the same section."""
+    return " ".join((s or "").lower().split())
 
 
 def _task_changed(prev: ExtractedTask, curr: ExtractedTask) -> bool:
