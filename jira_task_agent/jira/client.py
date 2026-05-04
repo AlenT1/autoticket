@@ -1,8 +1,8 @@
 """Jira REST API client.
 
-Auth model mirrors provider-jira.sh / jira-comment.sh:
+Auth modes:
   - JIRA_AUTH_MODE=bearer (default): Authorization: Bearer <PAT>  (Server/DC)
-  - JIRA_AUTH_MODE=basic:           Authorization: Basic b64(email:token)  (Cloud)
+  - JIRA_AUTH_MODE=basic:            Authorization: Basic b64(email:token)  (Cloud)
 
 Token lookup order (first hit wins):
   1. JIRA_TOKEN env var (explicit override)
