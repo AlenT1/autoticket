@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,8 +37,38 @@ import pytest
 from dotenv import load_dotenv
 
 from jira_task_agent.jira.client import JiraClient, get_issue
-from jira_task_agent.pipeline.preserve_state import _extract_checked_keys
 from jira_task_agent.runner import run_once
+
+
+_CHECKED_RE = re.compile(
+    r"^\s*(?:-\s*\[x\]|\*\s*\([/y]\))\s*(?P<text>.*?)\s*$"
+)
+_DOD_HEADING = re.compile(
+    r"^\s*(?:#{1,6}\s*Definition of Done|h[1-6]\.\s*Definition of Done)\s*$",
+    re.IGNORECASE,
+)
+_NEXT_HEADING = re.compile(r"^\s*(?:#{1,6}\s|h[1-6]\.\s)")
+
+
+def _extract_checked_keys(body: str) -> list[str]:
+    """Return a normalized key for each checked DoD bullet in `body`,
+    handling markdown `[x]` and Jira-wiki `(/)` / `(y)` syntaxes."""
+    out: list[str] = []
+    in_dod = False
+    for line in body.splitlines():
+        if _DOD_HEADING.match(line):
+            in_dod = True
+            continue
+        if in_dod and _NEXT_HEADING.match(line):
+            break
+        if not in_dod:
+            continue
+        m = _CHECKED_RE.match(line)
+        if m:
+            words = re.sub(r"[^\w\s]", " ", m.group("text").lower()).split()
+            if words:
+                out.append(" ".join(words[:5]))
+    return out
 
 
 pytestmark = [pytest.mark.live]
@@ -97,7 +128,7 @@ def test_preserve_dod_checkmarks_on_update_task(tmp_path):
     # update_task on CENTPM-1255 without disturbing T2.
     original = LOCAL_FILE_PATH.read_text(encoding="utf-8")
     marker = f" [dod-preserve-test {datetime.now(timezone.utc).isoformat(timespec='seconds')}]"
-    anchor_phrase = "the task safe to close once the verification is complete."
+    anchor_phrase = "verification is complete."
     if anchor_phrase not in original:
         pytest.skip(
             f"expected anchor phrase {anchor_phrase!r} not found in "

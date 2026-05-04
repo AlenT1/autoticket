@@ -191,10 +191,10 @@ def test_sanitizer_keeps_epic_changed_when_intro_changed():
     assert out.epic_changed is True
 
 
-def test_sanitizer_keeps_unknown_anchor_defensive():
+def test_sanitizer_drops_unknown_anchor():
     """If the LLM returns an anchor that isn't in the cached extraction,
-    the sanitizer can't verify the source. Defensive default: keep it,
-    let downstream decide."""
+    drop it — it's hallucination. Empirically, unknown anchors are
+    never the right answer (the LLM should echo the cached anchor)."""
     cached_text = _sanitize_doc()
     current_text = _sanitize_doc(t2_tail=" Owner: Saar.")
     labels = DiffLabels(
@@ -204,7 +204,7 @@ def test_sanitizer_keeps_unknown_anchor_defensive():
     out = _sanitize_labels_against_source(
         labels, _sanitize_cached_extraction(), cached_text, current_text,
     )
-    assert out.modified_anchors == ["totally-hallucinated-anchor"]
+    assert out.modified_anchors == []
 
 
 # ----------------------------------------------------------------------
@@ -406,20 +406,25 @@ def test_diff_path_single_epic_modified_only(tmp_path, monkeypatch):
         _task("Task A", "anchor-A", "body A"),
         _task("Task B", "anchor-B", "body B"),
     ])
-    _seed_warm_cache(cache, cached, "# T\n## A\nA body line.\n## B\nB body line.\n")
+    _seed_warm_cache(
+        cache, cached,
+        "# T\n- anchor-A — A body line.\n- anchor-B — B body line.\n",
+    )
 
     mutated_path = tmp_path / "f.md"
-    mutated_path.write_text("# T\n## A\nA body line edited.\n## B\nB body line.\n")
+    mutated_path.write_text(
+        "# T\n- anchor-A — A body line edited.\n- anchor-B — B body line.\n"
+    )
 
-    # Stub both LLM calls: diff returns the label, targeted returns the body.
-    # Stub the two LLM calls. Bodies are returned in target order
-    # (modified-then-added), so apply_changes positionally matches them.
+    # Stub both LLM calls: diff returns the label, targeted returns the
+    # body. apply_changes matches bodies to cached tasks by source_anchor,
+    # so the targeted-body anchor must echo the modified anchor.
     monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: DiffLabels(
         modified_anchors=["anchor-A"], removed_anchors=[],
         added=[], new_subepics=[], epic_changed=False,
     ))
     monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: TargetedBodies(
-        tasks=[_task("Task A edited", "anchor-ignored", "edited body")],
+        tasks=[_task("Task A edited", "anchor-A", "edited body")],
         task_sections=[None],
         epics=[], epic_sections=[],
     ))
@@ -438,6 +443,93 @@ def test_diff_path_single_epic_modified_only(tmp_path, monkeypatch):
     assert "Task B" in summaries
     assert "Task A" not in summaries
     assert dirty == {"anchor-A"}
+
+
+def test_diff_path_drops_hallucinated_body_for_unsolicited_anchor(
+    tmp_path, monkeypatch,
+):
+    """Bug 1 regression: when extract_targeted returns a body for a
+    cached task that was NOT in modified_anchors, that body must be
+    dropped — not appended as if it were a new add."""
+    cache = Cache()
+    cached = _single([
+        _task("Task A", "anchor-A", "body A"),
+        _task("Task B", "anchor-B", "body B"),
+    ])
+    _seed_warm_cache(
+        cache, cached,
+        "# T\n- anchor-A — A body\n- anchor-B — B body\n",
+    )
+
+    p = tmp_path / "f.md"
+    p.write_text("# T\n- anchor-A — A body edited\n- anchor-B — B body\n")
+
+    # Diff says only A was modified.
+    monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: DiffLabels(
+        modified_anchors=["anchor-A"], removed_anchors=[],
+        added=[], new_subepics=[], epic_changed=False,
+    ))
+    # LLM hallucinates: returns a body for B too even though we didn't ask.
+    monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: TargetedBodies(
+        tasks=[
+            _task("Task A edited", "anchor-A", "edited A body"),
+            _task("Task B (rewritten)", "anchor-B", "rewritten B body"),
+        ],
+        task_sections=[None, None],
+        epics=[], epic_sections=[],
+    ))
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    summaries = [t.summary for t in out.tasks]
+    assert "Task A edited" in summaries
+    assert "Task B" in summaries
+    assert "Task B (rewritten)" not in summaries
+    assert dirty == {"anchor-A"}
+
+
+def test_diff_path_drops_hallucinated_epic_body(tmp_path, monkeypatch):
+    """Bug 1 regression: when extract_targeted returns an epic body
+    but labels.epic_changed=False and no new_subepics requested, drop
+    it — don't let it leak into merged.epic."""
+    cache = Cache()
+    cached = _single([_task("Task A", "anchor-A")])
+    _seed_warm_cache(cache, cached, "# Epic\nA bullet.\n")
+
+    p = tmp_path / "f.md"
+    p.write_text("# Epic\nA bullet edited.\n")
+
+    monkeypatch.setattr(file_extract, "extract_diff", lambda *a, **kw: DiffLabels(
+        modified_anchors=["anchor-A"], removed_anchors=[],
+        added=[], new_subepics=[], epic_changed=False,
+    ))
+    monkeypatch.setattr(file_extract, "extract_targeted", lambda *a, **kw: TargetedBodies(
+        tasks=[_task("Task A edited", "anchor-A", "edited A body")],
+        task_sections=[None],
+        epics=[ExtractedEpicWithTasks(
+            summary="Hallucinated epic rename", description="rewritten",
+            assignee_name=None, tasks=[],
+        )],
+        epic_sections=[None],
+    ))
+
+    hooks = _Hooks()
+    ok, fail, hit = hooks.triple()
+    out, dirty = extract_or_reuse(
+        _df(), classification=_classify(),
+        local_path=p, content_sha="NEW", root_context="",
+        cache=cache, use_cache=True,
+        on_extract_ok=ok, on_extract_failed=fail, on_cache_hit_extract=hit,
+    )
+    # Epic body unchanged — hallucination dropped.
+    assert "<epic>:0" not in dirty
+    assert out.epic.summary == cached.epic.summary
 
 
 def test_diff_path_single_epic_added_appended(tmp_path, monkeypatch):
@@ -674,7 +766,21 @@ def _run_loop(
     Asserts dirty set after warm, then asserts the rerun is a Tier 2
     hit (no LLM calls) returning the post-mutation state."""
     cache = Cache()
-    _seed_warm_cache(cache, cached, "previous file text\n")
+    # Realistic cached file_text: each cached task's anchor appears as
+    # a bullet line so the sanitizer's bullet-location logic can find
+    # them. Otherwise the new "drop unknown modified_anchor" guard
+    # would refuse to mark anchors as dirty.
+    seed_lines = ["# Cached file\n"]
+    if hasattr(cached, "epics"):
+        for e in cached.epics:
+            seed_lines.append(f"## {e.summary}\n")
+            for t in e.tasks:
+                seed_lines.append(f"- {t.source_anchor} — body\n")
+    else:
+        seed_lines.append(f"## {cached.epic.summary}\n")
+        for t in cached.tasks:
+            seed_lines.append(f"- {t.source_anchor} — body\n")
+    _seed_warm_cache(cache, cached, "".join(seed_lines))
 
     mutated_path = tmp_path / "f.md"
     mutated_path.write_text(mutated_text)

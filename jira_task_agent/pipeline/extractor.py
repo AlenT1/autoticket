@@ -26,7 +26,7 @@ _SYSTEM_PROMPT = load_prompt("extract/single")
 _SYSTEM_PROMPT_MULTI = load_prompt("extract/multi")
 _SYSTEM_PROMPT_DIFF = load_prompt("extract/diff")
 _SYSTEM_PROMPT_TARGETED = load_prompt("extract/targeted")
-_SYSTEM_PROMPT_MERGE_WITH_LIVE = load_prompt("extract/merge_with_live")
+_SYSTEM_PROMPT_FINALIZE = load_prompt("extract/finalize_body")
 
 
 @dataclass
@@ -570,16 +570,20 @@ def _parse_targeted_epics(
     return epics, sections
 
 
-def merge_with_live(new_body: str, live_jira_body: str) -> str:
-    """Merge `new_body` (agent's freshly-generated markdown) with
-    `live_jira_body` (current Jira description, possibly with user-
-    marked DoD checkboxes) via a single LLM call. Returns the final
-    markdown body to PUT.
+def finalize_body(new_body: str, live_jira_body: str) -> str:
+    """Single LLM call that decides the final markdown body to PUT.
+
+    The agent passes the freshly-generated body (encoding the source-
+    doc change) and the live Jira body (which may carry user-marked
+    DoD checkboxes). The model owns the merge decision: keep live's
+    structured sections (with marks) when the source change is
+    additive, take the new body's structure when the source change
+    materially supersedes it. Output is always markdown — the wire
+    boundary converts to wiki at write time.
 
     Skips the LLM call entirely when there's nothing to merge:
-      - empty live body  → return new_body verbatim
-      - new body matches live body byte-for-byte after marker strip
-        → return new_body
+      - empty live body                                  → return new_body
+      - new body == live body after marker strip + trim  → return new_body
     """
     if not (live_jira_body or "").strip():
         return new_body
@@ -587,7 +591,7 @@ def merge_with_live(new_body: str, live_jira_body: str) -> str:
         return new_body
 
     user_msg = render_prompt(
-        _SYSTEM_PROMPT_MERGE_WITH_LIVE,
+        _SYSTEM_PROMPT_FINALIZE,
         new_body=new_body,
         live_jira_body=live_jira_body,
     )

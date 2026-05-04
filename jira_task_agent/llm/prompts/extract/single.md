@@ -89,71 +89,94 @@ D. Each child task description
        <one or two paragraph plain-language explanation of what + why,
         drawing on the task line and any relevant root context>
 
-       ### Implementation hints      (OMIT this whole section if the source
-                                      task has no code blocks)
-       <For every fenced code block (```…```) that appears within this
-        task's section in the source document, copy it VERBATIM here in a
-        fenced code block, preserving the language tag.>
-       <For every shell command line shown in the source for this task,
-        include it as a fenced code block here too.>
-       <Add no commentary inside this section — just the code blocks, in
-        the order they appear in the source.>
+       ### Goal
+       <1-3 sentences describing the observable end-state when this
+        task is done. Present-state language ("the Flows page no
+        longer renders the schedule button"). One outcome per
+        sentence. No process verbs ("verified", "reviewed", "tested").>
 
-       ### Acceptance criteria
-       - <observable outcome 1>
-       - <observable outcome 2>
+       ### Implementation steps
+       1. <Imperative action.> File: `path/to/file.py` (or other
+          location — config key, runbook page, etc.). Done when:
+          <one-line in-step verify>.
+          ```<lang>
+          <code block lifted VERBATIM from the source task if the
+          source includes one for this step; otherwise omit the
+          code block>
+          ```
+       2. <Next action.> File: ... Done when: ...
+       3. ...
 
        ### Definition of Done
-       - [ ] <process gate 1>
-       - [ ] <process gate 2>
-       - [ ] <process gate 3>
+       - [ ] All implementation steps completed and verified
+       - [ ] Code merged to <release branch / main / etc.>
+       - [ ] Tests added or updated and passing
+       - [ ] <task-specific shipping gate, e.g. "Manual smoke on
+              staging confirmed", "Runbook updated">
+       - [ ] <optional second task-specific gate>
 
        ### Source
        - Doc: {task_file_name}
        - Last edited by: {last_modifying_user_name}
 
-   - "### Acceptance criteria" — observable outcomes only.
-     Each bullet describes a product/service end-state a reviewer can
-     observe directly: a specific UI state, an API response shape, a
-     metric on a dashboard, a log line, a config value in production.
-     Use present-state language ("X is hidden", "Y returns 404",
-     "Z dashboard shows the metric"). DO NOT use the words "verified",
-     "documented", "reviewed", "checked", "exercised", "validated" —
-     those describe process, not outcome. 1-3 bullets, each
-     independently observable.
+   - "### Goal" — single observable outcome statement. 1-3 sentences.
+     This is the "stop when this is true" criterion an agent or
+     reviewer uses to decide if the task is done. No checkboxes here.
 
-   - "### Definition of Done" — process gates only, never restate AC.
-     Each checkbox is a step the team must complete before closing
-     the ticket: code merged, tests added, peer review, manual QA on
-     staging, runbook / release-notes / comms updated, owner sign-off.
-     DO NOT restate the acceptance criteria in different words. If a
-     DoD bullet would be redundant given the AC, drop it. 3-5 items,
-     mixing universal gates (review / tests) with task-specific gates
-     (e.g. "alerting.yaml committed", "DB migration applied to
-     staging"). The DoD MUST contain at least one task-specific item
-     beyond "code merged" / "tests pass".
+   - "### Implementation steps" — ordered, agent-executable plan.
+     Each numbered step MUST contain:
+       * an imperative action ("Add", "Update", "Remove", "Wire", ...);
+       * a concrete location (file path, config key, dashboard, etc.);
+       * a "Done when:" clause with a verifiable inline result.
+     If the source task has fenced code blocks (```…```) or shell
+     commands, lift them VERBATIM into the relevant step (preserving
+     the language tag). DO NOT paraphrase code into prose. Code is
+     for the agent / engineer to copy-paste; everything else is
+     describing the work.
+     Step count: 1 for trivial tasks, up to 8-10 for complex
+     multi-phase work. Choose the right granularity — a step should
+     be small enough that "Done when" is unambiguous.
+
+   - "### Definition of Done" — shipping gate checklist, not a
+     restatement of the steps. 3-5 items, mostly the universal gates
+     (`code merged`, `tests added`, `reviewed` …) plus 1-2
+     task-specific shipping gates (`alerting.yaml committed`,
+     `runbook page updated`, `release notes mention removal`).
+     The first DoD item should be `[ ] All implementation steps
+     completed and verified` — that's the link between Steps and
+     shipping.
 
    - Contrast example (task: "Hide unsupported schedule button on
      Flows page"):
 
-         ### Acceptance criteria
-         - The Flows page no longer renders the schedule button in
-           the May-1 release branch.
-         - Ad-hoc flow execution still works from the Flows page.
+         ### Goal
+         The Flows page no longer renders the schedule button on the
+         May-1 release branch, and ad-hoc execution still works.
+
+         ### Implementation steps
+         1. Hide the schedule control in the Flows route. File:
+            `src/flows/page.tsx`. Done when: the `<ScheduleButton/>`
+            element is absent from the rendered DOM in production.
+            ```tsx
+            // Wrap the button in the feature flag:
+            {flags.enableScheduling && <ScheduleButton/>}
+            ```
+         2. Confirm ad-hoc execution path is untouched. File:
+            `src/flows/exec.ts`. Done when: an ad-hoc run kicked
+            from the Flows page still completes successfully.
+         3. Update the release notes to mention the temporary
+            removal. File: `RELEASE_NOTES.md`.
 
          ### Definition of Done
+         - [ ] All implementation steps completed and verified
          - [ ] Frontend PR merged to release branch
+         - [ ] Tests cover the hidden-button case
          - [ ] Manual smoke on staging confirmed
-         - [ ] Release notes updated to mention the temporary removal
-         - [ ] Tech-lead sign-off
+         - [ ] Release notes mention the temporary removal
 
-     Note: the AC describes what someone will SEE; the DoD describes
-     what the team must DO. The two lists do not overlap.
-   - When the source task contains code (fenced blocks, shell commands,
-     config snippets), they MUST appear under "### Implementation hints"
-     in the description. DO NOT summarize code into prose — preserve it
-     verbatim. The narrative paragraph above explains *what + why*; the
-     code section gives the engineer the actual starting point.
+     Note: Goal answers "is this done?". Steps are the plan. DoD is
+     the shipping checklist. The three lists do not overlap.
+
    - End the description with the marker line, exactly:
      <!-- managed-by:jira-task-agent v1 -->
 
@@ -169,6 +192,17 @@ F. Order
 G. Coverage
    - Every distinct task line in the document must be represented in the
      output. Do not invent tasks that aren't in the document.
+   - Only TOP-LEVEL bullets directly under the task list (e.g. lines
+     beginning with `- ` at the leftmost indent in the tasks section)
+     become Jira tasks. A top-level bullet's body may itself contain a
+     numbered list (`1.`, `2.`, `3.`) describing the implementation
+     steps for that one task, or nested sub-bullets (indented `- `
+     lines) elaborating context. These nested items are PART OF THE
+     PARENT TASK'S BODY and MUST stay inside that one task — they are
+     never extracted as separate sibling tasks. If you see indented
+     `1.`/`2.` lines inside a `- T3 …` bullet, those are the steps for
+     T3 and belong in T3's `### Implementation steps` section, not as
+     T4/T5/T6/T7.
 
 H. Assignee (epic + each task)
    - Source documents typically have an "Owner" column in their task tables

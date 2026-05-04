@@ -253,10 +253,19 @@ def _sanitize_labels_against_source(
 def _filter_real_modified(
     anchors: list[str], cached_bullets: dict[str, str], current_text: str,
 ) -> list[str]:
+    """Drop anchors whose cached bullet is byte-identical in current
+    text (LLM over-emission), AND drop anchors that don't match any
+    cached bullet at all (LLM hallucinated an anchor name)."""
     real: list[str] = []
     for a in anchors:
         bullet = cached_bullets.get(a)
-        if bullet and bullet in current_text:
+        if bullet is None:
+            logger.info(
+                "diff-extract: dropping unknown modified_anchor %r "
+                "(not in cached extraction)", a,
+            )
+            continue
+        if bullet in current_text:
             logger.info(
                 "diff-extract: dropping spurious modified_anchor %r "
                 "(source bullet unchanged)", a,
@@ -335,10 +344,7 @@ def labels_to_targets(labels: DiffLabels, cached: Extraction) -> dict:
         ct = cached_by_anchor.get(anchor)
         if ct is None:
             continue
-        target: dict = {
-            "summary": ct.summary,
-            "cached_body": ct.description or "",
-        }
+        target: dict = {"summary": ct.summary}
         section = section_for_anchor.get(anchor)
         if section:
             target["section"] = section
@@ -351,10 +357,7 @@ def labels_to_targets(labels: DiffLabels, cached: Extraction) -> dict:
 
     epic_targets: list[dict] = []
     if labels.epic_changed and isinstance(cached, ExtractionResult):
-        epic_targets.append({
-            "summary": cached.epic.summary,
-            "cached_body": cached.epic.description or "",
-        })
+        epic_targets.append({"summary": cached.epic.summary})
     for ne in labels.new_subepics:
         epic_targets.append({"summary": ne["summary"], "section": ne["summary"]})
 
@@ -367,12 +370,17 @@ def apply_changes(
     bodies: TargetedBodies,
     drive_file: DriveFile,
 ) -> Extraction:
-    """Build the merged extraction. Targeted bodies are positional:
-    `bodies.tasks` is modified-then-added (mirroring `labels_to_targets`),
-    `bodies.epics` is epic_changed-then-new_subepics."""
-    n_modified = len(labels.modified_anchors)
-    body_by_anchor = dict(zip(labels.modified_anchors, bodies.tasks[:n_modified]))
-    added_bodies = list(bodies.tasks[n_modified:])
+    """Build the merged extraction.
+
+    Defensive against LLM hallucination in `extract_targeted`: bodies
+    are matched to targets by `source_anchor`, not by position. A body
+    whose anchor is in `cached` but NOT in `labels.modified_anchors`
+    is dropped (the LLM offered an unsolicited rewrite of an unchanged
+    item); a body with a fresh anchor is treated as added.
+    """
+    body_by_anchor, added_bodies = _partition_task_bodies(
+        bodies.tasks, cached, labels,
+    )
     epic_body, new_subepic_bodies = _split_epic_bodies(labels, bodies)
     removed = set(labels.removed_anchors)
 
@@ -405,19 +413,67 @@ def apply_changes(
     )
 
 
+def _partition_task_bodies(
+    task_bodies: list[ExtractedTask],
+    cached: Extraction,
+    labels: DiffLabels,
+) -> tuple[dict[str, ExtractedTask], list[ExtractedTask]]:
+    """Partition `task_bodies` into (modified-by-anchor, added).
+
+    Anchor-keyed match: a body whose anchor is in `cached` but NOT in
+    `labels.modified_anchors` is a hallucination — the LLM rewrote
+    an unchanged item we didn't ask about. Drop it. A body with a
+    fresh anchor (not in cached) is treated as added.
+    """
+    cached_anchors = {
+        t.source_anchor for t in _all_tasks(cached) if t.source_anchor
+    }
+    modified_set = set(labels.modified_anchors)
+    by_anchor: dict[str, ExtractedTask] = {}
+    added: list[ExtractedTask] = []
+    for body in task_bodies:
+        a = body.source_anchor
+        if a and a in cached_anchors:
+            if a in modified_set and a not in by_anchor:
+                by_anchor[a] = body
+            else:
+                logger.info(
+                    "diff-extract: dropping hallucinated body for "
+                    "unsolicited cached anchor %r", a,
+                )
+            continue
+        added.append(body)
+    return by_anchor, added
+
+
 def _split_epic_bodies(
     labels: DiffLabels, bodies: TargetedBodies,
 ) -> tuple[ExtractedEpic | None, list[ExtractedEpicWithTasks]]:
+    """Match epic bodies to what the labels actually requested.
+
+    Defensive against LLM hallucination: if `bodies.epics` has more
+    entries than `labels.epic_changed + len(labels.new_subepics)` told
+    it to produce, the extras are dropped.
+    """
     if not bodies.epics:
         return None, []
+    expected = (1 if labels.epic_changed else 0) + len(labels.new_subepics)
+    if expected == 0:
+        logger.info(
+            "diff-extract: dropping %d hallucinated epic body(ies) "
+            "(neither epic_changed nor new_subepics requested)",
+            len(bodies.epics),
+        )
+        return None, []
+    epics = bodies.epics[:expected]
     if labels.epic_changed:
-        e0 = bodies.epics[0]
+        e0 = epics[0]
         single = ExtractedEpic(
             summary=e0.summary, description=e0.description,
             assignee_name=e0.assignee_name,
         )
-        return single, list(bodies.epics[1:])
-    return None, list(bodies.epics)
+        return single, list(epics[1:])
+    return None, list(epics)
 
 
 def _merge_multi(
