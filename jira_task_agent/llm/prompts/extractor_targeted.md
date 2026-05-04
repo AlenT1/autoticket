@@ -49,19 +49,57 @@ QUALITY RULES (same as the cold extractor):
       <comprehensive context: what + why>
 
       ### Acceptance criteria
-      - <bullet 1>
-      - <bullet 2>
+      - <observable outcome 1>
+      - <observable outcome 2>
 
       ### Definition of Done
-      - [ ] <DoD item 1>
-      - [ ] <DoD item 2>
-      - [ ] <DoD item 3>
+      - [ ] <process gate 1>
+      - [ ] <process gate 2>
+      - [ ] <process gate 3>
 
       ### Source
       - Doc: {task_file_name}
       - Last edited by: {last_modifying_user_name}
 
       <!-- managed-by:jira-task-agent v1 -->
+
+- "### Acceptance criteria" — observable outcomes only. Each bullet
+  describes a product/service end-state a reviewer can observe
+  directly: a specific UI state, an API response shape, a metric on
+  a dashboard, a log line, a config value in production. Use
+  present-state language ("X is hidden", "Y returns 404", "Z
+  dashboard shows the metric"). DO NOT use the words "verified",
+  "documented", "reviewed", "checked", "exercised", "validated" —
+  those describe process, not outcome. 1-3 bullets, each
+  independently observable.
+
+- "### Definition of Done" — process gates only, never restate AC.
+  Each checkbox is a step the team must complete before closing the
+  ticket: code merged, tests added, peer review, manual QA on
+  staging, runbook / release-notes / comms updated, owner sign-off.
+  DO NOT restate the acceptance criteria in different words. If a
+  DoD bullet would be redundant given the AC, drop it. 3-5 items,
+  mixing universal gates (review / tests) with task-specific gates
+  (e.g. "alerting.yaml committed", "DB migration applied to staging").
+  The DoD MUST contain at least one task-specific item beyond "code
+  merged" / "tests pass".
+
+- Contrast example (task: "Hide unsupported schedule button on Flows
+  page"):
+
+      ### Acceptance criteria
+      - The Flows page no longer renders the schedule button in the
+        May-1 release branch.
+      - Ad-hoc flow execution still works from the Flows page.
+
+      ### Definition of Done
+      - [ ] Frontend PR merged to release branch
+      - [ ] Manual smoke on staging confirmed
+      - [ ] Release notes updated to mention the temporary removal
+      - [ ] Tech-lead sign-off
+
+  Note: the AC describes what someone will SEE; the DoD describes
+  what the team must DO. The two lists do not overlap.
 
 - Epic summary: 30-60 chars, hard cap 70, no coordinating connectors
   (`and`, `&`, `+`, `with`, `plus`).
