@@ -6,6 +6,7 @@ Turn a markdown bug list into Jira tickets, enriched with code context by an AI 
 input.md  →  parse  →  state.json  →  enrich (LLM)  →  upload (Jira)
 ```
 
+
 1. **Parse** a markdown file containing bug entries into structured records.
 2. **Enrich** each bug by spawning an LLM tool-use agent that browses the
    referenced source repo, locates the offending code, copies snippets, runs
