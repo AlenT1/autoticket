@@ -57,6 +57,11 @@ if TYPE_CHECKING:
     from ..runner import RunReport
 
 
+WRITEABLE_KINDS = frozenset({
+    "create_epic", "update_epic", "create_task", "update_task",
+})
+
+
 def _jira_url(host: str | None, key: str | None) -> str | None:
     if not host or not key:
         return None
@@ -193,6 +198,16 @@ def build_run_plan_dict(
     ))
     comments = totals.get("update_epic", 0) + totals.get("update_task", 0)
 
+    # Assign 1-based index to each writeable action so the verify gate
+    # can offer partial approval by number. The traversal order matches
+    # the runner's apply order, so the indices line up.
+    idx = 0
+    for f in files_out:
+        for a in f["actions"]:
+            if a.get("kind") in WRITEABLE_KINDS:
+                idx += 1
+                a["index"] = idx
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "mode": mode,
@@ -311,7 +326,8 @@ def _quote_block(text: str) -> str:
 def _render_update(a: dict[str, Any]) -> str:
     kind = a.get("kind")
     head = "UPDATE TASK" if kind == "update_task" else "UPDATE EPIC"
-    out = [f"#### {head} — {_link(a.get('target_key'), a.get('jira_url'))}"]
+    n = f"#{a['index']} " if a.get("index") else ""
+    out = [f"#### {n}{head} — {_link(a.get('target_key'), a.get('jira_url'))}"]
     if a.get("source_anchor"):
         out.append(f"_anchor:_ `{a['source_anchor']}`")
     out.append("")
@@ -355,7 +371,8 @@ def _render_update(a: dict[str, Any]) -> str:
 def _render_create(a: dict[str, Any]) -> str:
     kind = a.get("kind")
     head = "CREATE TASK" if kind == "create_task" else "CREATE EPIC"
-    out = [f"#### {head}"]
+    n = f"#{a['index']} " if a.get("index") else ""
+    out = [f"#### {n}{head}"]
     if a.get("source_anchor"):
         out.append(f"_anchor:_ `{a['source_anchor']}`")
     out.append("")
