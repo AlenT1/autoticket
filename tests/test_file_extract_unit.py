@@ -79,6 +79,36 @@ def test_compute_dirty_multi_epic_subepic_renamed():
     assert compute_dirty(cached, merged) == {"<epic>:0"}
 
 
+def test_compute_dirty_drops_whitespace_only_task_diff():
+    """Defensive guard: if the merged body is byte-equal after
+    whitespace/casing normalization, treat the task as unchanged."""
+    cached = _single([_task("T", "a", "Body line one.\nBody line two.")])
+    merged = _single([_task("T", "a", "Body line one.   Body line two.")])
+    assert compute_dirty(cached, merged) == set()
+
+
+def test_compute_dirty_drops_whitespace_only_epic_diff():
+    cached = ExtractionResult(
+        file_id="F1", file_name="F.md",
+        epic=ExtractedEpic(summary="E", description=f"Body.\n\n{AGENT_MARKER}"),
+        tasks=[_task("T", "a")],
+    )
+    merged = ExtractionResult(
+        file_id="F1", file_name="F.md",
+        epic=ExtractedEpic(summary="E", description=f"BODY.   \n\n  {AGENT_MARKER}"),
+        tasks=[_task("T", "a")],
+    )
+    assert compute_dirty(cached, merged) == set()
+
+
+def test_compute_dirty_keeps_real_task_change():
+    """The defensive guard must not over-fire — real semantic changes
+    must still be flagged."""
+    cached = _single([_task("T", "a", "First version of the body.")])
+    merged = _single([_task("T", "a", "Completely different body content.")])
+    assert compute_dirty(cached, merged) == {"a"}
+
+
 # ----------------------------------------------------------------------
 # _sanitize_labels_against_source — drops LLM over-emission against the
 # deterministic source-doc text. This is the safety net that prevents an
