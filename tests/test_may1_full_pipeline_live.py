@@ -14,15 +14,12 @@ Mutations → expected captured ops:
 
   - MON-NEW added under cached "Monitoring" sub-epic (no candidate):
       POST /issue                                  (create_task)
-      POST /issue/<new key>/remotelink             (back-pointer)
 
   - Section J brand-new sub-epic + DR-1 / DR-2 / DR-3:
       POST /issue                                  (create_epic for J)
-      POST /issue/<new key>/remotelink
       POST /issue × 3                              (create_task DR-1/2/3)
-      POST /issue/<new key>/remotelink × 3
 
-Total: 1 PUT + 9 POST(/issue or /comment or /remotelink) = 11 ops.
+Total: 1 PUT + 5 POST(/issue) + 1 POST(/comment) = 7 ops.
 
 Also asserts the run report's action counts: 1 update_task, 4 create_task,
 1 create_epic, 0 noop.
@@ -175,15 +172,14 @@ def test_may1_full_pipeline_only_processes_dirty_changes(tmp_path):
     )
     assert buckets["comment"][0]["path"] == "/issue/CENTPM-1237/comment"
 
-    assert len(buckets["remotelink"]) == 5, (
-        f"expected 5 remotelinks (1 epic + 4 tasks); got "
-        f"{len(buckets['remotelink'])}"
+    assert buckets["remotelink"] == [], (
+        f"unexpected remotelink ops: {buckets['remotelink']}"
     )
     assert buckets["other"] == [], (
         f"unexpected ops: {buckets['other']}"
     )
 
-    expected_total = 1 + 4 + 1 + 1 + 5
+    expected_total = 1 + 4 + 1 + 1
     assert len(ops) == expected_total, (
         f"expected exactly {expected_total} captured ops; got {len(ops)}"
     )

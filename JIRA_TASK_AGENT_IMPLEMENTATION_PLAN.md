@@ -1,22 +1,24 @@
 # Jira Task Agent — Implementation Plan
 
-See [JIRA_TASK_AGENT_OVERVIEW.md](./JIRA_TASK_AGENT_OVERVIEW.md) for the goal and high-level flow.
+See [JIRA_TASK_AGENT_OVERVIEW.md](./JIRA_TASK_AGENT_OVERVIEW.md) for the goal
+and [PIPELINE_FLOW.md](./PIPELINE_FLOW.md) for the canonical end-to-end flow,
+cache layout, and per-mutation expectations.
 
 ## 1. Goal
 
 Automate the path from "task written in a planning doc" to "ticket in Jira."
-The agent can run **on a schedule** (every X hours, unattended) **or be
-triggered manually** (one-shot from the CLI). Either way it scans a
-**pre-configured** Google Drive folder for documents updated since the last
-run, classifies each file via an LLM, extracts task items from "task files"
-using the surrounding "root/context files" as background, compares them to
-the Jira backlog, then **creates** new issues and **updates** existing ones —
-leaving a tagged audit comment on every change.
+The agent runs **on a schedule** (every X hours, unattended) **or manually**
+(one-shot from the CLI). It scans **two configurable sources** —
+a Google Drive folder and/or a local `data/local_files/` directory — for
+documents touched since the last run, classifies each file via an LLM,
+extracts task items, compares them to the Jira backlog via a two-stage LLM
+matcher, then **creates** new issues and **updates** existing ones — leaving
+a tagged audit comment on every change.
 
-Operators don't pass a folder ID on every run — `FOLDER_ID`, `JIRA_HOST`,
-`JIRA_PROJECT_KEY`, etc. are set once in `.env` (or `config.yaml`) and read
-automatically by both modes. CLI flags are reserved for **per-run overrides**
-(time filter, dry-run, target epic, etc.) — never required.
+Operators don't pass IDs/paths on every run — `FOLDER_ID`, `JIRA_HOST`,
+`JIRA_PROJECT_KEY`, etc. are set once in `.env` and read automatically.
+CLI flags are reserved for **per-run overrides** (time filter, dry-run,
+target epic, source mode).
 
 ## 2. High-Level Flow
 
@@ -37,80 +39,110 @@ itself is identical.
 │             │  run`            ─┼──►  ...          │
 └─────────────┘                   └──────────────────┘
                                          │
-   1. LIST + DOWNLOAD Drive files (one pass, filtered by
-      modifiedTime > last_run_at; saved as files/<id>__<name>)
+   1. LIST + DOWNLOAD files from configured sources
+        - Drive folder (modifiedTime > last_run_at)
+        - data/local_files/ (mtime > last_run_at)
+        - dedupe by content hash
                                          ▼
-   2. CLASSIFY each file via LLM   →  role: task | root | skip
+   2. CLASSIFY each file via LLM   →  role: single_epic | multi_epic | root | skip
                                          ▼
    3. AGGREGATE root files         →  shared context bundle
                                          ▼
-   4. For each TASK file:
-        a. EXTRACT epic + tasks via LLM (uses root bundle as context)
-        b. RECONCILE with Jira (resolve epic via state DB; list its children)
-        c. CREATE new / UPDATE changed / NO-OP unchanged
-        d. POST comment + @mention assignee on every update
+   4. For each task-bearing file (per-file caching):
+        a. EXTRACT (extract_or_reuse)  →  (extraction, dirty_anchors)
+              ▸ Tier 2 hit (content unchanged)   → reuse, dirty = ∅
+              ▸ cached + content changed         → diff path, dirty = exact set
+              ▸ no cache                         → cold full extract, dirty = None
+        b. MATCH (match_with_cache)
+              ▸ Tier 3 hit (full re-use)         → reuse cached decisions
+              ▸ partial (dirty present)          → re-Stage-1 processed sections,
+                                                   re-Stage-2 dirty tasks only,
+                                                   splice cached decisions
+              ▸ fresh                            → run_matcher end-to-end
                                          ▼
-   5. PERSIST cursor (last_run_at, last_run_status) — that's all
+   5. FILTER (dirty_filter.filter_dirty)
+        →  list[DirtySection] — only sections with dirty epic OR dirty tasks
+                                         ▼
+   6. RECONCILE (build_plans_from_dirty) — pure mapping from matcher
+       decisions to write actions: create_epic / update_epic / create_task /
+       update_task / covered_by_rollup / skip_completed_epic. No body
+       comparison, no extra Jira reads.
+                                         ▼
+   7. APPLY (--apply) or CAPTURE (--capture file.json)
+        + post changelog comment on every update
+                                         ▼
+   8. PERSIST cursor (last_run_at, last_run_status) + cache (extraction,
+        file_text, matcher result, project topology sha)
 ```
 
 ## 3. File classification
 
-The Drive folder is a mixed bag. The agent doesn't try to identify file role
-from filename or path — instead, an **LLM classifier skill** reads each file
-and decides:
+The classifier reads each file and produces a role. Same filename can carry
+different roles across the folder (we have multiple files literally named
+`May1_Initial_Version_Tasks.md` — one root, the rest task sources).
 
-| Role     | Meaning                                                                 | Drives writes? |
-|----------|-------------------------------------------------------------------------|----------------|
-| `task`   | A vertical/feature task list. Top of file = highlights/overview, body has the task table/list. | yes — creates an epic + child tasks |
-| `root`   | Background/context (e.g. `NVIS_Central_Vertical_Tasks_Plan.md`, the master `May1_Initial_Version_Tasks.md`). Used only as input context to enrich epics/tasks generated from `task` files. | no |
-| `skip`   | Not relevant (presentations, changelogs, untriaged drafts).             | no |
+| Role          | Meaning                                                                 | Drives writes? |
+|---------------|-------------------------------------------------------------------------|----------------|
+| `single_epic` | A single vertical/feature task list. One epic + its child tasks.        | yes |
+| `multi_epic`  | A "release plan" doc with multiple `## A. …` / `## B. …` sub-epics, each owning its own tasks. | yes (one epic per section) |
+| `root`        | Background/context (e.g. master release plan, vertical-tasks plan). Used as input context to enrich extracted bodies. | no |
+| `skip`        | Not relevant (presentations, changelogs, untriaged drafts).             | no |
 
-The classifier prompt is the agent's "brain" for this stage — it must be
-authoritative enough that we never need a filename-based fallback. **Same
-filename can have different roles** (we already have 5 files literally called
-`May1_Initial_Version_Tasks.md` — one of them is root, the rest are task
-sources).
+## 4. Doc structure
 
-## 4. Doc structure (assumption for `task` files)
-
-Every task file follows this shape:
+**`single_epic` files:**
 
 ```
 <file title>
-<top section — "highlights / overview / context">      ← becomes part of the EPIC description
+<top section — highlights / overview / context>      ← becomes epic description
 ...
-
-<a heading or table that introduces the task list>     ← the boundary
-- Task 1 ...                                           ← becomes a child task
+<heading or table introducing the task list>          ← boundary (LLM-detected)
+- Task 1 ...
 - Task 2 ...
-- ...
 ```
 
-The extractor prompt is told this convention explicitly. The split between
-"highlights" and "tasks" is detected by the LLM, not by a hardcoded regex
-against headings — we trust the prompt to find the boundary.
+**`multi_epic` files (e.g. `May1_Initial_Version_Tasks.md`):**
+
+```
+# Release plan title
+<intro paragraph(s) — root context for every sub-epic>
+
+## A. <Sub-epic A title>
+<sub-epic A overview>
+- A-Task 1
+- A-Task 2
+
+## B. <Sub-epic B title>
+<sub-epic B overview>
+- B-Task 1
+...
+```
+
+Each `## ` (or `### `) heading whose body contains task bullets becomes one
+epic. The extractor returns `{epics: [{summary, description, tasks: [...]}]}`.
 
 ## 5. Epic & task generation rules
 
-### Epic — 1 task file = 1 epic
+### Epic — one task-bearing section = one epic
 
 | Field          | Source                                                                 |
 |----------------|------------------------------------------------------------------------|
-| **Summary**    | **LLM-derived from the file's overview/highlights, not the filename.** No `V<N>_` / `Vx` prefix; no `_Tasks` suffix. The summary should read like a real epic title that a stakeholder would write — e.g. `V2_CentARB_Tasks.md` becomes something like `CentARB Vertical — Production Readiness & Conversation Flow`, not `V2 CentARB Tasks`. The filename is only used as a hint to the prompt; the overview content is the authoritative source. |
-| **Description**| Highlights/overview from the top of the task file **+** distilled relevant slice of the root-context bundle (LLM picks what's relevant). |
+| **Summary**    | LLM-derived from the section's overview/highlights, not the filename. No `V<N>_` / `_Tasks` artifacts. |
+| **Description**| Highlights/overview of that section + a distilled relevant slice of the root-context bundle. |
 | **Issue type** | Epic                                                                   |
 | **Project**    | `JIRA_PROJECT_KEY` from `.env`                                         |
-| **Remote link**| Source Drive file (`webViewLink`). Discoverable back-pointer in the Jira UI; also the agent's only on-Jira marker for "this epic was created from this doc" (see §6). |
+| **Source URL** | Embedded in the description footer + changelog comment as plain text. The agent does not write Jira remote-links. |
 
-### Tasks — each task line in the file becomes a Jira task
+### Tasks — each task line becomes a Jira task
 
 | Field          | Source                                                                 |
 |----------------|------------------------------------------------------------------------|
-| **Summary**    | LLM-generated, *highly informative* — not the raw bullet text. Should read like a Jira ticket title, not a doc TODO. |
-| **Description**| LLM-generated, comprehensive. **Must include a "Definition of Done" section** rich enough that a human reviewer could break the task into subtasks without re-reading the source doc. Uses task line + relevant root context. |
-| **Issue type** | Task (default; configurable)                                           |
-| **Epic Link**  | The epic associated with this `task` file. **May already exist** from a prior run — resolved fresh each run by remote-link lookup (see §6). Only created in this run when no existing epic is found. New tasks discovered in an updated file are added under that **same** epic, never under a new one. |
-| **Remote link**| Source Drive file (`webViewLink`). Same role as on the epic — discoverable back-pointer + the agent's only on-Jira marker. |
+| **Summary**    | LLM-generated, informative — ticket-title quality, not the raw bullet. |
+| **Description**| LLM-generated, comprehensive. Must include `### Definition of Done`.   |
+| **Issue type** | Task (configurable).                                                   |
+| **Epic Link**  | The matched epic (Stage 1) — or, if no match, the just-created epic.   |
+| **Source URL** | Embedded in the description footer + changelog comment as plain text. No remote-link write. |
+| **`source_anchor`** | Stable identifier produced by the extractor. Threads through caching, dirty detection, and matcher splice. |
 
 ### Description template (enforced by extractor prompt)
 
@@ -119,303 +151,284 @@ against headings — we trust the prompt to find the boundary.
 
 ### Acceptance criteria
 - ...
-- ...
 
 ### Definition of Done
 - [ ] Code merged, reviewed
 - [ ] Tests cover the change
-- [ ] <task-specific gates from the extractor>
+- [ ] <task-specific gates>
 
 ### Source
-- Doc: <doc name> (<drive link>)
+- Doc: <doc name> (<link>)
 - Last edited by: <last_modifying_user>
 ```
 
-The "highly informative" requirement is encoded in the extractor prompt + a
-post-validation check (min description length, presence of "Definition of Done"
-heading).
+The DoD requirement is enforced both by the prompt and by a post-validation
+check (`pipeline/extractor.py`).
 
-## 6. Reconcile: create / update / no-op
+## 6. Reconcile path: filter_dirty → build_plans_from_dirty
 
-For each `task` file the agent has freshly extracted `{epic, [tasks...]}` in
-memory. The matching decisions are made by an **LLM matcher** (no fuzzy
-ratios, no string heuristics); the reconciler then turns those decisions
-into write actions, entirely from live Jira state — no local cache, no hashes.
+The reconciler is a pure action mapper — it does not call the LLM, does not
+compare bodies, does not read Jira beyond what's already in the matcher
+result. The "doc is source of truth" rule is enforced **before** it.
 
-**Identification rule:** every Jira issue the agent creates carries a
-**remote link** back to the source Drive file (`webViewLink`). That remote
-link is the agent's only on-Jira marker. It's also useful to humans browsing
-the issue in the UI.
+### Identification rule
 
-### Matcher (two-stage, batched LLM)
+Doc-to-Jira pairing is decided by the LLM matcher (Stage 1 epic + Stage 2
+task) and persisted in the Tier 3 cache. `ai-generated` is a content
+label only, never an identifier. The source-doc URL appears in the
+description footer + changelog comment as plain text for human
+navigation; the agent does not write Jira remote-links.
 
-Lives in `pipeline/matcher.py`. Run once per pipeline invocation against the
-full project tree (`fetch_project_tree`):
+### Step 1 — filter_dirty
 
-- **Stage 1 — epic matching.** One LLM call pairs ALL extracted epics
-  (across all files in this run) against ALL project epics. Output: a
-  `(extracted_epic → jira_key | None, confidence, reason)` decision per
-  extracted epic. Confidence floor `_MIN_CONFIDENCE = 0.70`; below that the
-  decision is treated as "no match."
-- **Stage 2 — task matching.** Grouped per matched epic, batched 4 epics
-  per LLM call, run in parallel up to 3 workers. For each group the LLM is
-  scoped to that epic's children only — items in group A can only match
-  group A's candidates. The same candidate key may be cited by multiple
-  extracted tasks (rollup pattern); reconciler turns that into
-  `covered_by_rollup`.
+`pipeline/dirty_filter.py::filter_dirty(matcher_result, extractions,
+dirty_anchors_per_file) → list[DirtySection]`
 
-Status guard: epics in `_COMPLETED_EPIC_STATUSES` (`In Staging`, `In Review`,
-`Done`, `Closed`, `Resolved`, `Cancelled`, `Won't Do`, `Won't Fix`) emit
-`skip_completed_epic` and are not touched. `Backlog` and `In Progress` are
-active.
+A section is kept if **any** of:
+- the `<epic>:N` token is in the file's `dirty_anchors`,
+- it has at least one task whose `source_anchor` is in `dirty_anchors`,
+- it is brand-new this run (index ≥ len(cached file_results)),
+- the file's `dirty_anchors` is `None` (cold path: process everything).
 
-### Reconciler (pure-logic action emitter)
+`DirtySection` carries `epic_dirty: bool` so the reconciler can decide
+whether to issue an epic write (versus pass-through for child tasks only).
 
-Given the matcher's decisions, `build_plans_from_match` produces one
-`EpicGroup` per extracted epic with the following `Action.kind` values:
+### Step 2 — build_plans_from_dirty
 
-- `create_epic` — extracted epic has no match (or below confidence floor).
-- `update_epic` — match found, descriptions differ after normalization
-  (extracted markdown is run through `_md_to_jira_wiki` first so we compare
-  apples-to-apples).
-- `noop` — match found, descriptions equivalent.
-- `skip_completed_epic` — matched epic is in a terminal status; no writes.
-- `create_task` — extracted task with no candidate from Stage 2.
-- `update_task` — candidate found, content differs.
-- `covered_by_rollup` — multiple extracted tasks cite the same candidate
-  (rollup-style child); no per-task write, just reported.
-- `orphan` — existing child has no extracted-task counterpart this run.
-  Report-only; never deleted, never commented on.
+`pipeline/reconciler.py::build_plans_from_dirty(sections, *, client) →
+list[ReconcilePlan]`
 
-### Per-run Jira fetch (bounded, complete)
+Per `DirtySection`:
 
-Tasks are reached only via their epic. `fetch_project_tree` issues one
-paginated `/search` returning all epics + their direct children grouped
-locally. Per run we therefore fetch:
+- **Epic action**
+  - `matched_jira_key is None`            → `create_epic`
+  - matched, status in completed set      → `skip_completed_epic`
+  - matched, `epic_dirty=False`           → `noop` (preserves target_key for tasks)
+  - matched, `epic_dirty=True`            → `update_epic` (writes new summary AND description)
+- **Task actions** (only the dirty ones reach this point)
+  - `candidate_key is None`               → `create_task`
+  - same key cited by ≥2 dirty tasks      → first → `update_task`, rest → `covered_by_rollup`
+  - else                                  → `update_task`
 
-1. All project epics + their direct children — one paginated query.
-2. `remote_links(epic_key)` — lazy, cached per run, only if needed.
+Status guard: `_COMPLETED_EPIC_STATUSES = {In Staging, In Review, Done,
+Closed, Resolved, Cancelled, Won't Do, Won't Fix}`. Active: `Backlog`,
+`In Progress`.
 
-This is bounded (proportional to project size, one round-trip) and complete
-(every candidate, including `Done` / `Cancelled` children, is inspected for
-matching — no pre-filtering by status).
+### Per-run Jira fetch
+
+`fetch_project_tree` issues one paginated `/search` returning all epics +
+their direct children grouped locally. The reconciler does **not** issue
+additional Jira reads (orphan reporting comes from the matcher's leftover
+candidates).
 
 ### Agent-touch marker
 
-Every agent-written description ends with a hidden marker:
+Every agent-written description ends with:
 
 ```
 <!-- managed-by:jira-task-agent v1 -->
 ```
 
-It indicates "the agent last touched this body" — useful for humans
-browsing Jira and for future tooling that wants to filter to
-agent-managed issues. The doc is the source of truth: when a doc edit
-maps to an existing Jira issue, the agent updates the issue regardless
-of who previously authored its description, and posts a changelog
-comment naming the source doc + last editor so the human reviewer
-sees what changed and why.
+Indicator only — never used as a write gate. The doc is the source of
+truth: a doc edit that maps to an existing issue triggers `update_*`
+regardless of who last authored the body.
 
 ## 7. Update flow + Jira comment with @mention
 
-Every successful **update** (epic OR task) posts a comment on the issue:
-
-```
-[~currentAssigneeUsername]
-
-This issue was updated by the doc-sync agent.
-
-Changed:
-- Summary: "old text" → "new text"      (only if changed)
-- Description updated. (See diff below.)
-
-Source change:
-- Doc: <doc name> (<drive link>)
-- Edited by: <last_modifying_user_name> at <doc.modified_time>
-
-Diff:
-<unified diff or LLM-summarized "what changed and why">
-```
-
-**Tag rule:** `[~<username>]` of the **current Jira assignee** (per your
-decision). For unassigned issues, fall back to the reporter; if reporter is
-also empty, omit the mention and prepend a warning to the comment body.
-
-Note: Jira Server `@mentions` use `name` (the login), not `displayName`. The
-client must fetch and persist `assignee.name` along with the existing
-`displayName` / `emailAddress`.
+Every create/update posts a comment on the issue (LLM-summarized
+changelog), with `[~currentAssigneeUsername]` mention. Unassigned →
+fall back to reporter; both empty → omit mention with a warning prepended.
 
 ## 8. Architecture — components
 
-| Component             | Responsibility                                                          |
-|-----------------------|--------------------------------------------------------------------------|
-| `drive_client`        | List folder + filter + download. Already built.                          |
-| `jira_client`         | Read epic + children. Already built. Add: create issue, update issue, post comment, fetch assignee.name. |
-| `classifier`          | LLM call: file → role (`task` / `root` / `skip`). Cheap model.           |
-| `context_bundler`     | Concatenate `root` files into a length-bounded context blob.             |
-| `extractor`           | LLM call (per `task` file): produces `{epic: {...}, tasks: [{...}]}` JSON conforming to the schema in §5. Receives the task file + the bundled root context. |
-| `matcher`             | Two-stage LLM matcher (Stage 1: all-epics → project epics; Stage 2: grouped per-epic task matching, batched 4 per call, parallel 3 workers). One run per pipeline invocation. |
-| `reconciler`          | Pure-logic Action emitter: takes matcher decisions + live Jira issues, applies marker/status guards, emits `create_*` / `update_*` / `noop` / `skip_*` / `covered_by_rollup` / `orphan`. No LLM calls. |
-| `commenter`           | Composes the changelog comment + resolves `[~username]`.                |
-| `state`               | Single tiny `state.json` holding `last_run_at` + `last_run_status`. Nothing else persists. |
-| `runner`              | Orchestrates 1–6 of §2. Handles errors, retries, dry-run, report-only.   |
-| `config`              | `.env` + `config.yaml` for prompt paths, model IDs, mention fallback policy. |
+| Component                       | Responsibility                                                          |
+|---------------------------------|--------------------------------------------------------------------------|
+| `drive/client`                  | Drive list/download AND `list_local_folder(data/local_files)`. Local files get id `local::<filename>` and `file://` URIs. |
+| `jira/client`                   | Jira reads + writes; markdown→wiki at the boundary; `_enable_capture` for dry-runs.|
+| `jira/project_tree`             | One paginated `/search` returning all project epics + their direct children. |
+| `pipeline/classifier`           | LLM call: file → `single_epic` / `multi_epic` / `root` / `skip`.        |
+| `pipeline/context_bundler`      | Length-bounded concat of root files.                                   |
+| `pipeline/extractor`            | Cold extract (single + multi) and the two diff prompts: `extract_diff` (labels) + `extract_targeted` (full bodies). |
+| `pipeline/file_extract`         | `extract_or_reuse` — Tier 2 hit / diff path / cold; returns `(extraction, dirty_anchors)`. Owns `apply_changes` + `compute_dirty`. |
+| `pipeline/matcher`              | Two-stage LLM matcher (Stage 1: epics; Stage 2: grouped tasks, batched). Public helpers: `epic_candidates_from_tree`, `task_candidates_from_children`. |
+| `pipeline/file_match`           | `match_with_cache` — Tier 3 hit / partial (dirty-only) / fresh. Always re-runs Stage 1 for processed sections (self-heals stochastic Stage-1 misses). |
+| `pipeline/dirty_filter`         | `filter_dirty` → `list[DirtySection]`. Drops every section without dirty content. |
+| `pipeline/reconciler`           | `build_plans_from_dirty` → action plans. Pure logic, no Jira reads, no body comparison. |
+| `pipeline/commenter`            | Composes the changelog comment + resolves `[~username]`.                |
+| `pipeline/dedupe`               | Content-hash de-twinning (Drive-export vs local copy collisions).       |
+| `state`                         | `state.json` cursor.                                                    |
+| `cache`                         | `cache.json` — Tier 1/2/3 caches + `diff_payload.file_text`.            |
+| `runner`                        | Orchestrates the flow. Three source modes (`gdrive` / `local` / `both`). |
+| `__main__`                      | CLI: `--apply`, `--since`, `--only`, `--target-epic`, `--capture`, `--no-cache`, `--source`, `--local-dir`. |
 
-## 9. Persistence — minimal cursor only
+## 9. Persistence
 
-The only thing the agent persists across runs is the "since when" cursor.
-That's it. Everything else (file role, extracted content, which epic belongs
-to which doc, whether anything changed) is derived fresh each run from
-Drive + Jira.
-
-`state.json` (lives next to `.env`):
+### `state.json`
 
 ```json
-{
-  "last_run_at": "2026-04-27T13:42:11+03:00",
-  "last_run_status": "ok"
-}
+{ "last_run_at": "2026-04-27T13:42:11+03:00", "last_run_status": "ok" }
 ```
 
-That is the entire on-disk schema. The cursor lets the next run filter Drive
-via `modifiedTime > last_run_at` — the only optimization we keep, and it
-matters because Drive listing scales with folder size, not with file size.
-Losing `state.json` costs at most one full "process everything" run; there
-is nothing to recover.
+Single cursor. Losing it costs at most one full run.
 
-Runtime-only objects (`DriveFile`, `ExtractedEpic`, `ExtractedTask`) live in
-memory for the duration of one run. They're not persisted — they're shaped
-by the dataclasses in the code, not by the plan.
+### `cache.json` (version 2)
 
-## 10. LLM contracts (overview)
+Per file id:
+- **Tier 1 — classify cache**, key `(file_id, modified_time)`.
+- **Tier 2 — extract cache**, key `(file_id, content_sha)`. Stores
+  `extraction_payload` JSON.
+- **Tier 3 — matcher cache**, key `(file_id, content_sha,
+  project_topology_sha, matcher_prompt_sha)`. Stores `matcher_payload`
+  (one `FileEpicResult` per section, including `task_anchors`).
+- **`diff_payload`** — `{"file_text": "..."}` — the cached file content,
+  used by the diff path's `unified_diff` invocation.
 
-**Provider: NVIDIA Inference.** All LLM calls go through NVIDIA's NIM /
-build.nvidia.com inference endpoints (or an internal NVIDIA inference URL —
-configurable). The endpoints are **OpenAI-compatible**, so the client can be
-the standard `openai` Python SDK pointed at `NVIDIA_BASE_URL`. This avoids a
-proprietary SDK and keeps prompts/JSON-mode portable.
+Atomic writes via tempfile+rename. `compute_matcher_prompt_sha` invalidates
+matcher cache on any prompt or model-id change. `compute_project_topology_sha`
+invalidates on any structural change in CENTPM (epic add/remove/rename,
+child summary or status change, description rewrites).
 
-### Configuration (in `.env`)
+## 10. LLM contracts
+
+**Provider:** NVIDIA Inference (OpenAI-compatible). Client wrapper
+`llm/client.py` exposes `chat_json(model, system, user, schema)` and uses
+JSON mode + Pydantic validation + retry-on-invalid-JSON.
+
+### Configuration
 
 ```
-NVIDIA_API_KEY=...                                    # required
-NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1   # default; override for internal endpoints
-LLM_MODEL_CLASSIFY=meta/llama-3.3-70b-instruct        # small/fast for classification
-LLM_MODEL_EXTRACT=nvidia/llama-3.1-nemotron-70b-instruct   # high-quality for extraction
-LLM_MODEL_SUMMARIZE=meta/llama-3.3-70b-instruct       # changelog comments
+NVIDIA_API_KEY=...
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+LLM_MODEL_CLASSIFY=meta/llama-3.3-70b-instruct
+LLM_MODEL_EXTRACT=nvidia/llama-3.1-nemotron-70b-instruct
+LLM_MODEL_SUMMARIZE=meta/llama-3.3-70b-instruct
 ```
 
-(Model IDs are placeholders — choose what's available on the NVIDIA endpoint
-this project is licensed against. The pattern is "small + fast for classify
-& summarize, larger + better-instruction-following for extract.")
+### Prompts (in `jira_task_agent/llm/prompts/`)
 
-### Client wrapper
+| File                       | Purpose                                                                   |
+|----------------------------|----------------------------------------------------------------------------|
+| `classifier.txt`           | File → `{role, confidence, reason}`.                                       |
+| `extractor_single.txt`     | Cold full extract for `single_epic` files.                                 |
+| `extractor_multi.txt`      | Cold full extract for `multi_epic` files.                                  |
+| `extractor_diff.txt`       | Diff path — **labels only**: `{modified_anchors, removed_anchors, added, new_subepics, epic_changed}`. No bodies, no DoD. Inputs: cached extraction + unified diff. |
+| `extractor_targeted.txt`   | Diff path — full Jira-quality bodies for the items the labels named. Output: `{tasks, epics}` with full descriptions. |
+| `matcher.txt`              | Stage 1 (epic) and Stage 2 (task) matching. Stage 2 leans toward PAIRING — false-pair is bounded; missed-pair = duplicate Jira issue. Description preview is 3000 chars to spot rollup epic descriptions. |
+| `matcher_grouped.txt`      | Stage 2 grouping prompt (4 epics per call, parallel 3 workers).            |
+| `summarizer.txt`           | Comment changelog — 2-5 plain-text bullets.                                |
 
-A thin `llm_client.py` exposes `chat_json(model, system, user, schema)` and
-hides the OpenAI-compatible plumbing. Every call uses **JSON mode** (or
-prompt-enforced JSON for models without native JSON mode) and validates
-against a Pydantic schema; on validation failure, retry up to 2x with a
-"your previous output was invalid JSON, return only valid JSON conforming
-to the schema" follow-up.
+### Diff-aware extract pipeline (the doc-as-truth rule)
 
-### Classifier
-- **Inputs:** file name, first ~3 KB of file content, the names of all other
-  files in the folder (relative context).
-- **Output (JSON):** `{role: "task"|"root"|"skip", confidence: 0–1, reason: string}`.
-- **Model:** `LLM_MODEL_CLASSIFY` (small/fast).
+When a file is cached and content changed:
 
-### Extractor
-- **Inputs:** full task-file content + bundled root context (length-budgeted
-  to fit the model's context window).
-- **Output (JSON):**
-  ```json
-  {
-    "epic": {"summary": "...", "description": "..."},
-    "tasks": [
-      {"summary": "...", "description": "...", "source_anchor": "..."},
-      ...
-    ]
-  }
-  ```
-- **Constraints (validated post-call):** every task description contains a
-  `### Definition of Done` heading; every `summary` is between 8 and 120 chars.
-- **Model:** `LLM_MODEL_EXTRACT` (higher-quality).
+1. `unified_diff(cached_file_text, current_text)` — pure Python,
+   deterministic.
+2. **`extract_diff` LLM call** — labels only. Returns the structural
+   verdict: which anchors moved, which were removed, which were added,
+   which sub-epics are brand-new, whether the epic body changed.
+3. **`extract_targeted` LLM call** — given those targets, produces full
+   Jira-quality bodies for ONLY the changed items.
+4. `apply_changes(cached, labels, bodies, drive_file)` — pure Python merge.
+   Cached items kept verbatim except for the named slices. Section keys
+   are matched case+whitespace-insensitively (`_normalize_section`) so
+   the two LLM calls don't have to agree on title casing.
+5. `compute_dirty(cached, merged) → set[str]` — pure Python; returns task
+   `source_anchor` strings + `"<epic>:N"` tokens for changed epics.
 
-### Changelog summarizer (used inside `commenter`)
-- **Inputs:** before/after summary + description (epic or task).
-- **Output:** 2-5 bullet points, plain text, suitable for a Jira comment.
-- **Model:** `LLM_MODEL_SUMMARIZE` (small/fast).
+### Matcher partial path (Tier 3 partial reuse)
+
+Triggered when `dirty_anchors` is non-empty and there's a cached matcher
+result for the file. For each section:
+
+- Brand-new section, or any task in dirty, or epic token in dirty
+  → re-run **Stage 1** for that section's epic (always, even if cached
+  matched it before; this self-heals stochastic Stage-1 misses).
+- For matched epics with `epic_dirty=False` and only some tasks dirty
+  → run Stage 2 on dirty tasks only; splice fresh decisions into the
+  cached `MatchDecision` list using `task_anchors` as keys.
+- Matched epic + any structural change → run Stage 2 on the full task list.
+- Untouched sections → cached `FileEpicResult` returned byte-for-byte.
 
 ## 11. Implementation phases — current progress
 
 Legend: ✅ done · 🟡 partial · ⏳ not started
 
 ### Phase 0 — scaffolding ✅
-- Repo + venv + `.env`. ✅
-- `drive/client`: list + filter + download. ✅
-- `jira/client`: list epics, get issue, list epic children, write primitives (create / update / comment / remote-link / transition). ✅
-- Markdown → Jira-wiki conversion at the wrapper boundary. ✅
+Repo + venv + `.env`; Drive + Jira clients; markdown→wiki at the boundary.
 
 ### Phase 1 — classifier ✅
-- LLM client (`llm/client.py`) over NVIDIA Inference (OpenAI-compatible). ✅
-- `pipeline/classifier.py` — three-role classifier (`single_epic / multi_epic / root`). ✅
-- `scripts/classify_files.py`. ✅
-- Confirmed correct labels on all 20 files in the live folder, ≥0.95 confidence. ✅
+Four-role classifier (`single_epic` / `multi_epic` / `root` / `skip`),
+≥0.95 confidence on the live folder.
 
 ### Phase 2 — extractor ✅
-- `pipeline/context_bundler.py` — concatenates root files into a length-budgeted blob. ✅
-- `pipeline/extractor.py` — single-epic + multi-epic extractors. ✅
-- DoD post-validator + composite-owner `Co-owners:` injection. ✅
-- `scripts/extract_one.py` for ad-hoc extraction. ✅
+- Single + multi cold extractors with DoD validator + composite-owner injection.
+- Two-prompt diff path: `extractor_diff` (labels) + `extractor_targeted` (bodies).
+- `apply_changes` + `compute_dirty` in `pipeline/file_extract`.
 
 ### Phase 3 — Jira write primitives ✅
-- `JiraClient.create_issue` (auto Epic Name, auto `ai-generated` label, auto Epic Link). ✅
-- `update_issue`, `post_comment`, `add_remote_link`, `transition_issue`. ✅
-- **Smoke-tested live** on CENTPM-1253 (epic) and CENTPM-1255 (task), with `[~assignee]` mention. ✅
-- Delete: 403 by design — orphans are flagged, never deleted. ✅
+`create_issue` (auto Epic Name + `ai-generated` label + Epic Link),
+`update_issue`, `post_comment`, `transition_issue`.
+Smoke-tested on CENTPM-1253.
 
 ### Phase 4 — commenter + change-tracking ✅
-- `pipeline/commenter.py` — `format_update_comment` with `[~name]` mention + LLM-summarised changelog bullets. ✅
-- HTML-comment marker (`<!-- managed-by:jira-task-agent v1 -->`) on every agent-written description as a "last-touched-by-agent" indicator. ✅
-- Unassigned / no-reporter fallback. ✅
+`format_update_comment` with `[~name]` mention + LLM-summarized bullets.
+HTML marker on every agent-written description.
 
-### Phase 5 — comparator (matcher + reconciler) ✅
-- `pipeline/matcher.py` — **two-stage LLM matcher**:
-  - Stage 1: one batched LLM call pairing ALL extracted epics across all files vs ALL project epics. ✅
-  - Stage 2: grouped per-epic task matching, batched 4 epics per LLM call, parallel up to 3 workers. ✅
-  - `run_matcher(extractions, project_tree)` orchestrates both stages and returns one `FileEpicResult` per extracted epic. ✅
-- `jira/project_tree.fetch_project_tree()` — one paginated `/search` call returns all epics + their direct children. ✅
-- `pipeline/reconciler.py` — pure-logic `build_plans_from_match(matcher_result, extractions, ...)`: marker check + content compare + Action emission. **No LLM calls in the reconciler.** ✅
+### Phase 5 — comparator ✅
+- Two-stage LLM matcher with Tier 3 caching.
+- `dirty_filter` produces `list[DirtySection]`.
+- `build_plans_from_dirty` — pure mapping from matcher decisions to actions.
+  No body comparison, no `list_epic_children`, no Jira reads.
 
 ### Phase 6 — orchestrator + cursor + capture ✅
-- `pipeline/dedupe.py` — content-hash-based de-twinning of Google-Doc / markdown duplicates. ✅
-- `runner.run_once()` end-to-end pipeline: list → download → dedupe → classify → bundle → extract (cursor-gated) → fetch project tree → run matcher (one batched call) → build plans → apply / capture / report. ✅
-- `state.json` cursor (last_run_at + last_run_status). ✅
-- CLI: `python -m jira_task_agent run [--apply] [--since] [--only NAME] [--target-epic KEY] [--capture PATH]`. ✅
-- Per-run `run_plan.json` report. ✅
+- `run_once` end-to-end with `--source {gdrive,local,both}` (default `both`),
+  `--local-dir`, `--apply`, `--since`, `--only`, `--target-epic`,
+  `--capture`, `--no-cache`.
+- `data/local_files/` source: `list_local_folder` scans `*.md`/`*.html`/`*.txt`,
+  ids `local::<filename>`, `file://` URIs.
+- `state.json` cursor + per-run `run_plan.json`.
 
-### Phase 7 — testing 🟡
-- 50 unit + logical tests (helpers, dedupe, md→wiki, matcher unit, grouped matcher unit, reconciler scenarios). ✅
-- 8 live integration tests (classifier, extractor, matcher with hardcoded data + with real local artifacts). ✅
-- Run with `pytest` (offline) or `pytest -m live` (~30s, ~$0.01). ✅
-- ⏳ One end-to-end **live capture run** on a small file (e.g., V11_Dashboard_Tasks.md) — full pipeline, real Drive + Jira reads, real LLMs, `--capture`, **zero Jira writes**. Verifies the captured payloads are what `--apply` would send.
+### Phase 7 — testing ✅
+- 90+ unit + logical tests (helpers, dedupe, md→wiki, matcher unit/grouped,
+  reconciler scenarios, file_extract apply_changes/compute_dirty,
+  file_match three branches, dirty_filter, local source).
+- 8 live integration tests (classifier, extractor, matcher with hardcoded
+  + real-snapshot data).
+- **End-to-end live capture tests** (`pytest -m live`):
+  - `test_may1_extract_diff_live.py` — parametric over May1/V11/NemoClaw/V0_Lior;
+    asserts `dirty_anchors` exactness on each scenario.
+  - `test_may1_match_dirty_live.py` — Stage 1/Stage 2 invocation count;
+    cached decisions preserved byte-for-byte for clean tasks.
+  - `test_may1_full_pipeline_live.py` — May1's 3 mutations → exactly 7
+    captured Jira ops (1 update + 4 create_task + 1 create_epic + 1 comment).
+    Strict enforcement.
+  - `test_mixed_warm_and_new_live.py` — May1 warm + V11 cold in one pipeline
+    run; asserts the warm file produces only its 5 mutation-driven writes
+    while the cold file gets full create-everything treatment.
+  - `test_warm_scenarios_live.py` — broader warm-run scenarios per file.
 
-### Phase 8 — efficiency caching tiers 🟡
-**Goal:** warm runs (no doc changes) cost ~$0.
-
-1. ✅ **Tier 1 — classification cache.** `cache.json` next to `state.json`. Skip the LLM classify call when `(file_id, modified_time)` matches a prior run.
-2. ✅ **Tier 2 — extraction cache.** Skip the (large) LLM extract call when `(file_id, content_sha)` matches a prior run. The cached extraction is round-tripped through JSON; `mtime` change drops stale payloads.
-3. ✅ `--no-cache` CLI flag for forced re-run; cache version mismatch / corrupt JSON → cold start.
-4. ⏳ **Tier 3 — matcher skip path.** When `epic_key` is already cached for a file, skip Stage 1 of the matcher and go straight to live content compare. Remote-link match remains the fallback.
-5. ⏳ **Per-section remote links** for multi_epic adoption (URL fragment `webViewLink#section-A`), so re-runs find the right Jira epic per section without going through the matcher.
+### Phase 8 — efficiency caching tiers ✅
+1. ✅ **Tier 1** — classification cache, key `(file_id, modified_time)`.
+2. ✅ **Tier 2** — extraction cache, key `(file_id, content_sha)`.
+3. ✅ **Tier 3** — matcher cache, key `(file_id, content_sha,
+   project_topology_sha, matcher_prompt_sha)`. Reuses entire matcher
+   result when file content + Jira topology + matcher prompt all unchanged.
+4. ✅ **Diff path** — `diff_payload.file_text` enables `unified_diff` on
+   warm runs; two-prompt LLM extract returns only the changed slices;
+   `dirty_anchors` gates downstream stages.
+5. ✅ **Partial matcher path** — Stage 1 only re-runs for processed
+   sections; Stage 2 only for dirty tasks; cached decisions reused
+   byte-for-byte for everything else.
 
 ### Phase 9 — production rollout ⏳
-1. Run `--report-only` mode against the real folder for ≥2 weeks. Operator reviews `run_plan.json` daily.
+1. Run `--report-only` against the real folder for ≥2 weeks. Operator
+   reviews `run_plan.json` daily.
 2. Tune classifier / extractor / matcher prompts on real misses.
 3. Flip to `--apply`. Keep a `--pause` flag for emergencies.
 
 ### Phase 10 — scheduling + ops ⏳
-1. `python -m jira_task_agent watch --interval 4h` (or `cron` / `launchd` snippet in `docs/deploy.md`).
+1. `python -m jira_task_agent watch --interval 4h` (or cron / launchd
+   snippet in `docs/deploy.md`).
 2. Backoff/retry on Drive 5xx/429 and Jira 5xx/429.
 3. (Optional) Post the run report to Slack via webhook.
 
@@ -423,37 +436,42 @@ Legend: ✅ done · 🟡 partial · ⏳ not started
 
 | # | Risk / Question                                                                          | Default / Mitigation                                                                  |
 |---|------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
-| 1 | Classifier mis-labels a context file as a `task` → spurious epic created.                | Confidence threshold; below it, route to `report-only` queue for human review.         |
-| 2 | Five files share the name `May1_Initial_Version_Tasks.md` — multiple may be `task` role. | If multiple `task` classifications collide on cleaned-name, prefer the most recently   |
-|   |                                                                                          | edited; flag the others as duplicates in the report.                                  |
+| 1 | Classifier mis-labels a context file as a task-bearing file → spurious epic created.     | Confidence threshold; below it, route to report-only queue for human review.           |
+| 2 | Multiple files share the name `May1_Initial_Version_Tasks.md`.                           | Content-hash dedupe; if multiple `single_epic`/`multi_epic` classifications collide on cleaned-name, prefer the most recently edited; flag the others. |
 | 3 | Jira `@mention` username (`name`) differs from email/displayName.                        | Resolve once via `/issue/{key}` and cache per assignee.                                |
-| 4 | Updating descriptions could overwrite hand-edits made directly in Jira.                  | The doc is the source of truth: doc edits trigger updates and post a changelog comment |
-|   |                                                                                          | naming the source doc + last editor. The previous body remains in Jira's edit history. |
-| 5 | Token cost of LLM calls (re-extracting unchanged docs every run).                        | The `last_run_at` cursor filters Drive to files with `modifiedTime > last_run_at`, so  |
-|   |                                                                                          | the extractor only sees files that actually moved since last success.                  |
-| 6 | What to do with `task` files that no longer exist in Drive (deleted / moved).            | **OPEN.** Default proposal: leave existing Jira issues alone, surface in the report.   |
-| 7 | Issue type for child tasks — always `Task`, or sometimes `Story`?                        | **OPEN.** Default to `Task`; allow extractor to suggest `Story` when it identifies one.|
+| 4 | Doc edits overwrite hand-edits made directly in Jira.                                    | **By design.** Doc is source of truth — agent updates and posts a changelog comment naming the source doc + last editor. Prior body lives in Jira's edit history. |
+| 5 | Stage 1 LLM stochasticity — clear matches sometimes return None.                         | Matcher partial path always re-runs Stage 1 for processed sections (self-heals on next warm run, before any duplicate-create can happen). |
+| 6 | Bumping `matcher.txt` / `matcher_grouped.txt` / model IDs invalidates Tier 3 cache project-wide. | Intended: prompt-sha is part of the matcher cache key so behavior changes can't be silently masked. Cost is one full re-match; one-time per prompt change. |
+| 7 | Token cost of LLM calls.                                                                 | `last_run_at` cursor pre-filters; Tier 1/2/3 caches collapse warm-run cost; diff path collapses warm-run extract cost; partial matcher collapses warm-run match cost. |
+| 8 | Task files deleted/moved in the source folder.                                           | **OPEN.** Default: leave existing Jira issues alone, surface in the report.            |
+| 9 | Issue type for child tasks — always `Task`, or sometimes `Story`?                        | **OPEN.** Default to `Task`; allow extractor to suggest `Story`.                       |
 
 ## 13. Definition of Done — for the agent
 
 1. Given a folder where the LLM correctly classifies the `V*_*.md` files as
-   `task`, NVIS / latest-May1 as `root`, kickoff html as `skip`, the agent
-   creates one epic per `task` file under `JIRA_PROJECT_KEY`, each with a
+   `single_epic`, the multi-section release plan as `multi_epic`, NVIS /
+   the master May1 as `root`, kickoff html as `skip`, the agent creates one
+   epic per task-bearing section under `JIRA_PROJECT_KEY`, each with a
    description that contains highlights + relevant root context, and child
    tasks each containing a populated **Definition of Done** section.
 2. Re-running the agent against the same files creates **zero** new
-   issues and posts **zero** comments.
+   issues and posts **zero** comments — Tier 2 + Tier 3 caches collapse
+   the run to read-only.
 3. Editing one task line in a doc and re-running:
+   - The diff path tags exactly that one task as dirty.
    - Updates exactly that one Jira task.
-   - Posts exactly one comment, tagging the current assignee with `[~name]`,
-     showing the before/after summary + a description-change summary.
-4. Manually editing a Jira description (outside the agent) and re-running
+   - Posts exactly one comment, tagging the current assignee with `[~name]`.
+4. Adding a new section + N tasks to a `multi_epic` doc and re-running:
+   - The diff path tags `<epic>:N` + N task anchors as dirty.
+   - Creates 1 epic + N tasks; 0 comments (creates aren't commented).
+     Other sections stay untouched.
+5. Manually editing a Jira description (outside the agent) and re-running
    results in the doc-side update being applied, with a changelog comment
-   on the issue naming the source doc + last editor. Prior content is
-   preserved in Jira's edit history.
-5. The agent runs unattended for 7 days on its schedule with no manual
+   naming the source doc + last editor. Prior content is preserved in
+   Jira's edit history.
+6. The agent runs unattended for 7 days on its schedule with no manual
    intervention; report stays green.
-6. A manual one-shot (`python -m jira_task_agent run`) executed on the same
+7. A manual one-shot (`python -m jira_task_agent run`) executed on the same
    environment produces an identical Plan to the scheduled run that would
    fire at the same moment — i.e. the two entry points are interchangeable
    and configuration-driven, not flag-driven.

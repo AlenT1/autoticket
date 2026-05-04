@@ -27,7 +27,6 @@ class MockJiraClient(JiraClient):
         self,
         *,
         project_epics: list[dict] | None = None,
-        remote_links: dict[str, list[dict]] | None = None,
         issues: dict[str, dict] | None = None,
         children_by_epic: dict[str, list[dict]] | None = None,
         static_map: dict[str, str] | None = None,
@@ -37,7 +36,6 @@ class MockJiraClient(JiraClient):
         self.auth_header = "Bearer mock"
         self.auth_mode = "bearer"
         self._project_epics = list(project_epics or [])
-        self._remote_links = dict(remote_links or {})
         self._issues = dict(issues or {})
         self._children_by_epic = dict(children_by_epic or {})
         # Username resolution: pre-populate the static map.
@@ -53,7 +51,7 @@ class MockJiraClient(JiraClient):
         }
         self.recorded: list[dict[str, Any]] = []
 
-    # -- read-side: search / get / get_remote_links ------------------------
+    # -- read-side: search / get -------------------------------------------
 
     def search(self, jql: str, *, fields: list[str] | None = None,
                max_results: int = 100) -> list[dict]:
@@ -71,9 +69,6 @@ class MockJiraClient(JiraClient):
             key = path[len("/issue/"):]
             return self._issues.get(key, {})
         return {}
-
-    def get_remote_links(self, key: str) -> list[dict]:
-        return list(self._remote_links.get(key, []))
 
     # -- write-side: capture instead of send -------------------------------
 
@@ -99,6 +94,3 @@ class MockJiraClient(JiraClient):
 
     def comments(self) -> list[dict]:
         return [r for r in self.recorded if r["path"].endswith("/comment")]
-
-    def remote_link_writes(self) -> list[dict]:
-        return [r for r in self.recorded if r["path"].endswith("/remotelink")]

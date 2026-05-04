@@ -41,7 +41,6 @@ from .pipeline.file_match import match_with_cache
 from .pipeline.reconciler import (
     Action,
     EpicGroup,
-    ProjectEpicsIndex,
     ReconcilePlan,
     build_plans_from_dirty,
 )
@@ -478,14 +477,7 @@ def _apply_epic_action(
             issue_type="Epic",
             extra_fields=extra or None,
         )
-        new_key = created.get("key")
-        if new_key and drive_file.web_view_link:
-            jira.add_remote_link(
-                new_key,
-                url=drive_file.web_view_link,
-                title=f"Source doc: {drive_file.name}",
-            )
-        return new_key
+        return created.get("key")
     if a.kind == "update_epic":
         fields: dict = {"summary": a.summary, "description": a.description}
         if a.assignee_username:
@@ -518,13 +510,6 @@ def _apply_task_action(
             epic_link=epic_key,
             extra_fields=extra or None,
         )
-        new_key = created.get("key")
-        if new_key and drive_file.web_view_link:
-            jira.add_remote_link(
-                new_key,
-                url=drive_file.web_view_link,
-                title=f"Source doc: {drive_file.name}",
-            )
         return
     if a.kind == "update_task":
         fields: dict = {"summary": a.summary, "description": a.description}

@@ -105,8 +105,7 @@ The doc is the source of truth: a doc edit that maps to an existing Jira issue t
 ### Boundary conventions
 
 - **Markdown stays the LLM's lingua franca.** The Jira wrapper converts MD → wiki at the boundary (`_md_to_jira_wiki` in `jira/client.py`), applied to descriptions in `create_issue`/`update_issue` and to `post_comment` bodies. Don't pre-render wiki anywhere upstream.
-- **Description equality** must compare like-for-like: `_descriptions_equal` runs the extracted markdown through `_md_to_jira_wiki` first, then compares against the live wiki body. Skipping that step makes `noop` impossible to reach.
-- **Identification is by remote-link**, never by label. Every agent-created issue carries `ai-generated` as a content marker (set automatically in `JiraClient.create_issue`); identification is via `GET /issue/<key>/remotelink` matching the source `webViewLink`.
+- **Identification is by the LLM matcher + Tier 3 cache**, never by label or remote-link. Every agent-created issue carries `ai-generated` as a content marker only. Doc-to-Jira pairing is decided by `pipeline/matcher.py` (Stage 1 epic match + Stage 2 task match) and persisted in `cache.json` keyed by `(file_id, content_sha, project_topology_sha, matcher_prompt_sha)`. The source-doc URL is embedded in the description footer + changelog comment for human navigation only — no remote-link is written to Jira.
 - **Assignee resolution is static-only**: `team_mapping.json` maps display name → Jira username. No API guesswork. Composite owners (`Lior + Aviv`) → first name becomes assignee, others appended as `Co-owners:` line in the description (handled in `pipeline/extractor.py`).
 
 ### Persistence

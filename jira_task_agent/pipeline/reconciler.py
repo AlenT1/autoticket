@@ -17,29 +17,6 @@ from .matcher import MatchDecision
 
 
 @dataclass
-class ProjectEpicsIndex:
-    """Lazy cache of project epics + their remote links."""
-    client: JiraClient
-    project_key: str
-    _epics: list[dict] | None = None
-    _remote_links_cache: dict[str, list[dict]] = field(default_factory=dict)
-
-    def epics(self) -> list[dict]:
-        if self._epics is None:
-            jql = (
-                f'project = "{self.project_key}" '
-                f"AND issuetype = Epic ORDER BY updated DESC"
-            )
-            self._epics = self.client.search(jql, fields=["summary"])
-        return self._epics
-
-    def remote_links(self, key: str) -> list[dict]:
-        if key not in self._remote_links_cache:
-            self._remote_links_cache[key] = self.client.get_remote_links(key)
-        return self._remote_links_cache[key]
-
-
-@dataclass
 class Action:
     kind: str
     target_key: str | None = None

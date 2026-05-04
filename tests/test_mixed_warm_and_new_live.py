@@ -3,7 +3,7 @@ file and a fresh (cold-path) file.
 
   - May1: same 3 mutations as test_may1_full_pipeline_live.py. Expected
     to produce exactly the 5-mutation op set: 1 create_epic (section J)
-    + 4 create_task + 1 update_task + 1 comment + 5 remote_links = 12 ops.
+    + 4 create_task + 1 update_task + 1 comment = 7 ops.
 
   - V11: starts the warm phase with NO extraction or matcher cache for
     its file_id, so the runner treats it as new. Expected: full cold
@@ -199,13 +199,9 @@ def test_warm_may1_plus_fresh_v11_in_one_run(tmp_path):
         f"capture total mismatch: {len(ops)} vs sum-of-buckets {expected_ops}"
     )
 
-    create_epic_count = len(buckets["issue_create_epic"])
-    create_task_count = len(buckets["issue_create_task"])
     update_count = len(buckets["issue_update"])
-    expected_remotelinks = create_epic_count + create_task_count
-    assert len(buckets["remotelink"]) == expected_remotelinks, (
-        f"expected {expected_remotelinks} remotelinks (1 per create); "
-        f"got {len(buckets['remotelink'])}"
+    assert buckets["remotelink"] == [], (
+        f"unexpected remotelink ops: {buckets['remotelink']}"
     )
     assert len(buckets["comment"]) == update_count, (
         f"expected {update_count} comment(s) (1 per update); "

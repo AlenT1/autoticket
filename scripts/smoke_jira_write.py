@@ -6,8 +6,7 @@ Exercises the four write primitives the agent will use in production:
        team_mapping.json
     3. update_issue (description change)
     4. post_comment with [~assignee] mention
-    5. add_remote_link (back-pointer to a fake source doc)
-    6. transition_issue → Done   (cleanup; opt-out with --no-cleanup)
+    5. transition_issue → Done   (cleanup; opt-out with --no-cleanup)
 
 Each run creates fresh issues with timestamps in the title; safe to run
 multiple times. Issues are tagged "[smoke-test]" in the summary for easy
@@ -94,14 +93,6 @@ def main(argv: list[str] | None = None) -> int:
     epic_key = epic["key"]
     print(f"    -> {epic_key}: {epic_summary!r}", file=sys.stderr)
 
-    # 4) Add remote link to epic
-    print(f"[4] Adding remote link on {epic_key} ...", file=sys.stderr)
-    client.add_remote_link(
-        epic_key,
-        url="https://drive.google.com/file/d/SMOKE_TEST_FAKE_ID/view",
-        title="Source: smoke-test fake doc",
-    )
-
     # 5) Create task linked to epic
     task_summary = f"[smoke-test] child task {ts}"
     task_desc = (
@@ -154,11 +145,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"[7] Posting comment on {task_key} (mention: {mention}) ...", file=sys.stderr)
     client.post_comment(task_key, comment_body)
-    client.add_remote_link(
-        task_key,
-        url="https://drive.google.com/file/d/SMOKE_TEST_FAKE_ID/view",
-        title="Source: smoke-test fake doc",
-    )
 
     # 8) Read back to verify
     print(f"[8] Reading {task_key} back to verify ...", file=sys.stderr)

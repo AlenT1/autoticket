@@ -286,21 +286,6 @@ class JiraClient:
             {"body": self._md_to_jira_wiki(body)},
         )
 
-    def add_remote_link(
-        self, key: str, *, url: str, title: str, icon_url: str | None = None
-    ) -> dict[str, Any]:
-        obj: dict[str, Any] = {"url": url, "title": title}
-        if icon_url:
-            obj["icon"] = {"url16x16": icon_url, "title": title}
-        return self.post(f"/issue/{key}/remotelink", {"object": obj})
-
-    def get_remote_links(self, key: str) -> list[dict[str, Any]]:
-        return requests.get(
-            f"{self.api_base}/issue/{key}/remotelink",
-            headers=self._headers(),
-            timeout=30,
-        ).json() or []
-
     def transition_issue(self, key: str, target_status: str) -> bool:
         """Transition `key` to a state whose `to.name` matches `target_status`.
         Returns True on success, False if no matching transition is available.

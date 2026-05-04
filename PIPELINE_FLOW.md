@@ -229,11 +229,11 @@ dirty epic to check status.
 
 Walks each `EpicGroup`. For `--apply` runs:
 
-- `create_epic` → `POST /issue` (issuetype=Epic, with `ai-generated` label) → returns key → `POST /issue/<key>/remotelink` to the Drive doc URL.
+- `create_epic` → `POST /issue` (issuetype=Epic, with `ai-generated` label).
 - `update_epic` → `PUT /issue/<key>` (summary + description) → `POST /issue/<key>/comment` (changelog using live before-state).
 - `noop` (epic) → no Jira write; just propagates `target_key` to child tasks.
 - `skip_completed_epic` → no Jira writes anywhere in the group.
-- `create_task` → `POST /issue` (issuetype=Task, `epic_link` set) → `POST /issue/<key>/remotelink`.
+- `create_task` → `POST /issue` (issuetype=Task, `epic_link` set).
 - `update_task` → `PUT /issue/<key>` (summary + description) → `POST /issue/<key>/comment` (changelog).
 - `covered_by_rollup` / `orphan` → no Jira write; surface in report.
 
@@ -296,8 +296,8 @@ the file stays cached at every layer.
 - Match partial: section processed → Stage 1 confirms epic →  Stage 2
   for the one new task.
 - Reconcile: `noop` epic action + `create_task` (Stage 2's
-  `candidate_key=None` → no existing Jira issue) + remote_link.
-- Apply: 1 `POST /issue` (issuetype=Task) + 1 `POST .../remotelink`.
+  `candidate_key=None` → no existing Jira issue).
+- Apply: 1 `POST /issue` (issuetype=Task).
 
 ### 4.5. Updated file: one task removed
 
@@ -347,9 +347,8 @@ sub-section, or the file's H1 in single-epic.
 - Match partial: section idx N >= len(cached_frs) → processed → Stage 1
   on its epic (full tree) + Stage 2 on its tasks.
 - Reconcile: `create_epic` for the new section (Stage 1 returned None)
-  + `create_task` per task; remote_links.
-- Apply: 1 `POST /issue` (Epic) + 1 remote_link + N × (`POST /issue` Task
-  + remote_link).
+  + `create_task` per task.
+- Apply: 1 `POST /issue` (Epic) + N × `POST /issue` (Task).
 
 ### 4.8. Combinations
 
@@ -362,8 +361,7 @@ MON-NEW added in section C, section J added with DR-1/2/3) produces:
   (one per processed section, each scoped to its dirty tasks).
 - Reconciler: 1 `update_task` (UI-1) + 4 `create_task` (MON-NEW + DR-1/2/3)
   + 1 `create_epic` (J) + 2 `noop` epics (C and I — body unchanged).
-- Apply (capture or live): 12 writes — 1 PUT + 1 comment + 5 creates +
-  5 remote_links.
+- Apply (capture or live): 7 writes — 1 PUT + 1 comment + 5 creates.
 
 That's the property the live test `tests/test_may1_full_pipeline_live.py`
 asserts strictly.
