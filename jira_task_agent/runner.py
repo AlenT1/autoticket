@@ -26,7 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .cache import Cache, file_content_sha
-from .drive.client import DriveFile, build_service, download_file, list_folder
+from .drive.client import (
+    DriveFile, build_service, download_file, list_folder, list_local_folder,
+)
 from .jira.client import JiraClient
 from .jira.project_tree import fetch_project_tree
 from .pipeline.classifier import ClassifyResult, classify_file
@@ -73,6 +75,8 @@ def run_once(
     apply: bool = False,
     since_override: datetime | None = None,
     download_dir: str = "data/gdrive_files",
+    local_dir: str = "data/local_files",
+    source: str = "both",
     state_path: Path | None = None,
     cache_path: Path | None = None,
     use_cache: bool = True,
@@ -90,45 +94,59 @@ def run_once(
     `use_cache=False` (or `--no-cache` on the CLI) to force re-run
     everything.
     """
+    if source not in ("both", "gdrive", "local"):
+        raise ValueError(f"invalid source {source!r}; expected both/gdrive/local")
+
     started = datetime.now(tz=timezone.utc)
     report = RunReport(started_at=started, apply=apply)
     cache = Cache.load(cache_path) if use_cache else Cache()
 
-    folder_id = os.environ.get("FOLDER_ID")
     project_key = os.environ.get("JIRA_PROJECT_KEY")
-    if not folder_id:
-        report.errors.append("FOLDER_ID is not set in env")
-        report.finished_at = datetime.now(tz=timezone.utc)
-        return report
     if not project_key:
         report.errors.append("JIRA_PROJECT_KEY is not set in env")
         report.finished_at = datetime.now(tz=timezone.utc)
         return report
 
+    folder_id = os.environ.get("FOLDER_ID") if source in ("both", "gdrive") else None
+    if source in ("both", "gdrive") and not folder_id:
+        report.errors.append("FOLDER_ID is not set in env")
+        report.finished_at = datetime.now(tz=timezone.utc)
+        return report
+
     state = load_state(state_path)
     cursor = since_override or state.last_run_at
-    logger.info("run_once: cursor=%s apply=%s", cursor, apply)
+    logger.info(
+        "run_once: cursor=%s apply=%s source=%s", cursor, apply, source,
+    )
 
-    # 1+2. Drive list + download (no cursor; root files must be visible) ----
-    drive_service = build_service()
-    files = list_folder(folder_id, service=drive_service)
+    files: list[DriveFile] = []
+    local_paths: dict[str, Path] = {}
+
+    if source in ("both", "gdrive"):
+        drive_service = build_service()
+        drive_files = list_folder(folder_id, service=drive_service)
+        files.extend(drive_files)
+        download_root = Path(download_dir)
+        for f in drive_files:
+            try:
+                p = download_file(f, download_root, service=drive_service)
+                if p is not None:
+                    local_paths[f.id] = p
+            except Exception as e:  # noqa: BLE001
+                report.errors.append(f"download failed for {f.name}: {e}")
+
+    if source in ("both", "local"):
+        local_files, local_only_paths = list_local_folder(Path(local_dir))
+        files.extend(local_files)
+        local_paths.update(local_only_paths)
+
     report.files_total = len(files)
     if not files:
-        logger.info("run_once: no Drive files in folder; nothing to do")
+        logger.info("run_once: no files from source=%s; nothing to do", source)
         report.finished_at = datetime.now(tz=timezone.utc)
         if apply:
             save_state(State(last_run_at=started, last_run_status="ok"), state_path)
         return report
-
-    download_root = Path(download_dir)
-    local_paths: dict[str, Path] = {}
-    for f in files:
-        try:
-            p = download_file(f, download_root, service=drive_service)
-            if p is not None:
-                local_paths[f.id] = p
-        except Exception as e:  # noqa: BLE001
-            report.errors.append(f"download failed for {f.name}: {e}")
 
     # 3+4. Dedupe + classify all ------------------------------------------
     duplicate_of = find_duplicate_copies(files, local_paths)

@@ -90,6 +90,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         apply=apply_writes,
         since_override=args.since,
         download_dir=args.download_dir,
+        local_dir=args.local_dir,
+        source=args.source,
         only_file_name=args.only,
         target_epic=args.target_epic,
         capture_path=args.capture,
@@ -133,6 +135,25 @@ def main(argv: list[str] | None = None) -> int:
         "--download-dir",
         default="data/gdrive_files",
         help="Local download dir. Default: data/gdrive_files/",
+    )
+    r.add_argument(
+        "--local-dir",
+        default="data/local_files",
+        help=(
+            "Folder of locally-staged planning docs. Default: "
+            "data/local_files/. Used when --source is 'local' or 'both'."
+        ),
+    )
+    r.add_argument(
+        "--source",
+        choices=["both", "local", "gdrive"],
+        default="both",
+        help=(
+            "Where to read planning docs from. 'both' (default) merges "
+            "Drive + local, 'gdrive' is Drive-only, 'local' skips Drive "
+            "auth entirely and reads only --local-dir. Content-duplicate "
+            "files across sources are deduped by the existing dedupe step."
+        ),
     )
     r.add_argument(
         "--report-out",

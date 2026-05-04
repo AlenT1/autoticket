@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -197,3 +198,50 @@ def download_file(
     path = dest_dir / f"{file.id}__{_safe_filename(name)}"
     path.write_bytes(buf.getvalue())
     return path
+
+
+_LOCAL_TEXTUAL_SUFFIXES = (".md", ".html", ".txt")
+
+
+def list_local_folder(
+    local_dir: Path,
+) -> tuple[list[DriveFile], dict[str, Path]]:
+    """Scan `local_dir` for textual planning docs and return them as
+    `DriveFile`s plus a `{file_id: Path}` map. The returned shape mirrors
+    `list_folder` + `download_file` so the runner can treat local files
+    identically to Drive files.
+
+    File ids are `local::<filename>` so they cannot collide with Drive's
+    opaque ids and have a stable cache key across runs.
+    """
+    if not local_dir.exists():
+        return [], {}
+    files: list[DriveFile] = []
+    paths: dict[str, Path] = {}
+    user = os.environ.get("USER") or "local"
+    for p in sorted(local_dir.iterdir()):
+        if not p.is_file() or p.suffix.lower() not in _LOCAL_TEXTUAL_SUFFIXES:
+            continue
+        st = p.stat()
+        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+        ctime = datetime.fromtimestamp(st.st_ctime, tz=timezone.utc)
+        mime = "text/markdown" if p.suffix.lower() == ".md" else (
+            "text/html" if p.suffix.lower() == ".html" else "text/plain"
+        )
+        f = DriveFile(
+            id=f"local::{p.name}",
+            name=p.name,
+            mime_type=mime,
+            created_time=ctime,
+            modified_time=mtime,
+            size=st.st_size,
+            creator_name=None,
+            creator_email=None,
+            last_modifying_user_name=user,
+            last_modifying_user_email=None,
+            parents=[],
+            web_view_link=p.resolve().as_uri(),
+        )
+        files.append(f)
+        paths[f.id] = p
+    return files, paths
