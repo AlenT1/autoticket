@@ -35,7 +35,7 @@ from _shared.io.sinks.jira.strategies import (
     LabelSearchStrategy,
     PickerWithCacheStrategy,
 )
-from jira_task_agent.jira.client import (
+from _shared.io.sinks.jira.client import (
     JiraClient,
     _build_auth_header,
     _normalize_host,
@@ -128,7 +128,7 @@ def _build_jira_client(cfg: AppConfig) -> JiraClient:
         # JIRA_PROJECT_KEY temporarily — but only consult the file system,
         # don't mutate the parent env permanently. Easier: import the
         # token loader directly.
-        from jira_task_agent.jira.client import _load_token
+        from _shared.io.sinks.jira.client import _load_token
         prior = os.environ.get("JIRA_PROJECT_KEY")
         os.environ["JIRA_PROJECT_KEY"] = cfg.jira.project_key or "unknown"
         try:

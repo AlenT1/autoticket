@@ -427,3 +427,215 @@ def test_jira_sink_create_raises_when_client_returns_no_key():
     sink = JiraSink(client=fake, project_key="CENTPM", filter_components=False)
     with pytest.raises(RuntimeError, match="returned no key"):
         sink.create(Ticket(summary="x", description="y", type="Task"))
+
+
+# ===========================================================================
+# JiraSink.get_issue_normalized + fetch_project_tree
+# ===========================================================================
+
+
+def test_get_issue_normalized_returns_drives_flat_shape():
+    fake = FakeJiraClient(
+        issues_by_key={
+            "CENTPM-1": {
+                "key": "CENTPM-1",
+                "fields": {
+                    "summary": "test",
+                    "description": "body",
+                    "status": {"name": "In Progress"},
+                    "assignee": {"name": "alice", "displayName": "Alice"},
+                    "reporter": {"name": "bob", "displayName": "Bob"},
+                    "priority": {"name": "P1"},
+                    "issuetype": {"name": "Task"},
+                    "labels": ["x"],
+                    "created": "2026-01-01",
+                    "updated": "2026-01-02",
+                },
+            },
+        },
+    )
+    sink = JiraSink(client=fake, project_key="CENTPM", filter_components=False)
+
+    result = sink.get_issue_normalized("CENTPM-1")
+
+    assert result["key"] == "CENTPM-1"
+    assert result["summary"] == "test"
+    assert result["status"] == "In Progress"
+    assert result["assignee_username"] == "alice"
+    assert result["assignee_name"] == "Alice"
+    assert result["issue_type"] == "Task"
+    assert result["priority"] == "P1"
+    assert result["labels"] == ["x"]
+
+
+def test_fetch_project_tree_delegates_to_helper(monkeypatch):
+    seen: dict[str, Any] = {}
+
+    def fake_fetch(client, project_key, *, log=None):
+        seen["client"] = client
+        seen["project_key"] = project_key
+        return {"epic_count": 0, "child_count": 0, "orphan_count": 0, "epics": []}
+
+    monkeypatch.setattr(
+        "_shared.io.sinks.jira.project_tree.fetch_project_tree", fake_fetch
+    )
+
+    fake = FakeJiraClient()
+    sink = JiraSink(client=fake, project_key="CENTPM", filter_components=False)
+
+    result = sink.fetch_project_tree()
+
+    assert seen["client"] is fake
+    assert seen["project_key"] == "CENTPM"
+    assert result["epic_count"] == 0
+
+
+def test_fetch_project_tree_accepts_explicit_project_override(monkeypatch):
+    seen: dict[str, Any] = {}
+
+    def fake_fetch(client, project_key, *, log=None):
+        seen["project_key"] = project_key
+        return {"epic_count": 0, "child_count": 0, "orphan_count": 0, "epics": []}
+
+    monkeypatch.setattr(
+        "_shared.io.sinks.jira.project_tree.fetch_project_tree", fake_fetch
+    )
+
+    sink = JiraSink(
+        client=FakeJiraClient(), project_key="DEFAULT", filter_components=False,
+    )
+    sink.fetch_project_tree("OTHER")
+
+    assert seen["project_key"] == "OTHER"
+
+
+# ===========================================================================
+# CapturingJiraSink
+# ===========================================================================
+
+
+def _make_offline_jira_client():
+    """Construct a real :class:`JiraClient` with caches pre-populated so no
+    HTTP request is ever made — used to exercise CapturingJiraSink's
+    .post/.put diversion through the real client's higher-level methods."""
+    from _shared.io.sinks.jira.client import JiraClient
+
+    client = JiraClient(
+        host="example.com", auth_header="Bearer fake", auth_mode="bearer",
+    )
+    # Block any lazy /field discovery so we don't hit the network.
+    client._custom_fields = {}
+    return client
+
+
+def test_capturing_sink_create_records_post_and_returns_synthetic_key():
+    from _shared.io.sinks.jira import CapturingJiraSink
+
+    client = _make_offline_jira_client()
+    sink = CapturingJiraSink(
+        client=client, project_key="CENTPM", filter_components=False,
+    )
+
+    key = sink.create(Ticket(summary="hello", description="world", type="Task"))
+
+    assert key == "CAPTURED-1"
+    assert len(sink.captured_writes) == 1
+    write = sink.captured_writes[0]
+    assert write["method"] == "POST"
+    assert write["path"] == "/issue"
+    fields = write["body"]["fields"]
+    assert fields["summary"] == "hello"
+    assert fields["issuetype"] == {"name": "Task"}
+    assert fields["project"] == {"key": "CENTPM"}
+
+
+def test_capturing_sink_update_records_put_with_fields():
+    from _shared.io.sinks.jira import CapturingJiraSink
+
+    client = _make_offline_jira_client()
+    sink = CapturingJiraSink(
+        client=client, project_key="CENTPM", filter_components=False,
+    )
+
+    sink.update(
+        "CENTPM-7",
+        Ticket(summary="updated", description="new body", type="Task"),
+    )
+
+    assert len(sink.captured_writes) == 1
+    write = sink.captured_writes[0]
+    assert write["method"] == "PUT"
+    assert write["path"] == "/issue/CENTPM-7"
+    assert write["body"]["fields"]["summary"] == "updated"
+
+
+def test_capturing_sink_comment_records_post_to_comment_endpoint():
+    from _shared.io.sinks.jira import CapturingJiraSink
+
+    client = _make_offline_jira_client()
+    sink = CapturingJiraSink(
+        client=client, project_key="CENTPM", filter_components=False,
+    )
+
+    sink.comment("CENTPM-7", "this is a comment")
+
+    assert len(sink.captured_writes) == 1
+    write = sink.captured_writes[0]
+    assert write["method"] == "POST"
+    assert write["path"] == "/issue/CENTPM-7/comment"
+    assert write["body"]["body"] == "this is a comment"
+
+
+def test_capturing_sink_reads_pass_through_to_real_client():
+    """Reads (get_issue_normalized, search, etc.) must NOT be intercepted
+    by capture mode — they hit the underlying client unchanged."""
+    from _shared.io.sinks.jira import CapturingJiraSink
+
+    client = _make_offline_jira_client()
+
+    seen_paths: list[str] = []
+
+    def fake_get(path: str, params=None):
+        seen_paths.append(path)
+        return {
+            "key": "CENTPM-1",
+            "fields": {
+                "status": {"name": "Open"},
+                "assignee": None,
+                "reporter": None,
+                "priority": None,
+                "issuetype": {"name": "Task"},
+                "summary": "x",
+                "description": "y",
+                "labels": [],
+            },
+        }
+
+    client.get = fake_get  # type: ignore[method-assign]
+
+    sink = CapturingJiraSink(
+        client=client, project_key="CENTPM", filter_components=False,
+    )
+    result = sink.get_issue_normalized("CENTPM-1")
+
+    assert seen_paths == ["/issue/CENTPM-1"]
+    assert result["status"] == "Open"
+    # Reads must not appear in the capture log.
+    assert sink.captured_writes == []
+
+
+def test_capturing_sink_assigns_sequential_capture_keys():
+    """Multiple creates within the same sink get incrementing CAPTURED-N keys."""
+    from _shared.io.sinks.jira import CapturingJiraSink
+
+    client = _make_offline_jira_client()
+    sink = CapturingJiraSink(
+        client=client, project_key="CENTPM", filter_components=False,
+    )
+
+    k1 = sink.create(Ticket(summary="a", description="...", type="Task"))
+    k2 = sink.create(Ticket(summary="b", description="...", type="Task"))
+    k3 = sink.create(Ticket(summary="c", description="...", type="Task"))
+
+    assert (k1, k2, k3) == ("CAPTURED-1", "CAPTURED-2", "CAPTURED-3")
+    assert len(sink.captured_writes) == 3

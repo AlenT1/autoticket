@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from jira_task_agent.jira.client import JiraClient
+from .client import JiraClient
 
 from ..base import (
     AssigneeResolver,
@@ -142,6 +142,36 @@ class JiraSink:
     def get_issue(self, key: str) -> dict[str, Any]:
         return self._client.get(f"/issue/{key}")
 
+    def get_issue_normalized(self, key: str) -> dict[str, Any]:
+        """Return the normalized form (drive's flat shape: top-level
+        ``status``, ``assignee_username``, ``priority``, etc.) of issue
+        ``key``.
+
+        Use this for plan-building (drive's reconciler reads ``status`` to
+        decide ``skip_completed_epic``). For raw REST output, use
+        :meth:`get_issue` instead.
+        """
+        from .client import _ISSUE_FIELDS, _normalize_issue
+        raw = self._client.get(
+            f"/issue/{key}",
+            params={"fields": ",".join(_ISSUE_FIELDS)},
+        )
+        return _normalize_issue(raw)
+
+    def fetch_project_tree(
+        self,
+        project_key: str | None = None,
+        *,
+        log: Any = None,
+    ) -> dict[str, Any]:
+        """Return the project's epic tree (one paginated /search call).
+
+        Defaults ``project_key`` to ``self.project_key`` if not given. Used
+        by jira_task_agent's matcher to compute the topology hash.
+        """
+        from .project_tree import fetch_project_tree as _fetch
+        return _fetch(self._client, project_key or self.project_key, log=log)
+
     # ---- Helpers exposed for strategy plug-ins --------------------------
 
     @property
@@ -192,3 +222,72 @@ class JiraSink:
                 str(c.get("name", "")) for c in comps if c.get("name")
             }
         return self._valid_components
+
+
+class CapturingJiraSink(JiraSink):
+    """:class:`JiraSink` variant that records writes to ``captured_writes``
+    instead of sending them.
+
+    Used by jira_task_agent's ``--capture`` mode: drives the same plan-build
+    + reconcile path as :class:`JiraSink`, but writes that flow through the
+    underlying client's ``.post`` / ``.put`` (i.e. ``create`` / ``update`` /
+    ``comment`` / ``transition``) get appended to ``captured_writes`` and
+    issue-create POSTs return synthetic ``CAPTURED-N`` keys.
+
+    Reads (``search``, ``get_issue``, ``get_issue_normalized``,
+    ``fetch_project_tree``, ``find_existing``) pass through to the underlying
+    :class:`JiraClient` so the run sees the real Jira state.
+
+    Implementation: rewires the underlying client's ``.post`` / ``.put`` to
+    recorder closures. Any caller that constructs a ``CapturingJiraSink``
+    around a live client must accept that the client's HTTP write methods are
+    irreversibly redirected for the lifetime of that client.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: JiraClient,
+        project_key: str,
+        assignee_resolver: AssigneeResolver | None = None,
+        epic_router: EpicRouter | None = None,
+        add_ai_generated_label: bool = True,
+        filter_components: bool = True,
+    ) -> None:
+        super().__init__(
+            client=client,
+            project_key=project_key,
+            assignee_resolver=assignee_resolver,
+            epic_router=epic_router,
+            add_ai_generated_label=add_ai_generated_label,
+            filter_components=filter_components,
+        )
+        self.captured_writes: list[dict[str, Any]] = []
+        self._install_capture()
+
+    def _install_capture(self) -> None:
+        captured = self.captured_writes
+        counter = {"n": 0}
+        client = self._client
+
+        def fake_post(path: str, json_body: dict[str, Any]) -> dict[str, Any]:
+            counter["n"] += 1
+            captured.append(
+                {"method": "POST", "path": path, "body": json_body}
+            )
+            if path == "/issue":
+                return {
+                    "id": str(counter["n"]),
+                    "key": f"CAPTURED-{counter['n']}",
+                    "self": "(captured)",
+                }
+            return {}
+
+        def fake_put(path: str, json_body: dict[str, Any]) -> None:
+            counter["n"] += 1
+            captured.append(
+                {"method": "PUT", "path": path, "body": json_body}
+            )
+
+        client.post = fake_post  # type: ignore[method-assign]
+        client.put = fake_put  # type: ignore[method-assign]
