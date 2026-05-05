@@ -78,14 +78,60 @@ def _root(
 
 @app.command()
 def parse(
-    input_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    input_file: Optional[Path] = typer.Argument(
+        None,
+        help="Path to a local markdown file (when --source file, the default).",
+    ),
     out: Path = typer.Option(Path("state.json"), "--out", "-o"),
     config: Optional[Path] = typer.Option(None, "--config"),
     force: bool = typer.Option(False, "--force"),
     include_resolved: bool = typer.Option(False, "--include-resolved"),
+    source: str = typer.Option(
+        "file",
+        "--source",
+        help="Where to read the bug list from: 'file' (positional path), "
+        "'gdrive' (uses $FOLDER_ID + Google OAuth, requires --only), or "
+        "'local' (uses --local-dir, requires --only).",
+    ),
+    only: Optional[str] = typer.Option(
+        None,
+        "--only",
+        help="Filename to pick from the source. Required with --source gdrive/local.",
+    ),
+    folder_id: Optional[str] = typer.Option(
+        None,
+        "--folder-id",
+        help="Google Drive folder UUID (default: $FOLDER_ID env var). "
+        "Used only with --source gdrive.",
+    ),
+    local_dir: Path = typer.Option(
+        Path("data/local_files"),
+        "--local-dir",
+        help="Local folder to scan when --source local.",
+    ),
+    download_dir: Path = typer.Option(
+        Path("data/gdrive_files"),
+        "--download-dir",
+        help="Cache dir for Drive downloads when --source gdrive.",
+    ),
 ) -> None:
-    """Parse an input markdown file into a structured state.json."""
+    """Parse a markdown bug list into a structured state.json.
+
+    Three input sources, sharing the same Source protocol that
+    jira-task-agent uses:
+
+    \b
+    --source file   (default): pass a positional path to a local .md file.
+    --source gdrive          : reads from a Google Drive folder (FOLDER_ID
+                               env var or --folder-id), requires --only to
+                               pick one file. Needs credentials.json + token.json.
+    --source local           : scans --local-dir (default data/local_files),
+                               requires --only to pick one file.
+    """
+    import os
     import uuid
+
+    from _shared.io.sources import GDriveSource, LocalFolderSource
 
     from .input import F2JFileSource
     from .models import BugRecord, BugStage, IntermediateFile
@@ -101,19 +147,47 @@ def parse(
         )
         raise typer.Exit(code=1)
 
-    # Read the input via the shared RawDocument abstraction. F2JFileSource
-    # preserves f2j's encoding-detection + BOM-strip + line-ending norm so
-    # the parser sees the same decoded text it always has.
+    # Pick the source per --source flag.
+    src, source_label = _build_parse_source(
+        source=source,
+        input_file=input_file,
+        only=only,
+        folder_id=folder_id,
+        local_dir=local_dir,
+        download_dir=download_dir,
+    )
+
     try:
-        documents = list(F2JFileSource(input_file).iter_documents())
+        documents = list(src.iter_documents(only=only))
     except ParseError as e:
         err_console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=1) from e
+    except FileNotFoundError as e:
+        # GDrive auth failure (credentials.json missing) lands here.
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1) from e
+
     if not documents:
-        err_console.print(f"[red]Could not read {input_file}[/red]")
+        err_console.print(
+            f"[red]No documents found via --source {source}"
+            + (f" (only={only!r})" if only else "")
+            + ".[/red]"
+        )
         raise typer.Exit(code=1)
+
+    if len(documents) > 1:
+        console.print(
+            f"[yellow]warn:[/yellow] {len(documents)} documents matched; "
+            f"parsing the first ({documents[0].name!r}). Pass --only to scope explicitly."
+        )
+
     doc = documents[0]
-    source_sha = doc.metadata["content_sha256"]
+    # SingleFile / F2JFileSource expose `content_sha256` in metadata; gdrive /
+    # local fall back to a hash of the decoded content.
+    source_sha = doc.metadata.get("content_sha256")
+    if source_sha is None:
+        import hashlib
+        source_sha = hashlib.sha256(doc.content.encode("utf-8")).hexdigest()
 
     try:
         result = parse_markdown(doc.content, source_sha256=source_sha)
@@ -138,7 +212,7 @@ def parse(
 
     state = IntermediateFile(
         run_id=str(uuid.uuid4()),
-        source_file=str(input_file),
+        source_file=source_label,
         source_file_sha256=source_sha,
         config_snapshot={
             "anthropic_model": cfg.anthropic.model,
@@ -171,6 +245,71 @@ def parse(
         warnings=len(result.warnings),
         out=str(out),
     )
+
+
+def _build_parse_source(
+    *,
+    source: str,
+    input_file: Optional[Path],
+    only: Optional[str],
+    folder_id: Optional[str],
+    local_dir: Path,
+    download_dir: Path,
+):
+    """Pick the right Source impl per --source, validating CLI args.
+
+    Returns ``(source_impl, source_label)`` where ``source_label`` is what
+    gets stored as ``state.source_file`` (a path for file source, a
+    ``"gdrive::folder/<id>"`` style URI for drive, etc.).
+
+    Exits the process on misconfiguration.
+    """
+    import os
+
+    from _shared.io.sources import GDriveSource, LocalFolderSource
+
+    from .input import F2JFileSource
+
+    if source == "file":
+        if input_file is None:
+            err_console.print(
+                "[red]--source file requires a positional INPUT_FILE path.[/red]"
+            )
+            raise typer.Exit(code=1)
+        if not input_file.exists():
+            err_console.print(f"[red]{input_file} does not exist.[/red]")
+            raise typer.Exit(code=1)
+        return F2JFileSource(input_file), str(input_file)
+
+    if source == "gdrive":
+        fid = folder_id or os.environ.get("FOLDER_ID")
+        if not fid:
+            err_console.print(
+                "[red]--source gdrive requires --folder-id or $FOLDER_ID.[/red]"
+            )
+            raise typer.Exit(code=1)
+        if not only:
+            err_console.print(
+                "[red]--source gdrive requires --only <filename>.[/red]"
+            )
+            raise typer.Exit(code=1)
+        return (
+            GDriveSource(folder_id=fid, download_dir=download_dir),
+            f"gdrive::folder/{fid}/{only}",
+        )
+
+    if source == "local":
+        if not only:
+            err_console.print(
+                "[red]--source local requires --only <filename>.[/red]"
+            )
+            raise typer.Exit(code=1)
+        return LocalFolderSource(local_dir), f"local::{local_dir}/{only}"
+
+    err_console.print(
+        f"[red]unknown --source {source!r} (expected 'file', 'gdrive', or 'local').[/red]"
+    )
+    raise typer.Exit(code=1)
 
 
 @app.command()
