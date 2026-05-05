@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(uv sync 2>&1)",
+      "PowerShell($env:VIRTUAL_ENV=$null; uv run f2j parse \"examples\\\\Bugs_For_Dev_Review_2026-05-03.md\" --out parsed.state.json --force 2>&1 | Out-String)"
+    ]
+  }
+}

@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "file-to-jira-tickets"
+version = "0.1.0"
+description = "Doc-to-tracker pipelines: markdown bug-list → Jira bugs (file_to_jira) and Drive doc folder → Jira epics+tasks (jira_task_agent)."
+requires-python = ">=3.11"
+authors = [{ name = "NVIDIA" }]
+license = { text = "Proprietary" }
+readme = "README.md"
+dependencies = [
+    # ---- LLM clients ----
+    # Anthropic SDK; f2j has a tool-use loop wired to it. Currently dormant
+    # operationally (Sharon uses NVIDIA via OpenAI-compat); kept as a second
+    # impl to validate the LLMProvider ABC.
+    "anthropic>=0.40.0",
+    # OpenAI SDK; used by both bodies (f2j's agent_openai + jira_task_agent's
+    # llm/client) against NVIDIA Inference Hub or any OpenAI-protocol endpoint.
+    "openai>=1.50",
+
+    # ---- Jira / Trackers ----
+    # Used by f2j today; will be folded into the shared Jira sink in stage 3.
+    "atlassian-python-api>=3.41.0",
+    # Used by jira_task_agent's raw REST wrapper.
+    "requests>=2.31",
+
+    # ---- Models / Config ----
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+
+    # ---- Google Drive (jira_task_agent input) ----
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.0",
+    "google-auth-httplib2>=0.1",
+
+    # ---- CLI / UI ----
+    "typer>=0.12",
+    "rich>=13.7",
+    "structlog>=24.1",
+
+    # ---- Text / Misc ----
+    "markdown-it-py>=3.0",
+    "langchain-text-splitters>=0.3",
+    "rapidfuzz>=3.5",
+    "filelock>=3.13",
+    "tenacity>=8.2",
+    "charset-normalizer>=3.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-recording>=0.13",
+    "vcrpy>=6.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+f2j = "file_to_jira.cli:app"
+jira-task-agent = "jira_task_agent.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/_shared", "src/file_to_jira", "src/jira_task_agent"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# f2j's external prompt + default config get vendored as package data.
+"prompts/file_to_jira/enrichment_system.md" = "file_to_jira/_data/enrichment_system.md"
+"configs/default.yaml" = "file_to_jira/_data/default.yaml"
+# jira_task_agent's prompt templates live under the package, ship as package data.
+"src/jira_task_agent/llm/prompts" = "jira_task_agent/llm/prompts"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Default: skip live tests. Opt in with `pytest -m live`.
+addopts = '-m "not live"'
+markers = [
+    "live: tests that hit the real LLM (NVIDIA Inference) or Jira (RUN_LIVE=1 / -m live to enable).",
+]

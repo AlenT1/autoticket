@@ -1,0 +1,91 @@
+# Default configuration for file-to-jira-tickets.
+# This file ships with the package; do NOT edit it directly.
+# Override values in:
+#   ~/.config/f2j/config.yaml     (user-global; %APPDATA%\f2j\config.yaml on Windows)
+#   ./f2j.yaml                    (project-local)
+#   --config <path>               (explicit, on CLI)
+#   F2J_*                         (env vars; nested via __ delimiter, e.g. F2J_JIRA__URL)
+#   --flag value                  (CLI flags, highest precedence)
+
+anthropic:
+  model: "claude-sonnet-4-6"
+  enable_prompt_caching: true
+  # Override the SDK default (https://api.anthropic.com). Set to route through
+  # an Anthropic-compatible internal proxy (NVIDIA MaaS, Bedrock shim, etc.).
+  # Per-operator: each user typically sets this in ~/.config/f2j/config.yaml
+  # or via the ANTHROPIC_BASE_URL env var, NOT in the shared project f2j.yaml.
+  base_url: null
+  # Name of the env var holding the bearer token, when not using the default
+  # ANTHROPIC_API_KEY. The token itself always lives in env vars.
+  auth_token_env: null
+
+enrichment:
+  # Which agent backend drives enrichment:
+  #   anthropic          → Anthropic Messages API (default).
+  #   openai_compatible  → OpenAI Chat Completions; works against NVIDIA
+  #                        Inference Hub, Azure OpenAI, vLLM, LocalAI, etc.
+  #                        See `openai_compatible:` block below.
+  provider: "anthropic"
+  concurrency: 8
+  max_turns: 20
+  per_bug_timeout_seconds: 360
+  fix_proposals: "strip"            # strip | reframe | keep
+  warn_on_fix_suggestions: true
+  max_budget_usd: null              # null = no cap
+  context_docs: {}                  # repo_alias → list of doc paths to consult per session
+
+openai_compatible:
+  # Used only when enrichment.provider == "openai_compatible".
+  base_url: "https://api.openai.com/v1"
+  api_key_env: "OPENAI_API_KEY"     # name of the env var holding the bearer token
+  model: "gpt-4o"
+  temperature: 0.0
+  max_tokens_per_turn: 4096
+
+repo_cache:
+  dir: null                         # null = OS-specific default
+  max_size_gb: 5
+  clone_depth: 1
+
+git_auth:
+  ca_bundle: null                   # path to NVIDIA internal CA PEM, if needed
+  https_token:
+    askpass_helper: true
+  glab:
+    hostname: "gitlab-master.nvidia.com"
+
+repo_aliases: {}                    # user fills in
+
+jira:
+  url: null                         # required at runtime if uploading
+  project_key: null
+  issue_type: "Bug"
+  board_id: null
+  # Auth dispatch:
+  #   "bearer" → Server / Data Center (uses Authorization: Bearer <PAT>).
+  #             This is what NVIDIA on-prem Jira (jirasw.nvidia.com) wants.
+  #   "basic"  → Jira Cloud (uses Authorization: Basic base64(email:token));
+  #             requires user_email below.
+  auth_mode: "bearer"
+  user_email: null                  # only used when auth_mode is "basic"
+  default_assignee: null
+  default_components: []
+  default_labels: ["from-md", "auto-created"]
+  unknown_assignee_policy: "default"   # default | skip | fail
+  field_map: {}                     # discovered via `f2j jira fields`
+  priority_values:
+    P0: "Highest"
+    P1: "High"
+    P2: "Medium"
+    P3: "Low"
+  user_map_path: "configs/user_map.yaml"
+  module_to_component: {}
+  external_id_field: null           # Jira custom field for upstream BUG_ID; null = label only
+  external_id_label_prefix: "f2j-id"
+  ca_bundle: null
+  concurrency: 8
+
+logging:
+  level: "INFO"
+  format: "console"                 # console | json
+  log_dir: ".logs"
