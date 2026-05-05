@@ -6,7 +6,7 @@ functions below are re-exported for library callers.
 
 from .config import AppConfig, RepoAlias, load_config
 from .enrich.orchestrator import run_enrich
-from .jira import upload_state
+from .upload import upload_state
 from .models import (
     BugRecord,
     BugStage,

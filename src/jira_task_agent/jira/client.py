@@ -244,15 +244,22 @@ class JiraClient:
         description: str,
         issue_type: str = "Task",
         epic_link: str | None = None,
+        parent_key: str | None = None,
         extra_fields: dict[str, Any] | None = None,
+        add_ai_generated_label: bool = True,
     ) -> dict[str, Any]:
         """POST /issue. Returns Jira's response: {id, key, self}.
 
-        Always adds the `ai-generated` label so machine-created issues are
-        visible at a glance in the Jira UI. Caller can override `labels`
-        via `extra_fields`.
+        ``add_ai_generated_label`` controls whether the ``ai-generated`` label
+        is auto-added (defaults to True for jira_task_agent's flow; f2j's
+        bug-ticket flow opts out via False so Bug tickets don't carry the
+        marker). Caller can also override ``labels`` via ``extra_fields``.
 
-        For `issue_type="Epic"` on Jira Server, automatically discovers and
+        ``parent_key`` is for Sub-task issuetypes only — sets ``fields.parent``
+        directly. For non-Sub-task issues with a parent epic, use
+        ``epic_link`` (which routes via the Epic Link customfield).
+
+        For ``issue_type="Epic"`` on Jira Server, automatically discovers and
         populates the Epic Name customfield with the summary. (Epic Name
         is required on epic creation; Server / Software addon.)
         """
@@ -261,8 +268,12 @@ class JiraClient:
             "summary": summary,
             "description": self._md_to_jira_wiki(description),
             "issuetype": {"name": issue_type},
-            "labels": ["ai-generated"],
         }
+        if add_ai_generated_label:
+            fields["labels"] = ["ai-generated"]
+        if parent_key:
+            # Sub-task parent linkage; not via Epic Link.
+            fields["parent"] = {"key": parent_key}
         if epic_link:
             field_id = self.epic_link_field_id()
             if field_id:
@@ -276,6 +287,39 @@ class JiraClient:
         if extra_fields:
             fields.update(extra_fields)
         return self.post("/issue", {"fields": fields})
+
+    # -- Components + user picker (used by f2j strategies) ----------------
+
+    def get_components(self, project_key: str) -> list[dict[str, Any]]:
+        """GET /project/{key}/components. Returns the live list of project
+        components (each has ``id`` and ``name`` at minimum). Used by f2j's
+        upload path to filter out invented component names against the
+        project's actual component set.
+        """
+        data = self.get(f"/project/{project_key}/components")
+        # The endpoint returns a JSON array, but `get()` deserializes either
+        # a dict or list — normalize to list-of-dict.
+        if isinstance(data, list):
+            return [c for c in data if isinstance(c, dict)]
+        return []
+
+    def search_user_picker(self, query: str) -> list[dict[str, Any]]:
+        """GET /user/picker?query=... — more lenient than /user/search on
+        Jira Server installs that return empty for many display-name queries.
+        Returns a list of `{name, displayName, emailAddress, ...}` dicts.
+
+        Used by f2j's PickerWithCache assignee resolver.
+        """
+        if not query:
+            return []
+        try:
+            data = self.get("/user/picker", params={"query": query})
+        except requests.HTTPError:
+            return []
+        users = data.get("users") if isinstance(data, dict) else None
+        if not isinstance(users, list):
+            return []
+        return [u for u in users if isinstance(u, dict)]
 
     def post_comment(self, key: str, body: str) -> dict[str, Any]:
         """POST /issue/{key}/comment. `body` is converted from Markdown to

@@ -206,9 +206,17 @@ def test_tool_registry_translates_to_openai_shape() -> None:
         assert "function" in entry
         fn = entry["function"]
         assert {"name", "description", "parameters"}.issubset(fn.keys())
-        # cache_control is Anthropic-only and must be stripped.
-        assert "cache_control" not in entry
+        # cache_control belongs on the outer dict (AnthropicProvider reads it
+        # back when translating to Anthropic shape); the inner function payload
+        # itself must not carry it.
         assert "cache_control" not in fn
+
+    # cache_control should ride on the last tool only — that's the prompt-cache
+    # boundary, preserved through the LLMProvider abstraction.
+    assert "cache_control" in reg[-1]
+    assert reg[-1]["cache_control"] == {"type": "ephemeral"}
+    for entry in reg[:-1]:
+        assert "cache_control" not in entry
 
 
 def test_tool_registry_includes_submit_enrichment() -> None:
@@ -458,33 +466,9 @@ def test_passes_temperature_and_model(
     assert first["tool_choice"] == "auto"
 
 
-def test_base_url_env_overrides_literal(monkeypatch) -> None:
-    """When base_url_env names an env var that is set, its value beats the literal."""
-    from file_to_jira.enrich.agent_openai import build_openai_client
-
-    monkeypatch.setenv("NVIDIA_BASE_URL", "https://from-env.example.com/v1/")
-    monkeypatch.setenv("NVIDIA_LLM_API_KEY", "sk-fake")
-    client = build_openai_client(
-        base_url="https://from-yaml.example.com/v1",
-        base_url_env="NVIDIA_BASE_URL",
-        api_key_env="NVIDIA_LLM_API_KEY",
-    )
-    # OpenAI SDK exposes the resolved base URL on `_base_url` (private but stable).
-    assert "from-env.example.com" in str(client.base_url)
-
-
-def test_base_url_falls_back_to_literal_when_env_unset(monkeypatch) -> None:
-    """If the env-var named by base_url_env is empty/unset, the literal wins."""
-    from file_to_jira.enrich.agent_openai import build_openai_client
-
-    monkeypatch.delenv("NVIDIA_BASE_URL", raising=False)
-    monkeypatch.setenv("NVIDIA_LLM_API_KEY", "sk-fake")
-    client = build_openai_client(
-        base_url="https://from-yaml.example.com/v1",
-        base_url_env="NVIDIA_BASE_URL",
-        api_key_env="NVIDIA_LLM_API_KEY",
-    )
-    assert "from-yaml.example.com" in str(client.base_url)
+# build_openai_client base-url resolution tests moved to
+# tests/_shared/llm/test_providers.py (the equivalent semantics are now
+# implemented by OpenAICompatProvider).
 
 
 def test_tools_array_uses_openai_shape(

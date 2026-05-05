@@ -87,10 +87,10 @@ def parse(
     """Parse an input markdown file into a structured state.json."""
     import uuid
 
+    from .input import F2JFileSource
     from .models import BugRecord, BugStage, IntermediateFile
-    from .parse import ParseError, parse_markdown, read_and_decode
+    from .parse import ParseError, parse_markdown
     from .state import save_state
-    from .util.ids import file_sha256_bytes
 
     configure_logging()
     log = get_logger("parse")
@@ -101,16 +101,22 @@ def parse(
         )
         raise typer.Exit(code=1)
 
+    # Read the input via the shared RawDocument abstraction. F2JFileSource
+    # preserves f2j's encoding-detection + BOM-strip + line-ending norm so
+    # the parser sees the same decoded text it always has.
     try:
-        raw, decoded = read_and_decode(input_file)
+        documents = list(F2JFileSource(input_file).iter_documents())
     except ParseError as e:
         err_console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=1) from e
-
-    source_sha = file_sha256_bytes(raw)
+    if not documents:
+        err_console.print(f"[red]Could not read {input_file}[/red]")
+        raise typer.Exit(code=1)
+    doc = documents[0]
+    source_sha = doc.metadata["content_sha256"]
 
     try:
-        result = parse_markdown(decoded, source_sha256=source_sha)
+        result = parse_markdown(doc.content, source_sha256=source_sha)
     except ParseError as e:
         err_console.print(f"[red]Parse error: {e}[/red]")
         raise typer.Exit(code=1) from e
@@ -209,7 +215,7 @@ def upload(
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     """Upload enriched bugs to Jira."""
-    from .jira import upload_state
+    from .upload import upload_state
 
     configure_logging()
     cfg = load_config()
@@ -237,7 +243,7 @@ def run(
 ) -> None:
     """End-to-end: parse -> enrich -> upload."""
     from .enrich.orchestrator import run_enrich
-    from .jira import upload_state
+    from .upload import upload_state
 
     configure_logging()
     cfg = load_config()
@@ -309,7 +315,7 @@ def inspect(
         if match is None:
             err_console.print(f"[red]No bug found matching '{bug}'[/red]")
             raise typer.Exit(code=1)
-        from .jira.uploader import _resolve_epic
+        from .upload import _resolve_epic_for_inspect as _resolve_epic
 
         cfg = load_config()
         epic_lookup = {e.key: e.summary for e in cfg.jira.available_epics}
