@@ -1,12 +1,18 @@
-"""Thin LLM client over NVIDIA Inference (OpenAI-compatible).
+"""Thin LLM wrapper for the doc-sync pipeline.
 
-Pattern adapted from apps/CentArb/.../llm/client.py:
-- One or more OpenAI clients, tried in order.
-- One or more model IDs, tried in order per client.
-- Strict JSON mode via response_format={"type": "json_object"} + json.loads,
-  with code-fence stripping for models that wrap output in ```json ...```.
-- Multi-model fallback handles transient 429 / 5xx / parse errors without
-  per-call retry plumbing.
+Routes through :class:`_shared.llm.OpenAICompatProvider` for the actual SDK
+call. This module owns:
+
+- the multi-model fallback chain (try N models in order on transient errors)
+- per-task model defaults (classify / extract / summarize), env-overridable
+- JSON-mode plumbing: code-fence stripping + ``json.loads`` of the content
+- prompt loading + ``render_prompt`` (variable substitution that ignores
+  literal ``{...}`` blocks in JSON examples)
+
+What lives elsewhere:
+
+- SDK construction, base_url + api_key resolution, normalized response
+  shape — :class:`_shared.llm.OpenAICompatProvider`.
 """
 from __future__ import annotations
 
@@ -15,8 +21,9 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import Any
 
-from openai import OpenAI
+from _shared.llm import LLMProvider, OpenAICompatProvider
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +56,12 @@ def models_summarize() -> list[str]:
     return _models_for("LLM_MODEL_SUMMARIZE", "meta/llama-3.1-8b-instruct")
 
 
-_client_singleton: OpenAI | None = None
+_provider_singleton: LLMProvider | None = None
 
 
-def get_client() -> OpenAI:
-    global _client_singleton
-    if _client_singleton is None:
+def _get_provider() -> LLMProvider:
+    global _provider_singleton
+    if _provider_singleton is None:
         api_key = os.getenv("NVIDIA_API_KEY")
         if not api_key:
             raise RuntimeError(
@@ -63,8 +70,8 @@ def get_client() -> OpenAI:
                 "Inference console."
             )
         base_url = os.getenv("NVIDIA_BASE_URL") or DEFAULT_BASE_URL
-        _client_singleton = OpenAI(api_key=api_key, base_url=base_url)
-    return _client_singleton
+        _provider_singleton = OpenAICompatProvider(api_key=api_key, base_url=base_url)
+    return _provider_singleton
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*?)\n```\s*$", re.DOTALL)
@@ -104,42 +111,53 @@ def chat(
     temperature: float = 0.1,
     max_tokens: int | None = None,
     json_mode: bool = False,
-) -> tuple[str | dict, dict]:
+) -> tuple[Any, dict]:
     """Run one chat completion with multi-model fallback.
 
-    Returns (content, metrics) where content is the parsed dict (json_mode=True)
-    or the raw string. Raises RuntimeError if every model in the chain fails.
+    Returns ``(content, metrics)`` where content is the parsed dict
+    (json_mode=True) or the raw string. Raises RuntimeError if every model
+    in the chain fails.
     """
-    client = get_client()
+    provider = _get_provider()
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    response_format = {"type": "json_object"} if json_mode else None
+
     last_err: Exception | None = None
     for model in models:
         try:
-            kwargs: dict = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": temperature,
-            }
-            if max_tokens:
-                kwargs["max_tokens"] = max_tokens
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-            resp = client.chat.completions.create(**kwargs)
-            raw = resp.choices[0].message.content or ""
-            metrics = {
-                "model": model,
-                "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0),
-                "completion_tokens": getattr(resp.usage, "completion_tokens", 0),
-                "total_tokens": getattr(resp.usage, "total_tokens", 0),
-            }
-            if json_mode:
-                cleaned = strip_code_fences(raw)
-                return json.loads(cleaned), metrics
-            return raw, metrics
+            resp = provider.chat(
+                messages=messages,
+                model=model,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
         except Exception as e:  # noqa: BLE001
             last_err = e
             logger.warning("LLM call failed (model=%s): %s", model, e)
             continue
+
+        metrics = {
+            "model": model,
+            "prompt_tokens": resp.usage.get("prompt_tokens", 0),
+            "completion_tokens": resp.usage.get("completion_tokens", 0),
+            "total_tokens": resp.usage.get("total_tokens", 0),
+        }
+        if json_mode:
+            try:
+                cleaned = strip_code_fences(resp.content)
+                return json.loads(cleaned), metrics
+            except json.JSONDecodeError as e:
+                last_err = e
+                logger.warning(
+                    "LLM returned non-JSON despite json_mode (model=%s): %s",
+                    model,
+                    e,
+                )
+                continue
+        return resp.content, metrics
+
     raise RuntimeError(f"All models failed. Last error: {last_err}")

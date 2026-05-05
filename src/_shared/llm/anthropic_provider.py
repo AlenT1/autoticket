@@ -145,32 +145,61 @@ class AnthropicProvider:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _split_system(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
-    """Pull all ``role: system`` messages into a single concatenated system prompt.
+def _split_system(
+    messages: list[dict[str, Any]],
+) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
+    """Pull all ``role: system`` messages into a single Anthropic ``system`` value.
 
     Anthropic Messages API takes ``system`` as a top-level parameter; messages
     must alternate user/assistant.
+
+    Return shape:
+    - ``None`` if no system content
+    - ``str`` if all system messages are plain text (most callers)
+    - ``list[dict]`` of content blocks if any block carries metadata such as
+      ``cache_control: ephemeral`` (preserves prompt-cache hints from f2j's
+      Anthropic agent)
     """
-    system_parts: list[str] = []
+    blocks: list[dict[str, Any]] = []
     rest: list[dict[str, Any]] = []
+    has_metadata = False
+
     for m in messages:
-        if m.get("role") == "system":
-            system_parts.append(_message_content_to_text(m.get("content")))
-        else:
+        if m.get("role") != "system":
             rest.append(m)
-    system = "\n\n".join(p for p in system_parts if p) or None
-    return system, rest
+            continue
+        added_metadata = _collect_system_blocks(m.get("content"), blocks)
+        has_metadata = has_metadata or added_metadata
+
+    if not blocks:
+        return None, rest
+    if has_metadata:
+        return blocks, rest
+    return "\n\n".join(b.get("text", "") for b in blocks if b.get("text")), rest
 
 
-def _message_content_to_text(content: Any) -> str:
+def _collect_system_blocks(content: Any, blocks: list[dict[str, Any]]) -> bool:
+    """Append text blocks for one system message's ``content`` into ``blocks``.
+
+    Returns True if any appended block carried metadata (e.g. ``cache_control``).
+    """
     if isinstance(content, str):
-        return content
+        if content:
+            blocks.append({"type": "text", "text": content})
+        return False
     if isinstance(content, list):
-        return "".join(
-            (b.get("text", "") if isinstance(b, dict) and b.get("type") == "text" else "")
-            for b in content
-        )
-    return ""
+        return any(_append_block(b, blocks) for b in content)
+    return False
+
+
+def _append_block(b: Any, blocks: list[dict[str, Any]]) -> bool:
+    """Append one block-or-string to ``blocks``. Returns True if it carried metadata."""
+    if isinstance(b, dict):
+        blocks.append(b)
+        return any(k not in ("type", "text") for k in b)
+    if isinstance(b, str) and b:
+        blocks.append({"type": "text", "text": b})
+    return False
 
 
 def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -187,43 +216,49 @@ def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
     for m in messages:
         role = m.get("role")
         if role == "tool":
-            out.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": m.get("tool_call_id", ""),
-                            "content": m.get("content", ""),
-                        }
-                    ],
-                }
-            )
-            continue
-        if role == "assistant" and m.get("tool_calls"):
-            blocks: list[dict[str, Any]] = []
-            text = m.get("content")
-            if isinstance(text, str) and text:
-                blocks.append({"type": "text", "text": text})
-            for tc in m["tool_calls"]:
-                fn = tc.get("function", {})
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except (json.JSONDecodeError, TypeError):
-                    args = {}
-                blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": tc.get("id", ""),
-                        "name": fn.get("name", ""),
-                        "input": args,
-                    }
-                )
-            out.append({"role": "assistant", "content": blocks})
-            continue
-        # Plain user/assistant message
-        out.append({"role": role, "content": m.get("content", "")})
+            out.append(_tool_message_to_anthropic(m))
+        elif role == "assistant" and m.get("tool_calls"):
+            out.append(_assistant_with_tool_calls_to_anthropic(m))
+        else:
+            out.append({"role": role, "content": m.get("content", "")})
     return out
+
+
+def _tool_message_to_anthropic(m: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": m.get("tool_call_id", ""),
+                "content": m.get("content", ""),
+            }
+        ],
+    }
+
+
+def _assistant_with_tool_calls_to_anthropic(m: dict[str, Any]) -> dict[str, Any]:
+    blocks: list[dict[str, Any]] = []
+    text = m.get("content")
+    if isinstance(text, str) and text:
+        blocks.append({"type": "text", "text": text})
+    for tc in m["tool_calls"]:
+        blocks.append(_tool_call_to_anthropic_block(tc))
+    return {"role": "assistant", "content": blocks}
+
+
+def _tool_call_to_anthropic_block(tc: dict[str, Any]) -> dict[str, Any]:
+    fn = tc.get("function", {})
+    try:
+        args = json.loads(fn.get("arguments") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        args = {}
+    return {
+        "type": "tool_use",
+        "id": tc.get("id", ""),
+        "name": fn.get("name", ""),
+        "input": args,
+    }
 
 
 def _openai_tools_to_anthropic(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -282,8 +317,17 @@ def _extract_usage(resp: Any) -> dict[str, int]:
         return {}
     in_t = getattr(u, "input_tokens", 0) or 0
     out_t = getattr(u, "output_tokens", 0) or 0
-    return {
+    cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+    cache_create = getattr(u, "cache_creation_input_tokens", 0) or 0
+    out = {
         "prompt_tokens": in_t,
         "completion_tokens": out_t,
         "total_tokens": in_t + out_t,
     }
+    # Anthropic-only — exposed when present so callers can populate
+    # EnrichmentMeta.cache_read_tokens / cache_creation_tokens.
+    if cache_read:
+        out["cache_read_tokens"] = cache_read
+    if cache_create:
+        out["cache_creation_tokens"] = cache_create
+    return out

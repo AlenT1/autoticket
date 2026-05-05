@@ -1,11 +1,17 @@
-"""Claude tool-use agent loop, one session per bug.
+"""Anthropic tool-use agent loop, one session per bug.
 
-We drive the Anthropic SDK directly (rather than depending on a higher-level
-agent framework) so that:
-- The submit_enrichment validation/retry loop is fully under our control.
-- Prompt caching boundaries are explicit (`cache_control: ephemeral` on the
-  system prompt + tool registry).
-- Token accounting is tied to our EnrichmentMeta on a per-bug basis.
+Routes through :class:`_shared.llm.LLMProvider` (specifically
+:class:`AnthropicProvider`) for the SDK call. Operationally **dormant** —
+Sharon's prod path is OpenAI-compat against NVIDIA — but kept as a genuine
+alternate impl that exercises the LLMProvider ABC against a different SDK
+shape. This validates that the abstraction generalizes.
+
+What stays the same as before the LLMProvider refactor:
+- ``submit_enrichment`` validation/retry loop fully under our control
+- prompt-caching boundaries explicit (``cache_control: ephemeral`` on the
+  system block + last tool); preserved through the provider
+- token accounting tied to ``EnrichmentMeta`` per bug, including
+  ``cache_read_tokens`` / ``cache_creation_tokens`` from Anthropic usage
 """
 
 from __future__ import annotations
@@ -13,15 +19,20 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from anthropic import Anthropic
 from pydantic import ValidationError
+
+from _shared.llm import (
+    AnthropicProvider,
+    ChatWithToolsResponse,
+    LLMProvider,
+    ToolCall,
+)
 
 from ..models import EnrichedBug, EnrichmentMeta, ParsedBug
 from .tools import ToolError, Toolkit
@@ -43,7 +54,7 @@ class EnrichmentTruncated(EnrichmentError):
 
 
 # ---------------------------------------------------------------------------
-# Tool registry (Anthropic Tool Use schema)
+# Tool registry
 # ---------------------------------------------------------------------------
 
 # A permissive schema for submit_enrichment: the *real* validation happens in
@@ -100,7 +111,7 @@ _SUBMIT_INPUT_SCHEMA: dict[str, Any] = {
 
 
 def build_tool_registry() -> list[dict[str, Any]]:
-    """Tool definitions sent to the Anthropic API. The last tool gets cache_control."""
+    """Tool definitions in Anthropic's tool-use schema. The last tool gets cache_control."""
     tools: list[dict[str, Any]] = [
         {
             "name": "clone_repo",
@@ -201,6 +212,33 @@ def build_tool_registry() -> list[dict[str, Any]]:
     return tools
 
 
+def build_openai_tool_registry() -> list[dict[str, Any]]:
+    """OpenAI-shape tool registry, used uniformly via _shared.llm.LLMProvider.
+
+    Translates the Anthropic-shaped registry returned by :func:`build_tool_registry`
+    into OpenAI's ``tools=[{"type":"function","function":{...}}]`` shape.
+
+    The ``cache_control: ephemeral`` annotation on the last tool is preserved
+    at the outer dict level — :class:`AnthropicProvider` reads it back when
+    converting to Anthropic shape on the wire, so prompt caching still works
+    on the dormant Anthropic path.
+    """
+    out: list[dict[str, Any]] = []
+    for tool in build_tool_registry():
+        entry: dict[str, Any] = {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["input_schema"],
+            },
+        }
+        if "cache_control" in tool:
+            entry["cache_control"] = tool["cache_control"]
+        out.append(entry)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Initial-prompt formatting
 # ---------------------------------------------------------------------------
@@ -283,7 +321,10 @@ def format_initial_prompt(
 def load_system_prompt() -> str:
     """Read the versioned system prompt from `prompts/enrichment_system.md`."""
     here = Path(__file__).resolve().parent.parent.parent.parent
-    path = here / "prompts" / "enrichment_system.md"
+    path = here / "prompts" / "file_to_jira" / "enrichment_system.md"
+    if not path.exists():
+        # Back-compat with the pre-merge layout.
+        path = here / "prompts" / "enrichment_system.md"
     return path.read_text(encoding="utf-8")
 
 
@@ -304,35 +345,13 @@ class _Usage:
     tool_calls: int = 0
 
 
-def _build_anthropic_client(
-    base_url: str | None = None,
-    auth_token_env: str | None = None,
-) -> Any:
-    """Construct an Anthropic client honoring the per-operator overrides.
-
-    With both args None this is equivalent to ``Anthropic()`` — i.e., the SDK
-    picks up ``ANTHROPIC_API_KEY`` and ``ANTHROPIC_BASE_URL`` from env.
-    Explicit values take precedence over env so a project-local config can
-    pin the routing.
-    """
-    import os
-
-    kwargs: dict[str, Any] = {}
-    if base_url:
-        kwargs["base_url"] = base_url
-    if auth_token_env:
-        token = os.environ.get(auth_token_env)
-        if token:
-            kwargs["auth_token"] = token
-    return Anthropic(**kwargs)
-
-
 class EnrichmentAgent:
     def __init__(
         self,
         toolkit: Toolkit,
         submit_tool: Callable[[dict[str, Any]], dict[str, Any]],
         *,
+        provider: LLMProvider | None = None,
         client: Any | None = None,
         model: str = DEFAULT_MODEL,
         max_turns: int = DEFAULT_MAX_TURNS,
@@ -346,10 +365,11 @@ class EnrichmentAgent:
     ) -> None:
         self.toolkit = toolkit
         self.submit_tool = submit_tool
-        self._client = (
-            client
-            if client is not None
-            else _build_anthropic_client(base_url, auth_token_env)
+        self._provider = _resolve_anthropic_provider(
+            provider=provider,
+            client=client,
+            base_url=base_url,
+            auth_token_env=auth_token_env,
         )
         self.model = model
         self.max_turns = max_turns
@@ -359,7 +379,7 @@ class EnrichmentAgent:
         self.system_prompt_hash = system_prompt_hash(self.system_prompt)
         self.enable_prompt_caching = enable_prompt_caching
         self.available_epics = available_epics
-        self.tools = build_tool_registry()
+        self.tools = build_openai_tool_registry()
 
     def enrich(self, bug: ParsedBug) -> EnrichedBug:
         """Run one bug through the agent loop. Raises EnrichmentError on failure."""
@@ -368,88 +388,121 @@ class EnrichmentAgent:
         repos_touched: set[str] = set()
 
         messages: list[dict[str, Any]] = [
-            {"role": "user", "content": format_initial_prompt(bug, self.available_epics)}
+            {"role": "system", "content": self._system_blocks()},
+            {"role": "user", "content": format_initial_prompt(bug, self.available_epics)},
         ]
-        system = self._system_blocks()
 
         for turn in range(self.max_turns):
-            response = self._client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens_per_turn,
-                temperature=self.temperature,
-                system=system,
-                tools=self.tools,
+            resp = self._provider.chat_with_tools(
                 messages=messages,
+                model=self.model,
+                tools=self.tools,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens_per_turn,
             )
-            self._account_usage(usage, response)
+            self._account_usage(usage, resp.usage)
+            tool_calls = self._extract_tool_calls(resp, turn, messages)
 
-            if response.stop_reason == "end_turn":
-                # Agent ended without submitting. Treat as a failure.
-                raise EnrichmentTruncated(
-                    f"agent ended turn without calling submit_enrichment "
-                    f"after {turn + 1} turn(s)"
-                )
-
-            if response.stop_reason != "tool_use":
-                raise EnrichmentError(
-                    f"unexpected stop_reason {response.stop_reason!r} on turn {turn + 1}"
-                )
-
-            # Append assistant content verbatim.
-            messages.append({"role": "assistant", "content": response.content})
-
-            # Dispatch each tool_use block. submit_enrichment is special: a
-            # successful call ends the session.
-            tool_results: list[dict[str, Any]] = []
-            submitted: EnrichedBug | None = None
-            for block in response.content:
-                if getattr(block, "type", None) != "tool_use":
-                    continue
-                usage.tool_calls += 1
-                tu_id = block.id
-                tu_name = block.name
-                tu_input = block.input
-
-                if tu_name == "submit_enrichment":
-                    result = self.submit_tool(tu_input)
-                    tool_results.append(_tool_result(tu_id, result))
-                    if result.get("ok"):
-                        try:
-                            submitted = EnrichedBug.model_validate(result["enriched"])
-                        except ValidationError as e:
-                            # Should not happen — submit_tool already validated.
-                            raise EnrichmentError(
-                                f"submit_tool returned ok but EnrichedBug failed: {e}"
-                            ) from e
-                else:
-                    result, repo_alias = self._dispatch_tool(tu_name, tu_input)
-                    if repo_alias:
-                        repos_touched.add(repo_alias)
-                    tool_results.append(_tool_result(tu_id, result))
-
+            submitted = self._run_tool_calls(
+                tool_calls, messages, usage, repos_touched
+            )
             if submitted is not None:
-                # Successful submission ends the session.
                 submitted.enrichment_meta = self._build_meta(
                     started, usage, repos_touched, truncated=False
                 )
                 return submitted
 
-            messages.append({"role": "user", "content": tool_results})
-
         raise EnrichmentTruncated(
             f"hit max_turns ({self.max_turns}) without successful submit_enrichment"
         )
 
-    # ---- helpers --------------------------------------------------------
+    # ----- per-turn helpers ----------------------------------------------
+
+    def _extract_tool_calls(
+        self,
+        resp: ChatWithToolsResponse,
+        turn: int,
+        messages: list[dict[str, Any]],
+    ) -> list[ToolCall]:
+        finish_reason = resp.finish_reason
+
+        if finish_reason == "stop":
+            raise EnrichmentTruncated(
+                f"agent ended turn without calling submit_enrichment "
+                f"after {turn + 1} turn(s)"
+            )
+        if finish_reason not in {"tool_calls", "length"}:
+            raise EnrichmentError(
+                f"unexpected finish_reason {finish_reason!r} on turn {turn + 1}"
+            )
+
+        if not resp.tool_calls:
+            raise EnrichmentError(
+                f"finish_reason={finish_reason} but no tool_calls present"
+            )
+
+        messages.append(_assistant_message_with_tool_calls(resp))
+        return resp.tool_calls
+
+    def _run_tool_calls(
+        self,
+        tool_calls: list[ToolCall],
+        messages: list[dict[str, Any]],
+        usage: _Usage,
+        repos_touched: set[str],
+    ) -> EnrichedBug | None:
+        submitted: EnrichedBug | None = None
+        for tc in tool_calls:
+            usage.tool_calls += 1
+            args = _parse_tool_arguments(tc, messages)
+            if args is None:
+                continue
+            if tc.name == "submit_enrichment":
+                submitted = self._handle_submit(tc, args, messages, submitted)
+            else:
+                self._handle_tool_call(tc, args, messages, repos_touched)
+        return submitted
+
+    def _handle_submit(
+        self,
+        tc: ToolCall,
+        args: dict[str, Any],
+        messages: list[dict[str, Any]],
+        submitted: EnrichedBug | None,
+    ) -> EnrichedBug | None:
+        result = self.submit_tool(args)
+        messages.append(_tool_result(tc.id, result))
+        if not result.get("ok"):
+            return submitted
+        try:
+            return EnrichedBug.model_validate(result["enriched"])
+        except ValidationError as e:
+            raise EnrichmentError(
+                f"submit_tool returned ok but EnrichedBug failed: {e}"
+            ) from e
+
+    def _handle_tool_call(
+        self,
+        tc: ToolCall,
+        args: dict[str, Any],
+        messages: list[dict[str, Any]],
+        repos_touched: set[str],
+    ) -> None:
+        result, repo_alias = self._dispatch_tool(tc.name, args)
+        if repo_alias:
+            repos_touched.add(repo_alias)
+        messages.append(_tool_result(tc.id, result))
+
+    # ----- helpers --------------------------------------------------------
 
     def _system_blocks(self) -> list[dict[str, Any]]:
+        """System content as a list of blocks so cache_control can ride along."""
         block: dict[str, Any] = {"type": "text", "text": self.system_prompt}
         if self.enable_prompt_caching:
             block["cache_control"] = {"type": "ephemeral"}
         return [block]
 
     def _dispatch_tool(self, name: str, args: dict[str, Any]) -> tuple[Any, str | None]:
-        """Run a non-submit tool. Returns (result_dict_or_error, repo_alias_if_known)."""
         method = getattr(self.toolkit, name, None)
         if method is None:
             return {"error": f"unknown tool {name!r}"}, None
@@ -461,14 +514,13 @@ class EnrichmentAgent:
         except TypeError as e:
             return {"error": f"bad arguments for {name}: {e}"}, repo_alias
 
-    def _account_usage(self, usage: _Usage, response: Any) -> None:
-        u = getattr(response, "usage", None)
-        if u is None:
+    def _account_usage(self, usage: _Usage, u: dict[str, int]) -> None:
+        if not u:
             return
-        usage.input_tokens += getattr(u, "input_tokens", 0) or 0
-        usage.output_tokens += getattr(u, "output_tokens", 0) or 0
-        usage.cache_read_tokens += getattr(u, "cache_read_input_tokens", 0) or 0
-        usage.cache_creation_tokens += getattr(u, "cache_creation_input_tokens", 0) or 0
+        usage.input_tokens += u.get("prompt_tokens", 0) or 0
+        usage.output_tokens += u.get("completion_tokens", 0) or 0
+        usage.cache_read_tokens += u.get("cache_read_tokens", 0) or 0
+        usage.cache_creation_tokens += u.get("cache_creation_tokens", 0) or 0
 
     def _build_meta(
         self,
@@ -493,17 +545,62 @@ class EnrichmentAgent:
         )
 
 
-def _tool_result(tool_use_id: str, result: Any) -> dict[str, Any]:
-    """Format a tool result block for the next turn's user message."""
-    is_error = isinstance(result, dict) and (
-        "error" in result or result.get("ok") is False
-    )
-    text = json.dumps(result, default=str)
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_anthropic_provider(
+    *,
+    provider: LLMProvider | None,
+    client: Any | None,
+    base_url: str | None,
+    auth_token_env: str | None,
+) -> LLMProvider:
+    """Pick a provider: explicit > raw client (back-compat) > env-derived default.
+
+    Legacy ``auth_token_env`` is mapped onto :class:`AnthropicProvider`'s
+    ``api_key_env`` — the Anthropic SDK accepts the same value via either
+    parameter for proxy/MaaS deployments.
+    """
+    if provider is not None:
+        return provider
+    if client is not None:
+        return AnthropicProvider(client=client)
+    return AnthropicProvider(api_key_env=auth_token_env, base_url=base_url)
+
+
+def _assistant_message_with_tool_calls(resp: ChatWithToolsResponse) -> dict[str, Any]:
+    """OpenAI-shape assistant message; AnthropicProvider re-translates on the wire."""
     return {
-        "type": "tool_result",
-        "tool_use_id": tool_use_id,
-        "content": text,
-        "is_error": is_error,
+        "role": "assistant",
+        "content": resp.content,
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": tc.arguments},
+            }
+            for tc in resp.tool_calls
+        ],
+    }
+
+
+def _parse_tool_arguments(
+    tc: ToolCall, messages: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    try:
+        return json.loads(tc.arguments) if tc.arguments else {}
+    except json.JSONDecodeError as e:
+        messages.append(_tool_result(tc.id, {"error": f"invalid JSON args: {e}"}))
+        return None
+
+
+def _tool_result(tool_call_id: str, result: Any) -> dict[str, Any]:
+    """OpenAI-shape tool result message; AnthropicProvider re-wraps as tool_result block."""
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": json.dumps(result, default=str),
     }
 
 

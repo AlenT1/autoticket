@@ -345,40 +345,52 @@ def _build_agent(
 ):
     """Pick the agent backend by ``cfg.enrichment.provider`` and construct it.
 
-    Imports are deferred so unit tests that only exercise one provider don't
-    pull the other SDK's transitive deps into their import graph.
+    The :class:`_shared.llm.LLMProvider` is constructed via the registry and
+    injected into the agent — so the agent itself owns only loop semantics,
+    not SDK/auth plumbing.
     """
-    provider = cfg.enrichment.provider
+    from _shared.llm import get_provider
+
+    provider_name = cfg.enrichment.provider
     available_epics = list(cfg.jira.available_epics) if cfg.jira.available_epics else None
-    if provider == "openai_compatible":
+
+    if provider_name == "openai_compatible":
         from .agent_openai import OpenAIEnrichmentAgent
 
         oc = cfg.openai_compatible
+        provider = get_provider(
+            "openai_compatible",
+            base_url=oc.base_url,
+            base_url_env=oc.base_url_env,
+            api_key_env=oc.api_key_env,
+        )
         return OpenAIEnrichmentAgent(
             toolkit=toolkit,
             submit_tool=submit_tool,
+            provider=provider,
             model=chosen_model,
             max_turns=max_turns,
             max_tokens_per_turn=oc.max_tokens_per_turn,
             temperature=oc.temperature,
-            base_url=oc.base_url,
-            base_url_env=oc.base_url_env,
-            api_key_env=oc.api_key_env,
             available_epics=available_epics,
         )
-    if provider == "anthropic":
+    if provider_name == "anthropic":
+        provider = get_provider(
+            "anthropic",
+            base_url=cfg.anthropic.base_url,
+            api_key_env=cfg.anthropic.auth_token_env,
+        )
         return EnrichmentAgent(
             toolkit=toolkit,
             submit_tool=submit_tool,
+            provider=provider,
             model=chosen_model,
             max_turns=max_turns,
             enable_prompt_caching=cfg.anthropic.enable_prompt_caching,
-            base_url=cfg.anthropic.base_url,
-            auth_token_env=cfg.anthropic.auth_token_env,
             available_epics=available_epics,
         )
     raise ValueError(
-        f"unknown enrichment.provider {provider!r} "
+        f"unknown enrichment.provider {provider_name!r} "
         "(expected 'anthropic' or 'openai_compatible')"
     )
 

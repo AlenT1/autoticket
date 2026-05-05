@@ -165,7 +165,7 @@ def test_openai_compat_chat_json_mode():
     call = fake.calls[0]
     assert call["model"] == "meta/llama-3.1-70b-instruct"
     assert call["response_format"] == {"type": "json_object"}
-    assert call["temperature"] == 0.1
+    assert call["temperature"] == pytest.approx(0.1)
     assert call["messages"][0]["role"] == "system"
 
 
@@ -412,3 +412,36 @@ def test_get_provider_aliases():
 def test_get_provider_unknown_name_raises():
     with pytest.raises(ValueError, match="Unknown LLM provider"):
         get_provider("bedrock")
+
+
+# ===========================================================================
+# OpenAICompatProvider — base_url + api_key resolution
+# (covers what the removed file_to_jira.enrich.agent_openai.build_openai_client
+# helper used to do)
+# ===========================================================================
+
+
+def test_openai_compat_base_url_env_overrides_literal(monkeypatch):
+    """When base_url_env names a set env var, its value beats the literal."""
+    monkeypatch.setenv("NVIDIA_BASE_URL", "https://from-env.example.com/v1/")
+    monkeypatch.setenv("NVIDIA_LLM_API_KEY", "sk-fake")
+    provider = OpenAICompatProvider(
+        base_url="https://from-yaml.example.com/v1",
+        base_url_env="NVIDIA_BASE_URL",
+        api_key_env="NVIDIA_LLM_API_KEY",
+    )
+    # The provider's wrapped openai client exposes the resolved base URL
+    # on `.base_url` (stable across openai>=1.0).
+    assert "from-env.example.com" in str(provider._client.base_url)
+
+
+def test_openai_compat_base_url_falls_back_to_literal_when_env_unset(monkeypatch):
+    """If the env-var named by base_url_env is unset, the literal wins."""
+    monkeypatch.delenv("NVIDIA_BASE_URL", raising=False)
+    monkeypatch.setenv("NVIDIA_LLM_API_KEY", "sk-fake")
+    provider = OpenAICompatProvider(
+        base_url="https://from-yaml.example.com/v1",
+        base_url_env="NVIDIA_BASE_URL",
+        api_key_env="NVIDIA_LLM_API_KEY",
+    )
+    assert "from-yaml.example.com" in str(provider._client.base_url)

@@ -1,45 +1,59 @@
 """OpenAI-compatible tool-use agent loop, one session per bug.
 
-Mirrors the Anthropic agent but speaks OpenAI Chat Completions protocol so
-this tool can run against any compatible endpoint — NVIDIA Inference Hub,
-Azure OpenAI, vLLM, LocalAI, etc. — without code change beyond config.
+Drives one bug end-to-end: clones repo, browses code, blames, submits
+the structured ``EnrichedBug`` via ``submit_enrichment``. The actual SDK
+call is delegated to :class:`_shared.llm.LLMProvider` so this module
+owns only loop semantics — when to stop, how to interpret submit results,
+how to account tokens — not provider/auth plumbing.
 
 The Anthropic agent and this one share:
-- the same system prompt (versioned in `prompts/enrichment_system.md`)
-- the same toolkit (`Toolkit` methods become tools)
-- the same `submit_enrichment` schema validator
-- the same `EnrichmentMeta` accounting
+- the system prompt (versioned in ``prompts/enrichment_system.md``)
+- the toolkit (``Toolkit`` methods become tools)
+- the ``submit_enrichment`` schema validator
+- the ``EnrichmentMeta`` accounting
 
-What differs:
-- request/response shape (Chat Completions vs Messages)
-- tool format (`tools=[{"type":"function","function":{...}}]` vs `tools=[{"name":...}]`)
-- finish-reason vocabulary (`stop`/`tool_calls`/`length` vs `end_turn`/`tool_use`)
-- no native prompt caching (some endpoints support it via headers; out of scope here)
+Backward compat: tests that pass a raw fake-OpenAI client via ``client=``
+are auto-wrapped into an :class:`OpenAICompatProvider`.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from openai import OpenAI
 from pydantic import ValidationError
+
+from _shared.llm import (
+    ChatWithToolsResponse,
+    LLMProvider,
+    OpenAICompatProvider,
+    ToolCall,
+)
 
 from ..models import EnrichedBug, EnrichmentMeta, ParsedBug
 from .agent import (
     EnrichmentError,
     EnrichmentTruncated,
-    build_tool_registry as _anthropic_tool_registry,
+    build_openai_tool_registry,
     format_initial_prompt,
     load_system_prompt,
     system_prompt_hash,
 )
 from .tools import ToolError, Toolkit
+
+# Re-export for tests that import build_openai_tool_registry from here.
+__all__ = [
+    "OpenAIEnrichmentAgent",
+    "build_openai_tool_registry",
+    "DEFAULT_MAX_TURNS",
+    "DEFAULT_MAX_TOKENS_PER_TURN",
+    "DEFAULT_TEMPERATURE",
+    "DEFAULT_MODEL",
+]
 
 DEFAULT_MAX_TURNS = 20
 DEFAULT_MAX_TOKENS_PER_TURN = 4096
@@ -47,76 +61,6 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MODEL = "gpt-4o"
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Tool registry: convert Anthropic shape → OpenAI Chat Completions shape
-# ---------------------------------------------------------------------------
-
-def build_openai_tool_registry() -> list[dict[str, Any]]:
-    """Translate the Anthropic tool list into OpenAI's `tools` array.
-
-    Anthropic shape:  ``{"name": "...", "description": "...", "input_schema": {...}}``
-    OpenAI shape:     ``{"type": "function", "function": {"name", "description", "parameters"}}``
-
-    The Anthropic-only ``cache_control`` field on the last tool is dropped —
-    OpenAI-compatible endpoints don't speak ephemeral cache control.
-    """
-    out: list[dict[str, Any]] = []
-    for tool in _anthropic_tool_registry():
-        out.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool["input_schema"],
-                },
-            }
-        )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Client builder
-# ---------------------------------------------------------------------------
-
-def build_openai_client(
-    *,
-    base_url: str,
-    api_key_env: str,
-    base_url_env: str | None = None,
-    api_key: str | None = None,
-) -> OpenAI:
-    """Construct an OpenAI client.
-
-    Resolution order for the **base URL**:
-    1. Env var named by ``base_url_env`` (if set and non-empty).
-    2. The ``base_url`` literal arg.
-
-    Resolution order for the **bearer token**:
-    1. Explicit ``api_key`` arg (used by tests).
-    2. The env var named by ``api_key_env`` (e.g. ``NVIDIA_LLM_API_KEY``).
-    3. The default ``OPENAI_API_KEY`` env var (the SDK falls back to this).
-
-    Raises a clear ``EnrichmentError`` if no token is resolvable.
-    """
-    resolved_url = base_url
-    if base_url_env:
-        env_url = os.environ.get(base_url_env)
-        if env_url:
-            resolved_url = env_url
-
-    resolved_key = api_key or os.environ.get(api_key_env)
-    if not resolved_key and not os.environ.get("OPENAI_API_KEY"):
-        raise EnrichmentError(
-            f"OpenAI-compatible auth: env var {api_key_env!r} not set "
-            "(and no fallback OPENAI_API_KEY found)."
-        )
-    return OpenAI(
-        base_url=resolved_url,
-        api_key=resolved_key or os.environ.get("OPENAI_API_KEY"),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +80,7 @@ class OpenAIEnrichmentAgent:
         toolkit: Toolkit,
         submit_tool: Callable[[dict[str, Any]], dict[str, Any]],
         *,
+        provider: LLMProvider | None = None,
         client: Any | None = None,
         model: str = DEFAULT_MODEL,
         max_turns: int = DEFAULT_MAX_TURNS,
@@ -149,17 +94,13 @@ class OpenAIEnrichmentAgent:
     ) -> None:
         self.toolkit = toolkit
         self.submit_tool = submit_tool
-        if client is not None:
-            self._client = client
-        elif base_url and api_key_env:
-            self._client = build_openai_client(
-                base_url=base_url,
-                base_url_env=base_url_env,
-                api_key_env=api_key_env,
-            )
-        else:
-            self._client = OpenAI()  # SDK reads OPENAI_API_KEY/OPENAI_BASE_URL
-
+        self._provider = _resolve_openai_provider(
+            provider=provider,
+            client=client,
+            base_url=base_url,
+            base_url_env=base_url_env,
+            api_key_env=api_key_env,
+        )
         self.model = model
         self.max_turns = max_turns
         self.max_tokens_per_turn = max_tokens_per_turn
@@ -181,16 +122,16 @@ class OpenAIEnrichmentAgent:
         ]
 
         for turn in range(self.max_turns):
-            response = self._client.chat.completions.create(
-                model=self.model,
+            resp = self._provider.chat_with_tools(
                 messages=messages,
+                model=self.model,
                 tools=self.tools,
                 tool_choice="auto",
                 temperature=self.temperature,
                 max_tokens=self.max_tokens_per_turn,
             )
-            self._account_usage(usage, response)
-            tool_calls = self._extract_tool_calls(response, turn, messages)
+            self._account_usage(usage, resp.usage)
+            tool_calls = self._extract_tool_calls(resp, turn, messages)
 
             submitted = self._run_tool_calls(
                 tool_calls, messages, usage, repos_touched
@@ -206,12 +147,13 @@ class OpenAIEnrichmentAgent:
         )
 
     def _extract_tool_calls(
-        self, response: Any, turn: int, messages: list[dict[str, Any]]
-    ) -> list[Any]:
+        self,
+        resp: ChatWithToolsResponse,
+        turn: int,
+        messages: list[dict[str, Any]],
+    ) -> list[ToolCall]:
         """Validate the response and return its tool_calls. Raises on bad shape."""
-        choice = response.choices[0]
-        msg = choice.message
-        finish_reason = choice.finish_reason
+        finish_reason = resp.finish_reason
 
         if finish_reason == "stop":
             raise EnrichmentTruncated(
@@ -223,18 +165,17 @@ class OpenAIEnrichmentAgent:
                 f"unexpected finish_reason {finish_reason!r} on turn {turn + 1}"
             )
 
-        tool_calls = list(msg.tool_calls or [])
-        if not tool_calls:
+        if not resp.tool_calls:
             raise EnrichmentError(
                 f"finish_reason={finish_reason} but no tool_calls present"
             )
 
-        messages.append(_assistant_message_with_tool_calls(msg, tool_calls))
-        return tool_calls
+        messages.append(_assistant_message_with_tool_calls(resp))
+        return resp.tool_calls
 
     def _run_tool_calls(
         self,
-        tool_calls: list[Any],
+        tool_calls: list[ToolCall],
         messages: list[dict[str, Any]],
         usage: _Usage,
         repos_touched: set[str],
@@ -245,8 +186,8 @@ class OpenAIEnrichmentAgent:
             usage.tool_calls += 1
             args = _parse_tool_arguments(tc, messages)
             if args is None:
-                continue  # invalid JSON; tool result already appended
-            if tc.function.name == "submit_enrichment":
+                continue
+            if tc.name == "submit_enrichment":
                 submitted = self._handle_submit(tc, args, messages, submitted)
             else:
                 self._handle_tool_call(tc, args, messages, repos_touched)
@@ -256,7 +197,7 @@ class OpenAIEnrichmentAgent:
 
     def _handle_submit(
         self,
-        tc: Any,
+        tc: ToolCall,
         args: dict[str, Any],
         messages: list[dict[str, Any]],
         submitted: EnrichedBug | None,
@@ -274,12 +215,12 @@ class OpenAIEnrichmentAgent:
 
     def _handle_tool_call(
         self,
-        tc: Any,
+        tc: ToolCall,
         args: dict[str, Any],
         messages: list[dict[str, Any]],
         repos_touched: set[str],
     ) -> None:
-        result, repo_alias = self._dispatch_tool(tc.function.name, args)
+        result, repo_alias = self._dispatch_tool(tc.name, args)
         if repo_alias:
             repos_touched.add(repo_alias)
         messages.append(_tool_result(tc.id, result))
@@ -296,12 +237,11 @@ class OpenAIEnrichmentAgent:
         except TypeError as e:
             return {"error": f"bad arguments for {name}: {e}"}, repo_alias
 
-    def _account_usage(self, usage: _Usage, response: Any) -> None:
-        u = getattr(response, "usage", None)
-        if u is None:
+    def _account_usage(self, usage: _Usage, u: dict[str, int]) -> None:
+        if not u:
             return
-        usage.input_tokens += getattr(u, "prompt_tokens", 0) or 0
-        usage.output_tokens += getattr(u, "completion_tokens", 0) or 0
+        usage.input_tokens += u.get("prompt_tokens", 0) or 0
+        usage.output_tokens += u.get("completion_tokens", 0) or 0
 
     def _build_meta(
         self,
@@ -328,31 +268,48 @@ class OpenAIEnrichmentAgent:
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
-def _assistant_message_with_tool_calls(
-    msg: Any, tool_calls: list[Any]
-) -> dict[str, Any]:
-    """Turn the SDK's Message object into a JSON-serializable dict for the next turn."""
+def _resolve_openai_provider(
+    *,
+    provider: LLMProvider | None,
+    client: Any | None,
+    base_url: str | None,
+    base_url_env: str | None,
+    api_key_env: str | None,
+) -> LLMProvider:
+    """Pick a provider: explicit > raw client (back-compat) > env-derived default."""
+    if provider is not None:
+        return provider
+    if client is not None:
+        return OpenAICompatProvider(client=client)
+    return OpenAICompatProvider(
+        base_url=base_url,
+        base_url_env=base_url_env,
+        api_key_env=api_key_env,
+    )
+
+
+def _assistant_message_with_tool_calls(resp: ChatWithToolsResponse) -> dict[str, Any]:
+    """OpenAI-shape assistant message preserving tool_calls for next turn."""
     return {
         "role": "assistant",
-        "content": getattr(msg, "content", None),
+        "content": resp.content,
         "tool_calls": [
             {
                 "id": tc.id,
                 "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
+                "function": {"name": tc.name, "arguments": tc.arguments},
             }
-            for tc in tool_calls
+            for tc in resp.tool_calls
         ],
     }
 
 
-def _parse_tool_arguments(tc: Any, messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _parse_tool_arguments(
+    tc: ToolCall, messages: list[dict[str, Any]]
+) -> dict[str, Any] | None:
     """Parse the tool-call argument JSON; on failure, append a tool_result error."""
     try:
-        return json.loads(tc.function.arguments)
+        return json.loads(tc.arguments) if tc.arguments else {}
     except json.JSONDecodeError as e:
         messages.append(_tool_result(tc.id, {"error": f"invalid JSON args: {e}"}))
         return None
