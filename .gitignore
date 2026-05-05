@@ -29,6 +29,8 @@ htmlcov/
 *.state.json.bak*
 state.json
 state.json.bak*
+state-*.json
+state-*.json.bak*
 .cache/
 .logs/
 
