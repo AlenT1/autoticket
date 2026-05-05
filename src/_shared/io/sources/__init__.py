@@ -6,6 +6,14 @@ tracker-agnostic. Bodies do format-specific parsing themselves
 and extracts epic/task structure).
 """
 from .base import RawDocument, Source
+from .gdrive import GDriveSource
+from .local_folder import LocalFolderSource
 from .single_file import SingleFileSource
 
-__all__ = ["RawDocument", "Source", "SingleFileSource"]
+__all__ = [
+    "RawDocument",
+    "Source",
+    "GDriveSource",
+    "LocalFolderSource",
+    "SingleFileSource",
+]

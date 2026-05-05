@@ -2,9 +2,43 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## What this project is
+## Repo layout (post-merge)
 
-Doc → Jira sync agent. Mirrors planning docs in a Google Drive folder into Jira project `CENTPM`: classifies each doc, extracts `{epic, tasks}` via LLM, matches against live Jira via a two-stage LLM matcher, then creates / updates / no-ops. Writes are gated behind `--apply`; dry-run is the default. See `JIRA_TASK_AGENT_OVERVIEW.md` for the goal, `JIRA_TASK_AGENT_IMPLEMENTATION_PLAN.md` for the canonical plan, `JIRA_TASK_AGENT_DEMO.md` for runnable commands.
+This repo hosts **two complementary tools** sharing one set of abstractions
+in `src/_shared/`:
+
+| Tool | Package | CLI | What it does |
+|---|---|---|---|
+| **f2j** | `src/file_to_jira/` | `f2j` (Typer subcommands) | Markdown bug list → Jira **Bug** tickets. Tool-use agent per bug clones the source repo, browses code, runs `git blame`. |
+| **jira_task_agent** | `src/jira_task_agent/` | `jira-task-agent` (single `run` subcommand) | Drive folder → Jira **Epics + Tasks**. Pipeline of structured LLM calls with 3-tier cache + diff-aware extraction. |
+
+The shared edges in `src/_shared/`:
+- `llm/` — `LLMProvider` ABC + `OpenAICompatProvider` + `AnthropicProvider`
+- `io/sources/` — `Source` protocol + `RawDocument` + `GDriveSource` / `LocalFolderSource` / `SingleFileSource`
+- `io/sinks/` — `TicketSink` protocol + `Ticket` shape + `JiraSink` + plug-in strategies (`LabelSearch` / `CacheTrust`, `PickerWithCache` / `StaticMap`, `DeterministicChain` / `NoOp`)
+
+Per-tool walkthroughs:
+- [docs/file_to_jira.md](docs/file_to_jira.md) — f2j operator quick-start (parse → enrich → upload)
+- [docs/file_to_jira_troubleshooting.md](docs/file_to_jira_troubleshooting.md)
+- [docs/jira_task_agent.md](docs/jira_task_agent.md) — jira_task_agent operator quick-start
+
+## Common commands (umbrella)
+
+```sh
+uv sync --extra dev                            # install everything
+uv run pytest -m "not live" -q                 # ~400 offline tests, ~20s
+uv run pytest -m live -q                       # opt-in live tests (real $)
+uv run f2j --help                              # f2j CLI
+uv run jira-task-agent --help                  # jira_task_agent CLI
+```
+
+Standing test epic for live work on CENTPM: **`CENTPM-1253`** (PM sweeps periodically; use `--target-epic CENTPM-1253` to keep dev runs scoped).
+
+---
+
+## jira_task_agent details
+
+Doc → Jira sync agent. Mirrors planning docs in a Google Drive folder into Jira project `CENTPM`: classifies each doc, extracts `{epic, tasks}` via LLM, matches against live Jira via a two-stage LLM matcher, then creates / updates / no-ops. Writes are gated behind `--apply`; dry-run is the default. See [docs/jira_task_agent.md](docs/jira_task_agent.md) for operator-facing detail.
 
 ## Common commands
 

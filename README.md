@@ -1,173 +1,134 @@
-# Jira Task Agent
+# file-to-jira-tickets
 
-Doc-to-Jira sync agent. Mirrors planning docs in a Google Drive folder
-and/or a local directory into the Jira project `CENTPM`: classifies
-each doc, extracts `{epic, tasks}` via an LLM, matches the extracted
-items against live Jira via a two-stage LLM matcher, then creates,
-updates, or no-ops. Writes are gated behind `--apply`; dry-run is the
-default and produces a human-readable plan for review.
+Two complementary tools for getting work into Jira, sharing one repo and one
+set of abstractions:
+
+| Tool | Input | Output | Pattern |
+|---|---|---|---|
+| **`f2j`** ([file_to_jira](docs/file_to_jira.md)) | A markdown bug-list file | Jira **Bug** tickets | One LLM tool-use agent per bug — clones the source repo, browses code, runs `git blame`, validates file paths, then submits |
+| **`jira-task-agent`** ([jira_task_agent](docs/jira_task_agent.md)) | A Google Drive folder (or local docs dir) | Jira **Epics + Tasks** | Pipeline of structured LLM calls: classify → extract → 2-stage match → reconcile, with 3-tier cache + diff-aware extraction |
+
+The bodies stay distinct (each pattern fits its problem), but they share
+the **edges** — input source plumbing, LLM provider, and Jira output sink.
 
 ## Quick start
 
 ```sh
-# 1. clone, set up venv
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# 2. configure .env (copy .env.example and fill in)
-cp .env.example .env
-$EDITOR .env
-
-# 3. run dry-run (no Jira writes); review data/run_plan.json
-.venv/bin/python -m jira_task_agent run
-
-# 4. apply for real
-.venv/bin/python -m jira_task_agent run --apply
+uv sync --extra dev          # install everything
+cp .env.example .env         # fill in JIRA_TOKEN, NVIDIA_API_KEY, FOLDER_ID, ...
+uv run f2j --help            # CLI 1
+uv run jira-task-agent --help # CLI 2
 ```
 
-Required `.env` keys: `FOLDER_ID`, `JIRA_HOST`, `JIRA_PROJECT_KEY`,
-`JIRA_AUTH_MODE`, `JIRA_TOKEN`, `NVIDIA_API_KEY`, `NVIDIA_BASE_URL`,
-`LLM_MODEL_CLASSIFY`, `LLM_MODEL_EXTRACT`, `LLM_MODEL_SUMMARIZE`.
-Google OAuth files (`credentials.json`, `token.json`) are needed only
-when reading from Drive.
+Per-tool walkthroughs:
+- [docs/file_to_jira.md](docs/file_to_jira.md) — operator's quick-start for `f2j` (parse → enrich → upload)
+- [docs/jira_task_agent.md](docs/jira_task_agent.md) — operator's quick-start for `jira-task-agent` (Drive → Jira sync)
 
-## CLI
-
-```sh
-# default: read both Drive + data/local_files/, dry-run
-python -m jira_task_agent run
-
-# choose source: gdrive | local | both
-python -m jira_task_agent run --source local
-python -m jira_task_agent run --source gdrive
-
-# narrow to one file
-python -m jira_task_agent run --only V11_Dashboard_Tasks.md
-
-# override the last_run_at cursor
-python -m jira_task_agent run --since 2026-01-01
-
-# write to Jira
-python -m jira_task_agent run --apply
-
-# capture intended writes to a JSON without sending
-python -m jira_task_agent run --capture data/would_send.json
-
-# bypass cache (force re-classify + re-extract)
-python -m jira_task_agent run --no-cache
-```
-
-## Pipeline
+## Architecture — sandwich
 
 ```
-Drive | local ──► classify ──► bundle root ──► extract (cold | diff | reuse)
-                                                       │
-Jira project ──fetch_project_tree (1 query)──► [tree]  │
-                                                       ▼
-                          run_matcher (Stage 1: epics, Stage 2: tasks)
-                                                       │
-                                          filter_dirty │
-                                                       ▼
-                          build_plans_from_dirty ──► ReconcilePlan
-                                                       │
-                                       ┌───────────────┴───────────────┐
-                                     dry-run                       --apply
-                              (run_plan.json + .md)             (Jira writes)
+┌─ Shared INPUT layer (src/_shared/io/sources/) ──────────────────────┐
+│   Source protocol — yields RawDocument(id, name, content, mtime, …) │
+│   Impls: GDriveSource, LocalFolderSource, SingleFileSource          │
+└──────────────────────────────────────────────────────────────────────┘
+            ↓
+┌─ f2j BODY (agentic) ─────┐   ┌─ jira_task_agent BODY (pipelined) ───┐
+│   parse bug list         │   │   classify → extract (cold/diff/     │
+│   tool-use agent loop    │   │     reuse, 3-tier cache) → 2-stage   │
+│   (clone, grep, blame)   │   │     LLM matcher → reconcile          │
+│   linter strips fix-     │   │   action plan: create/update/noop    │
+│     proposal language    │   │                                       │
+└───────────────────────────┘   └───────────────────────────────────────┘
+            ↓                                          ↓
+┌─ Shared LLM provider layer (src/_shared/llm/) ──────────────────────┐
+│   LLMProvider ABC                                                    │
+│     chat(messages, response_format=…)         (JSON-mode pipelines)  │
+│     chat_with_tools(messages, tools, …)       (agentic loops)        │
+│   Impls: OpenAICompatProvider (NVIDIA Inference, ...),               │
+│          AnthropicProvider                                           │
+└──────────────────────────────────────────────────────────────────────┘
+            ↓
+┌─ Shared OUTPUT layer (src/_shared/io/sinks/) ───────────────────────┐
+│   TicketSink protocol + Ticket shape (tracker-agnostic)              │
+│   Impls: JiraSink (today). Future: MondaySink, LinearSink.           │
+│   Strategies (Jira-flavored):                                        │
+│     IdentificationStrategy — LabelSearch (f2j) / CacheTrust (drive)  │
+│     AssigneeResolver       — PickerWithCache (f2j) / StaticMap (drv) │
+│     EpicRouter             — DeterministicChain (f2j) / NoOp (drive) │
+└──────────────────────────────────────────────────────────────────────┘
 ```
-
-| Stage | Module |
-|---|---|
-| List + download (Drive + local) | `drive/client.py` |
-| Classify | `pipeline/classifier.py` |
-| Bundle root | `pipeline/context_bundler.py` |
-| Extract (cold + multi + diff + targeted) | `pipeline/extractor.py` |
-| Per-file extract w/ caching | `pipeline/file_extract.py` |
-| Two-stage LLM matcher | `pipeline/matcher.py` |
-| Per-file match w/ caching | `pipeline/file_match.py` |
-| Filter to dirty changes | `pipeline/dirty_filter.py` |
-| Reconcile (action emitter) | `pipeline/reconciler.py` |
-| Apply / capture | `runner.py::_apply_plan` |
-| Render run plan as MD | `pipeline/run_plan_md.py` |
-| Orchestrate | `runner.py::run_once` |
-| CLI | `__main__.py` |
-| Cursor + cache | `state.py`, `cache.py` |
-
-## Caching
-
-`data/cache.json` (regenerated on every run, never committed):
-
-- **Tier 1** classification cache, key `(file_id, modified_time)`.
-- **Tier 2** extraction cache, key `(file_id, content_sha)`.
-- **Tier 3** matcher cache, key `(file_id, content_sha,
-  project_topology_sha, matcher_prompt_sha)`.
-
-Warm runs with no doc changes cost ~0 LLM tokens. Bumping the matcher
-prompt or the model id invalidates Tier 3 cache project-wide.
-
-## Tests
-
-Offline (default — fast, no API calls):
-
-```sh
-.venv/bin/pytest
-```
-
-Live (real LLM + Jira reads, opt-in):
-
-```sh
-.venv/bin/pytest -m live
-```
-
-Notable live tests:
-
-- `test_may1_full_pipeline_live.py` — May1 doc with 3 mutations →
-  exactly 7 captured Jira ops.
-- `test_mixed_warm_and_new_live.py` — May1 warm + V11 cold in one run.
-- `test_local_e2e_md_live.py` — local-folder E2E in capture mode,
-  generates a human-readable run plan MD.
-
-## Run plan output
-
-Every run writes `data/run_plan.json` (machine) and (when used via the
-live test path) `data/run_plan*.md` (human view). The MD is a pure
-deterministic render of the JSON: same JSON in → same MD out, no LLM
-calls, no extra Jira reads. Re-render at any time with:
-
-```sh
-.venv/bin/python -c "import json; \
-from jira_task_agent.pipeline.run_plan_md import render_run_plan_md; \
-print(render_run_plan_md(json.load(open('data/run_plan.json'))))"
-```
-
-## Conventions
-
-- **Identification** is by the LLM matcher + Tier 3 cache, never by
-  label or remote-link. `ai-generated` is a content marker only.
-- **Markdown is the LLM lingua franca**; the Jira wrapper converts
-  MD → wiki at the boundary (`_md_to_jira_wiki`). Don't pre-render
-  wiki upstream.
-- **Assignee resolution is static** via `team_mapping.json`.
-- **The doc is the source of truth.** A doc edit that maps to an
-  existing Jira issue triggers an update; the prior Jira body lives
-  in Jira's edit history. The agent stamps every body it writes with
-  `<!-- managed-by:jira-task-agent v1 -->` as a "last touched by
-  agent" indicator.
 
 ## Layout
 
 ```
-jira_task_agent/        # core package
-  drive/                # Google Drive + local-folder readers
-  jira/                 # Jira REST wrapper + project-tree fetch
-  llm/                  # NVIDIA Inference (OpenAI-compatible) client
-    prompts/            # markdown prompt templates
-      extract/          # cold + diff + targeted body extraction
-      match/            # epic + issue matchers
-  pipeline/             # classify, extract, match, filter, reconcile, render
-  runner.py             # orchestrator
-  __main__.py           # CLI
+file-to-jira-tickets/
+├── pyproject.toml                  # uv-managed; both packages, both CLIs
+├── .env / .env.example
+├── README.md                       # this file
+├── CLAUDE.md                       # repo-level guidance for Claude Code
+├── docs/
+│   ├── file_to_jira.md             # f2j operator docs
+│   ├── file_to_jira_troubleshooting.md
+│   ├── file_to_jira_project_summary.md
+│   └── jira_task_agent.md          # drive operator docs
+│
+├── src/
+│   ├── _shared/                    # shared abstractions (the edges)
+│   │   ├── io/sources/             # Source + RawDocument + GDrive/Local/SingleFile
+│   │   ├── io/sinks/               # TicketSink + Ticket + JiraSink + strategies
+│   │   └── llm/                    # LLMProvider + OpenAICompat + Anthropic
+│   ├── file_to_jira/               # f2j body (agentic enrichment)
+│   │   ├── parse/                  # bug-list markdown parser
+│   │   ├── enrich/                 # tool-use agent + toolkit + linter
+│   │   ├── repocache/              # shallow clone cache
+│   │   ├── input.py                # F2JFileSource (encoding-aware)
+│   │   ├── upload.py               # JiraSink-based upload orchestrator
+│   │   └── cli.py                  # `f2j` CLI (Typer)
+│   └── jira_task_agent/            # drive body (pipelined sync)
+│       ├── pipeline/               # classify, extract, match, reconcile, ...
+│       ├── llm/prompts/            # 8 markdown prompt templates
+│       ├── cache.py                # 3-tier matcher cache
+│       ├── runner.py               # orchestrator
+│       └── __main__.py             # `jira-task-agent` CLI (argparse)
+│
+├── prompts/file_to_jira/           # f2j system prompt (versioned)
+├── configs/                        # f2j layered YAML configs
+├── examples/                       # f2j sample bug-list inputs (gitignored)
+├── data/                           # drive runtime artifacts (gitignored)
+├── scripts/                        # both projects' helper scripts
+└── tests/
+    ├── _shared/                    # shared-layer contract tests
+    ├── file_to_jira/               # f2j unit tests
+    └── jira_task_agent/            # drive offline + live tests
+```
 
-scripts/                # stage-isolated dev scripts (list, classify, extract)
-tests/                  # offline + live tests
-data/                   # runtime artifacts (gitignored)
+## Tests
+
+```sh
+uv run pytest -m "not live" -q                 # offline, ~20s, ~400 tests
+uv run pytest -m live -q                       # live LLM/Jira (opt-in, real $)
+uv run pytest tests/_shared -q                 # shared-layer contracts only
+uv run pytest tests/file_to_jira -q            # f2j only
+uv run pytest tests/jira_task_agent -q         # drive only (offline default)
+```
+
+## Library use (autodev / embedding)
+
+```python
+# f2j: bug list → Jira bugs
+import file_to_jira as f2j
+cfg = f2j.load_config()
+f2j.parse_markdown(decoded_text, source_sha256=sha)
+f2j.run_enrich(state_file=path, cfg=cfg)
+f2j.upload_state(state_file=path, cfg=cfg)
+
+# jira_task_agent: Drive folder → Jira epics+tasks
+from jira_task_agent import run_once, RunReport
+report: RunReport = run_once(apply=True, source="both")
+
+# Shared abstractions (for stage 4 autodev consumption)
+from _shared.llm import LLMProvider, OpenAICompatProvider
+from _shared.io.sources import RawDocument, GDriveSource, SingleFileSource
+from _shared.io.sinks import Ticket, TicketSink
+from _shared.io.sinks.jira import JiraSink
 ```
