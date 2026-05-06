@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..jira.client import JiraClient, get_issue
+from _shared.io.sinks.base import AssigneeResolver
+from _shared.io.sinks.jira import JiraSink
+
 from .dirty_filter import DirtySection, DirtyTask
 from .matcher import MatchDecision
 
@@ -62,7 +64,8 @@ _COMPLETED_EPIC_STATUSES = frozenset({
 def build_plans_from_dirty(
     sections: list[DirtySection],
     *,
-    client: JiraClient,
+    sink: JiraSink,
+    resolver: AssigneeResolver,
 ) -> list[ReconcilePlan]:
     plans_by_file: dict[str, ReconcilePlan] = {}
     for section in sections:
@@ -74,12 +77,16 @@ def build_plans_from_dirty(
                 role=section.role,
             )
             plans_by_file[section.file_id] = plan
-        plan.groups.append(_build_epic_group(section, client))
+        plan.groups.append(_build_epic_group(section, sink, resolver))
     return list(plans_by_file.values())
 
 
-def _build_epic_group(section: DirtySection, client: JiraClient) -> EpicGroup:
-    epic_action = _build_epic_action(section, client)
+def _build_epic_group(
+    section: DirtySection,
+    sink: JiraSink,
+    resolver: AssigneeResolver,
+) -> EpicGroup:
+    epic_action = _build_epic_action(section, sink, resolver)
     if epic_action.kind == "skip_completed_epic":
         return EpicGroup(epic_action=epic_action, task_actions=[])
     epic_key = (
@@ -87,11 +94,15 @@ def _build_epic_group(section: DirtySection, client: JiraClient) -> EpicGroup:
         if epic_action.kind in ("update_epic", "noop")
         else None
     )
-    task_actions = _build_task_actions(section, client, epic_key)
+    task_actions = _build_task_actions(section, resolver, epic_key)
     return EpicGroup(epic_action=epic_action, task_actions=task_actions)
 
 
-def _build_epic_action(section: DirtySection, client: JiraClient) -> Action:
+def _build_epic_action(
+    section: DirtySection,
+    sink: JiraSink,
+    resolver: AssigneeResolver,
+) -> Action:
     epic_anchor = f"{section.file_id}#{section.section_index}"
 
     if section.matched_jira_key is None:
@@ -101,12 +112,12 @@ def _build_epic_action(section: DirtySection, client: JiraClient) -> Action:
             summary=section.extracted_epic_summary,
             description=section.extracted_epic_description,
             assignee_username=_resolve_assignee(
-                client, section.extracted_epic_assignee_raw,
+                resolver, section.extracted_epic_assignee_raw,
             ),
             note="no existing epic matched",
         )
 
-    live_status = get_issue(section.matched_jira_key, client=client).get("status")
+    live_status = sink.get_issue_normalized(section.matched_jira_key).get("status")
     if live_status in _COMPLETED_EPIC_STATUSES:
         return Action(
             kind="skip_completed_epic",
@@ -137,7 +148,7 @@ def _build_epic_action(section: DirtySection, client: JiraClient) -> Action:
         summary=section.extracted_epic_summary,
         description=section.extracted_epic_description,
         assignee_username=_resolve_assignee(
-            client, section.extracted_epic_assignee_raw,
+            resolver, section.extracted_epic_assignee_raw,
         ),
         match_confidence=section.epic_match_confidence,
         match_reason=section.epic_match_reason,
@@ -146,13 +157,13 @@ def _build_epic_action(section: DirtySection, client: JiraClient) -> Action:
 
 def _build_task_actions(
     section: DirtySection,
-    client: JiraClient,
+    resolver: AssigneeResolver,
     epic_key: str | None,
 ) -> list[Action]:
     epic_anchor = f"{section.file_id}#{section.section_index}"
     matches_per_key = _count_matches(section.tasks)
     actions = [
-        _build_task_action(t, client, epic_key, epic_anchor, matches_per_key)
+        _build_task_action(t, resolver, epic_key, epic_anchor, matches_per_key)
         for t in section.tasks
     ]
     consumed = set(matches_per_key.keys())
@@ -171,14 +182,14 @@ def _build_task_actions(
 
 def _build_task_action(
     t: DirtyTask,
-    client: JiraClient,
+    resolver: AssigneeResolver,
     epic_key: str | None,
     epic_anchor: str,
     matches_per_key: dict[str, int],
 ) -> Action:
     decision = t.decision
     matched_key = decision.candidate_key
-    task_assignee = _resolve_assignee(client, t.extracted.assignee_name)
+    task_assignee = _resolve_assignee(resolver, t.extracted.assignee_name)
 
     if matched_key is None:
         return Action(
@@ -231,5 +242,5 @@ def _count_matches(tasks: list[DirtyTask]) -> dict[str, int]:
     return out
 
 
-def _resolve_assignee(client: JiraClient, raw: str | None) -> str | None:
-    return client.resolve_assignee_username(raw) if raw else None
+def _resolve_assignee(resolver: AssigneeResolver, raw: str | None) -> str | None:
+    return resolver.resolve(raw) if raw else None

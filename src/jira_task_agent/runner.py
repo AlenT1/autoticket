@@ -337,10 +337,21 @@ def run_once(
 
     # 9. Filter to dirty + build ReconcilePlans ---------------------------
     try:
+        from _shared.io.sinks.jira import JiraSink
+        from _shared.io.sinks.jira.strategies import StaticMapStrategy
+        _resolver = StaticMapStrategy()
+        _sink = JiraSink(
+            client=jira,
+            project_key=project_key,
+            assignee_resolver=_resolver,
+            filter_components=False,
+        )
         dirty_sections = filter_dirty(
             matcher_result, extractions, dirty_anchors_per_file,
         )
-        plans = build_plans_from_dirty(dirty_sections, client=jira)
+        plans = build_plans_from_dirty(
+            dirty_sections, sink=_sink, resolver=_resolver,
+        )
     except Exception as e:  # noqa: BLE001
         report.errors.append(f"build_plans failed: {e}")
         report.finished_at = datetime.now(tz=timezone.utc)

@@ -32,6 +32,9 @@ from jira_task_agent.pipeline.matcher import (
 )
 from jira_task_agent.pipeline.reconciler import build_plans_from_dirty
 
+from _shared.io.sinks.jira import JiraSink
+from _shared.io.sinks.jira.strategies.assignee import PassthroughAssigneeResolver
+
 from .conftest import MockJiraClient
 
 
@@ -106,12 +109,18 @@ def _dirty_task(summary: str, anchor: str, candidate_key: str | None) -> DirtyTa
     )
 
 
-def _open_status_client(
+def _open_status_kw(
     matched_keys: list[str] = (),
     *,
     status: str = "Open",
-) -> MockJiraClient:
-    """MockJiraClient that returns matched epics in the given status."""
+) -> dict:
+    """Build the (sink, resolver) kwargs `build_plans_from_dirty` expects.
+
+    Wraps a `MockJiraClient` in a real `JiraSink` so plan-building goes
+    through the same `sink.get_issue_normalized` code path as production,
+    and pairs it with a `PassthroughAssigneeResolver` so display names
+    flow through unchanged. Returns a kwargs dict for `**`-unpacking.
+    """
     issues = {
         k: {
             "id": "1", "key": k, "self": "(mock)",
@@ -130,7 +139,10 @@ def _open_status_client(
         }
         for k in matched_keys
     }
-    return MockJiraClient(issues=issues)
+    client = MockJiraClient(issues=issues)
+    sink = JiraSink(client=client, project_key="DEMO", filter_components=False)
+    resolver = PassthroughAssigneeResolver()
+    return {"sink": sink, "resolver": resolver}
 
 
 # ----------------------------------------------------------------------
@@ -146,7 +158,7 @@ def test_brand_new_epic_emits_create_epic_and_creates():
             _dirty_task("Task B", "a2", candidate_key=None),
         ],
     )
-    plans = build_plans_from_dirty([section], client=_open_status_client())
+    plans = build_plans_from_dirty([section], **_open_status_kw())
 
     assert len(plans) == 1
     group = plans[0].groups[0]
@@ -164,7 +176,7 @@ def test_dirty_matched_epic_emits_update_epic_with_new_summary_and_description()
         tasks=[],
     )
     plans = build_plans_from_dirty(
-        [section], client=_open_status_client(["DEMO-100"]),
+        [section], **_open_status_kw(["DEMO-100"]),
     )
 
     epic_action = plans[0].groups[0].epic_action
@@ -184,7 +196,7 @@ def test_clean_matched_epic_with_dirty_tasks_emits_noop_epic():
         tasks=[_dirty_task("Edited task", "a", candidate_key="DEMO-201")],
     )
     plans = build_plans_from_dirty(
-        [section], client=_open_status_client(["DEMO-100"]),
+        [section], **_open_status_kw(["DEMO-100"]),
     )
     group = plans[0].groups[0]
     assert group.epic_action.kind == "noop"
@@ -200,7 +212,7 @@ def test_completed_status_suppresses_task_actions():
         tasks=[_dirty_task("Task", "a1", candidate_key="DEMO-101")],
     )
     plans = build_plans_from_dirty(
-        [section], client=_open_status_client(["DEMO-100"], status="Done"),
+        [section], **_open_status_kw(["DEMO-100"], status="Done"),
     )
 
     group = plans[0].groups[0]
@@ -214,7 +226,7 @@ def test_dirty_task_with_match_emits_update_task():
         tasks=[_dirty_task("UI fix", "ui-1", candidate_key="DEMO-201")],
     )
     plans = build_plans_from_dirty(
-        [section], client=_open_status_client(["DEMO-100"]),
+        [section], **_open_status_kw(["DEMO-100"]),
     )
 
     task_actions = plans[0].groups[0].task_actions
@@ -231,7 +243,7 @@ def test_dirty_task_without_match_emits_create_task():
         tasks=[_dirty_task("Brand new", "new-1", candidate_key=None)],
     )
     plans = build_plans_from_dirty(
-        [section], client=_open_status_client(["DEMO-100"]),
+        [section], **_open_status_kw(["DEMO-100"]),
     )
 
     task_actions = plans[0].groups[0].task_actions
@@ -250,7 +262,7 @@ def test_rollup_when_two_dirty_tasks_share_one_candidate_key():
         ],
     )
     plans = build_plans_from_dirty(
-        [section], client=_open_status_client(["DEMO-100"]),
+        [section], **_open_status_kw(["DEMO-100"]),
     )
 
     kinds = [a.kind for a in plans[0].groups[0].task_actions]
@@ -264,7 +276,7 @@ def test_orphan_keys_surfaced_for_unconsumed_children():
         orphan_keys=["DEMO-202", "DEMO-203", "DEMO-201"],
     )
     plans = build_plans_from_dirty(
-        [section], client=_open_status_client(["DEMO-100"]),
+        [section], **_open_status_kw(["DEMO-100"]),
     )
 
     actions = plans[0].groups[0].task_actions
@@ -290,7 +302,7 @@ def test_multi_epic_two_sections_one_per_group():
         ),
     ]
     plans = build_plans_from_dirty(
-        sections, client=_open_status_client(["DEMO-100"]),
+        sections, **_open_status_kw(["DEMO-100"]),
     )
 
     assert len(plans) == 1
@@ -302,7 +314,135 @@ def test_multi_epic_two_sections_one_per_group():
 
 
 def test_empty_input_returns_empty_plans():
-    assert build_plans_from_dirty([], client=_open_status_client()) == []
+    assert build_plans_from_dirty([], **_open_status_kw()) == []
+
+
+# ----------------------------------------------------------------------
+# c4 — verify the new sink + resolver injection points
+# ----------------------------------------------------------------------
+
+
+class _RecordingResolver:
+    """AssigneeResolver stub that records every call."""
+
+    def __init__(self, mapping: dict[str, str] | None = None) -> None:
+        self.calls: list[str] = []
+        self._map = mapping or {}
+
+    def resolve(self, display_name: str) -> str | None:
+        self.calls.append(display_name)
+        return self._map.get(display_name)
+
+
+def test_resolver_injection_consults_resolver_for_create_epic_assignee():
+    """Reconciler's epic-assignee path goes through the injected resolver,
+    not the legacy `client.resolve_assignee_username`."""
+    section = _section(matched_jira_key=None, tasks=[])
+    resolver = _RecordingResolver({"Saar": "sriftin"})
+    sink = JiraSink(
+        client=MockJiraClient(), project_key="DEMO", filter_components=False,
+    )
+    plans = build_plans_from_dirty([section], sink=sink, resolver=resolver)
+
+    epic_action = plans[0].groups[0].epic_action
+    assert epic_action.kind == "create_epic"
+    assert resolver.calls == ["Saar"]
+    assert epic_action.assignee_username == "sriftin"
+
+
+def test_resolver_injection_consults_resolver_for_task_assignees():
+    """Each dirty task's assignee goes through the resolver too."""
+    section = _section(
+        matched_jira_key=None,
+        tasks=[
+            _dirty_task("T1", "a1", candidate_key=None),
+            _dirty_task("T2", "a2", candidate_key=None),
+        ],
+    )
+    resolver = _RecordingResolver()
+    sink = JiraSink(
+        client=MockJiraClient(), project_key="DEMO", filter_components=False,
+    )
+    plans = build_plans_from_dirty([section], sink=sink, resolver=resolver)
+
+    # Three resolves: 1 for the epic + 1 per task.
+    assert resolver.calls == ["Saar", "Saar", "Saar"]
+    task_actions = plans[0].groups[0].task_actions
+    assert all(a.assignee_username is None for a in task_actions), (
+        "stub resolver returns None — None should propagate to Action.assignee_username"
+    )
+
+
+def test_resolver_injection_skips_resolve_when_assignee_is_none():
+    """`_resolve_assignee` short-circuits on falsy input; resolver isn't
+    called for tasks/epics with no assignee_name."""
+    task = DirtyTask(
+        extracted=ExtractedTask(
+            summary="T", description=_task_desc("T"),
+            source_anchor="a", assignee_name=None,
+        ),
+        decision=MatchDecision(
+            item_index=0, candidate_key=None, confidence=0.0, reason="stub",
+        ),
+    )
+    section = _section(matched_jira_key=None, tasks=[task])
+    section.extracted_epic_assignee_raw = None
+    resolver = _RecordingResolver()
+    sink = JiraSink(
+        client=MockJiraClient(), project_key="DEMO", filter_components=False,
+    )
+    build_plans_from_dirty([section], sink=sink, resolver=resolver)
+
+    assert resolver.calls == [], (
+        "resolver must not be called when assignee_name is None"
+    )
+
+
+def test_sink_get_issue_normalized_called_for_matched_epic():
+    """Reconciler's status guard reads via `sink.get_issue_normalized`,
+    not via the module-level `get_issue` import that c4 removed."""
+    calls: list[str] = []
+
+    class _ProbeSink(JiraSink):
+        def get_issue_normalized(self, key: str) -> dict:
+            calls.append(key)
+            return {"status": "Open"}
+
+    sink = _ProbeSink(
+        client=MockJiraClient(), project_key="DEMO", filter_components=False,
+    )
+    section = _section(matched_jira_key="DEMO-100", tasks=[])
+    resolver = PassthroughAssigneeResolver()
+    build_plans_from_dirty([section], sink=sink, resolver=resolver)
+
+    assert calls == ["DEMO-100"], (
+        "sink.get_issue_normalized must be the only path the reconciler uses to read live status"
+    )
+
+
+def test_sink_get_issue_normalized_status_drives_skip_completed_epic():
+    """The status returned by `sink.get_issue_normalized` decides whether
+    the epic action becomes `skip_completed_epic`."""
+    class _DoneSink(JiraSink):
+        def get_issue_normalized(self, key: str) -> dict:
+            return {"status": "Done"}
+
+    sink = _DoneSink(
+        client=MockJiraClient(), project_key="DEMO", filter_components=False,
+    )
+    section = _section(
+        matched_jira_key="DEMO-100",
+        tasks=[_dirty_task("T", "a", candidate_key="DEMO-200")],
+    )
+    plans = build_plans_from_dirty(
+        [section], sink=sink, resolver=PassthroughAssigneeResolver(),
+    )
+
+    group = plans[0].groups[0]
+    assert group.epic_action.kind == "skip_completed_epic"
+    assert group.task_actions == [], (
+        "completed epic suppresses all task actions regardless of dirty state"
+    )
 
 
 # ----------------------------------------------------------------------

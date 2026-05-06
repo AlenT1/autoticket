@@ -11,12 +11,14 @@ zero matches.
 
 ---
 
-## ▶ Current position — stopped at end of commit 3
+## ▶ Current position — stopped at end of commit 4
 
-Commits 1+2+3 landed as a single bundled commit (they share
-`src/_shared/io/sinks/jira/client.py` so splitting in-place would have
-required rewriting the file in two passes — bundle was the pragmatic call).
-Net result:
+Phase 1 (cherry-picks from `main`) landed at `ba0b72d` and was published
+to `autoticket/scope/final-tool-abstract`. Stage 3 c1+c2+c3 already
+landed before that as a single bundled commit (they share
+`src/_shared/io/sinks/jira/client.py`). Stage 3 c4 just landed:
+`pipeline/reconciler.py` now takes `sink: JiraSink` + `resolver:
+AssigneeResolver` instead of `client: JiraClient`. Net result:
 
 - The shared `JiraClient` lives at
   [src/_shared/io/sinks/jira/client.py](../src/_shared/io/sinks/jira/client.py).
@@ -26,13 +28,19 @@ Net result:
 - `JiraSink` exposes everything the drive runner will need in c5:
   `get_issue_normalized`, `fetch_project_tree`, plus the new
   `CapturingJiraSink` subclass.
-- 402 offline tests pass (was 394 pre-c1-3; +8 for the new sink coverage),
-  modulo the one pre-existing `test_payload_includes_summary_priority_labels`
+- The reconciler is now sink/resolver-driven; the runner constructs a
+  `StaticMapStrategy` + `JiraSink` and threads them through. Apply path
+  is still on the raw client — that's c5's job.
+- 398 offline tests pass post-c4 (was 393 post-Phase-1, +5 c4-specific
+  tests), modulo the pre-existing `test_payload_includes_summary_priority_labels`
   failure that's unrelated to stage 3.
 
-**Next up:** [commit 4](#commit-4--reconciler-takes-an-assigneeresolver-not-a-client)
-— refactor `pipeline/reconciler.py` to take an `AssigneeResolver` + a
-`JiraSink` instead of importing `JiraClient` directly.
+**Next up:** [commit 5](#commit-5--drive-runner-uses-jirasink-for-writes-capture-via-capturingjirasink)
+— route the drive runner's apply path through `JiraSink.create/update/comment`
+and replace capture-mode monkey-patching with `CapturingJiraSink`. **Riskiest
+commit** — preserve `finalize_body` calls and the cache-save gate
+(`apply and not capture_path and not report.errors`) per
+[stage_3_phase1_integration.md § c4-c8 deltas](./stage_3_phase1_integration.md).
 
 For everything a fresh dev needs to pick this up cold (env setup, gotchas,
 locked-in sub-decisions, exact starting line numbers for c4) see the
@@ -132,16 +140,24 @@ bearer + Cloud basic) is ported to the shared client to unblock item 3.
   sequencing + capture reads pass-through + `get_issue_normalized` shape +
   2 `fetch_project_tree` delegate tests). Full offline 402 passed.
 
-### Commit 4 — Reconciler takes an `AssigneeResolver`, not a client
+### Commit 4 — Reconciler takes an `AssigneeResolver`, not a client ✅
 
-- [ ] Modify [src/jira_task_agent/pipeline/reconciler.py](../src/jira_task_agent/pipeline/reconciler.py):
+- [x] Modify [src/jira_task_agent/pipeline/reconciler.py](../src/jira_task_agent/pipeline/reconciler.py):
   `_resolve_assignee(resolver, raw)`; thread `resolver` + `sink` through
   `_build_epic_action`, `_build_task_actions`, `_build_task_action`,
   `build_plans_from_dirty`. Replace `get_issue(key, client=client)` with
   `sink.get_issue_normalized(key)`.
-- [ ] Modify [src/jira_task_agent/runner.py](../src/jira_task_agent/runner.py)
-  call site at line 342.
-- [ ] Gate: `uv run pytest tests/jira_task_agent/test_reconciler*` offline.
+- [x] Modify [src/jira_task_agent/runner.py](../src/jira_task_agent/runner.py)
+  call site at line 342 — construct `StaticMapStrategy` + `JiraSink`,
+  pass both. Apply path unchanged (c5's territory).
+- [x] Update existing 14 reconciler test call sites to use `**_open_status_kw()`
+  (returns `sink` + `resolver` kwargs).
+- [x] Add 5 new c4-specific tests covering the injection points: resolver
+  consulted for epic + task assignees, resolver short-circuits on `None`,
+  `sink.get_issue_normalized` is the only live-status reader, sink status
+  drives `skip_completed_epic`.
+- [x] Gate: `uv run pytest tests/jira_task_agent/test_reconciler_logical.py`
+  → 23 passed (was 18 pre-c4). Full offline gate at 398 (was 393).
 
 ### Commit 5 — Drive runner uses `JiraSink` for writes; capture via `CapturingJiraSink`
 
