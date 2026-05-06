@@ -26,6 +26,7 @@ _SYSTEM_PROMPT = load_prompt("extract/single")
 _SYSTEM_PROMPT_MULTI = load_prompt("extract/multi")
 _SYSTEM_PROMPT_DIFF = load_prompt("extract/diff")
 _SYSTEM_PROMPT_TARGETED = load_prompt("extract/targeted")
+_SYSTEM_PROMPT_MERGE_WITH_LIVE = load_prompt("extract/merge_with_live")
 
 
 @dataclass
@@ -567,3 +568,37 @@ def _parse_targeted_epics(
         sec = e.get("section")
         sections.append(str(sec).strip() if sec else None)
     return epics, sections
+
+
+def merge_with_live(new_body: str, live_jira_body: str) -> str:
+    """Merge `new_body` (agent's freshly-generated markdown) with
+    `live_jira_body` (current Jira description, possibly with user-
+    marked DoD checkboxes) via a single LLM call. Returns the final
+    markdown body to PUT.
+
+    Skips the LLM call entirely when there's nothing to merge:
+      - empty live body  → return new_body verbatim
+      - new body matches live body byte-for-byte after marker strip
+        → return new_body
+    """
+    if not (live_jira_body or "").strip():
+        return new_body
+    if _ensure_marker(new_body).strip() == _ensure_marker(live_jira_body).strip():
+        return new_body
+
+    user_msg = render_prompt(
+        _SYSTEM_PROMPT_MERGE_WITH_LIVE,
+        new_body=new_body,
+        live_jira_body=live_jira_body,
+    )
+    raw, _ = chat(
+        system="You output a single markdown document. No JSON. No prose preamble.",
+        user=user_msg,
+        models=models_extract(),
+        temperature=0.0,
+        json_mode=False,
+    )
+    text = (raw or "").strip()
+    if not text:
+        return new_body
+    return _ensure_marker(text)

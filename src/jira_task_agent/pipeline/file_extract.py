@@ -335,7 +335,10 @@ def labels_to_targets(labels: DiffLabels, cached: Extraction) -> dict:
         ct = cached_by_anchor.get(anchor)
         if ct is None:
             continue
-        target: dict = {"summary": ct.summary}
+        target: dict = {
+            "summary": ct.summary,
+            "cached_body": ct.description or "",
+        }
         section = section_for_anchor.get(anchor)
         if section:
             target["section"] = section
@@ -348,7 +351,10 @@ def labels_to_targets(labels: DiffLabels, cached: Extraction) -> dict:
 
     epic_targets: list[dict] = []
     if labels.epic_changed and isinstance(cached, ExtractionResult):
-        epic_targets.append({"summary": cached.epic.summary})
+        epic_targets.append({
+            "summary": cached.epic.summary,
+            "cached_body": cached.epic.description or "",
+        })
     for ne in labels.new_subepics:
         epic_targets.append({"summary": ne["summary"], "section": ne["summary"]})
 
@@ -505,7 +511,19 @@ def _all_tasks(ext: Extraction) -> list[ExtractedTask]:
 
 
 def _norm(s: str | None) -> str:
+    """Strict equality after stripping the agent marker and trimming."""
     return (s or "").replace(AGENT_MARKER, "").strip()
+
+
+def _norm_loose(s: str | None) -> str:
+    """Cosmetic-equivalence key: strip marker, collapse all whitespace
+    runs to single spaces, lowercase. Two bodies normalizing to the
+    same string say the same thing in the same words — different only
+    in formatting. LLM paraphrase still produces different keys here,
+    so this is a *byte-equivalence-after-formatting* check, not a
+    semantic one."""
+    base = (s or "").replace(AGENT_MARKER, "")
+    return " ".join(base.lower().split())
 
 
 def _normalize_section(s: str | None) -> str:
@@ -517,14 +535,23 @@ def _normalize_section(s: str | None) -> str:
 
 
 def _task_changed(prev: ExtractedTask, curr: ExtractedTask) -> bool:
-    return prev.summary != curr.summary or _norm(prev.description) != _norm(curr.description)
+    if prev.summary != curr.summary:
+        return True
+    if _norm(prev.description) == _norm(curr.description):
+        return False
+    # Defensive: bodies differ only in whitespace / casing → drop.
+    return _norm_loose(prev.description) != _norm_loose(curr.description)
 
 
 def _epic_changed(
     prev: ExtractedEpic | ExtractedEpicWithTasks,
     curr: ExtractedEpic | ExtractedEpicWithTasks,
 ) -> bool:
-    return prev.summary != curr.summary or _norm(prev.description) != _norm(curr.description)
+    if prev.summary != curr.summary:
+        return True
+    if _norm(prev.description) == _norm(curr.description):
+        return False
+    return _norm_loose(prev.description) != _norm_loose(curr.description)
 
 
 # ----------------------------------------------------------------------
