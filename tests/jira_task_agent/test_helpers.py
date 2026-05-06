@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from jira_task_agent.jira.client import JiraClient
+from _shared.io.sinks.jira.client import JiraClient
 from jira_task_agent.pipeline.dedupe import (
     _normalize as dedupe_normalize,
     find_duplicate_copies,

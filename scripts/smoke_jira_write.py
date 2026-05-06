@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
-from jira_task_agent.jira.client import JiraClient, get_issue
+from _shared.io.sinks.jira.client import JiraClient, get_issue
 
 
 def _ts() -> str:

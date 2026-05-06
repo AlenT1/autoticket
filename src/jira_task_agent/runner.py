@@ -31,9 +31,8 @@ from .cache import Cache, file_content_sha
 from .drive.client import (
     DriveFile, build_service, download_file, list_folder, list_local_folder,
 )
-from .jira.client import JiraClient
 from _shared.io.sinks import Ticket
-from _shared.io.sinks.jira import CapturingJiraSink, JiraSink
+from _shared.io.sinks.jira import CapturingJiraSink, JiraClient, JiraSink
 from _shared.io.sinks.jira.strategies import StaticMapStrategy
 from .pipeline.classifier import ClassifyResult, classify_file
 from .pipeline.commenter import format_update_comment

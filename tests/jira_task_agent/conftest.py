@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from jira_task_agent.jira.client import JiraClient
+from _shared.io.sinks.jira.client import JiraClient
 
 
 class MockJiraClient(JiraClient):

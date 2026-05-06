@@ -1,5 +1,5 @@
 """Write the full Jira project tree (epics + their direct children) to
-JSON. Wraps `jira_task_agent.jira.project_tree.fetch_project_tree`.
+JSON. Wraps `_shared.io.sinks.jira.project_tree.fetch_project_tree`.
 
     python scripts/list_project_tree.py            # uses $JIRA_PROJECT_KEY
     python scripts/list_project_tree.py CENTPM
@@ -18,8 +18,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from jira_task_agent.jira.client import JiraClient
-from jira_task_agent.jira.project_tree import fetch_project_tree
+from _shared.io.sinks.jira.client import JiraClient
+from _shared.io.sinks.jira.project_tree import fetch_project_tree
 
 
 def main(argv: list[str] | None = None) -> int:

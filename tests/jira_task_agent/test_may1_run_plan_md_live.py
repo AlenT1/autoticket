@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from jira_task_agent import runner as runner_module
-from jira_task_agent.jira.client import JiraClient, get_issue
+from _shared.io.sinks.jira.client import JiraClient, get_issue
 from jira_task_agent.pipeline.run_plan_md import render_run_plan_md
 from jira_task_agent.runner import run_once
 

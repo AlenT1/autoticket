@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ..jira.client import JiraClient
+    from _shared.io.sinks.jira.client import JiraClient
     from ..runner import RunReport
 
 
@@ -70,7 +70,7 @@ def _jira_url(host: str | None, key: str | None) -> str | None:
 
 
 def _epic_action_dict(ea: Any, jira: Any, host: str | None) -> dict | None:
-    from ..jira.client import get_issue
+    from _shared.io.sinks.jira.client import get_issue
     if ea.kind == "update_epic" and ea.target_key:
         live = (get_issue(ea.target_key, client=jira) if jira else {}) or {}
         return {
@@ -105,7 +105,7 @@ def _task_action_dict(
     ta: Any, *, epic_key: str | None, parent_summary: str | None,
     jira: Any, host: str | None,
 ) -> dict | None:
-    from ..jira.client import get_issue
+    from _shared.io.sinks.jira.client import get_issue
     if ta.kind == "update_task" and ta.target_key:
         live = (get_issue(ta.target_key, client=jira) if jira else {}) or {}
         return {
@@ -141,7 +141,7 @@ def _task_action_dict(
 
 
 def _group_actions(g: Any, jira: Any, host: str | None, totals: Counter) -> list[dict]:
-    from ..jira.client import get_issue
+    from _shared.io.sinks.jira.client import get_issue
     out: list[dict] = []
     ea = g.epic_action
     totals[ea.kind] += 1

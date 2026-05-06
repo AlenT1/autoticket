@@ -11,7 +11,7 @@ zero matches.
 
 ---
 
-## ▶ Current position — stopped at end of commit 5
+## ▶ Current position — stopped at end of commit 6
 
 Phase 1 (cherry-picks from `main`) landed at `ba0b72d` and was published
 to `autoticket/scope/final-tool-abstract`. Phase 2 work happens on a
@@ -37,11 +37,13 @@ and c5 are now done. Net result post-c5:
 - Cache save gate untouched: `if use_cache and apply and not capture_path and not report.errors: cache.save(...)`.
 - 415 offline tests pass post-c5 (was 398 post-c4, +17 c5-specific apply-path tests).
 
-**Next up:** [commit 6](#commit-6--delete-the-drive-shim) — delete
-`src/jira_task_agent/jira/{client,project_tree,__init__}.py` (re-export
-shims) and repoint any remaining `from .jira.client import …` (notably
-`run_plan_md.py`'s `get_issue` reads + `_verify_gate`'s `jira: JiraClient`
-type) to `_shared.io.sinks.jira.client`.
+**Next up:** [commit 7](#commit-7--f2j-cli--delete-legacy-file_to_jirajira) —
+**Sharon's body**. Repoint `src/file_to_jira/cli.py`'s `_build_jira_client_for_cli`
+at `_shared.io.sinks.jira.client` (`JiraClient.from_config(...)`), port the
+field-discovery surface (`FieldInfo`, `build_field_map`, etc.) into
+`src/_shared/io/sinks/jira/field_discovery.py`, migrate
+`build_issue_payload` next to `src/file_to_jira/upload.py`, then delete
+the legacy `src/file_to_jira/jira/` package (1,353 LOC).
 
 For everything a fresh dev needs to pick this up cold (env setup, gotchas,
 locked-in sub-decisions, exact starting line numbers for c4) see the
@@ -193,12 +195,27 @@ bearer + Cloud basic) is ported to the shared client to unblock item 3.
   deferred to end-of-Phase-2 per the test-efficiency rule (one cold
   pass at the end, not per-commit).
 
-### Commit 6 — Delete the drive shim
+### Commit 6 — Delete the drive shim ✅
 
-- [ ] Delete `src/jira_task_agent/jira/{client,project_tree,__init__}.py`.
-- [ ] Re-point any remaining `from .jira.client import …` to
-  `_shared.io.sinks.jira.client`.
-- [ ] Gate: `uv run pytest tests/jira_task_agent -x` + one live smoke.
+- [x] Deleted `src/jira_task_agent/jira/{client,project_tree,__init__}.py`
+  and the empty `src/jira_task_agent/jira/` directory.
+- [x] Repointed every remaining `from jira_task_agent.jira.client import …`
+  / `from .jira.client import …` / `from ..jira.client import …` to
+  `_shared.io.sinks.jira.client` (and `project_tree`):
+  - `src/jira_task_agent/runner.py` (1 line)
+  - `src/jira_task_agent/pipeline/run_plan_md.py` (4 lazy imports of `get_issue` + 1 `JiraClient` type)
+  - 6 test files (`conftest.py`, `test_helpers.py`, 4 live tests)
+  - 4 scripts (`list_project_tree.py`, `list_epic_tree.py`, `list_epics.py`, `smoke_jira_write.py`)
+  - Docstring on `scripts/list_project_tree.py` updated.
+- [x] **7 new c6 contract tests** in
+  `tests/jira_task_agent/test_drive_shim_removed.py` enforcing: drive
+  shim package + module imports raise `ModuleNotFoundError`;
+  `runner.JiraClient is _shared.JiraClient` (identity); runner has no
+  top-level `get_issue` re-export; `run_plan_md.py` lazy-imports
+  `get_issue` from `_shared`.
+- [x] Gate: full offline at 422 (was 415 post-refactor, +7 new contract
+  tests). Live re-smoke deferred to end-of-Phase-2 per the test-efficiency
+  rule.
 
 ### Commit 7 — f2j CLI + delete legacy `file_to_jira/jira/`
 

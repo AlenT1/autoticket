@@ -30,7 +30,7 @@ from pathlib import Path
 import pytest
 from dotenv import load_dotenv
 
-from jira_task_agent.jira.client import JiraClient
+from _shared.io.sinks.jira.client import JiraClient
 from jira_task_agent.pipeline.run_plan_md import (
     build_run_plan_dict,
     render_run_plan_md,

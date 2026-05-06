@@ -24,8 +24,8 @@ from dotenv import load_dotenv
 
 from jira_task_agent.cache import Cache, file_content_sha
 from jira_task_agent.drive.client import DriveFile
-from jira_task_agent.jira.client import JiraClient
-from jira_task_agent.jira.project_tree import fetch_project_tree
+from _shared.io.sinks.jira.client import JiraClient
+from _shared.io.sinks.jira.project_tree import fetch_project_tree
 from jira_task_agent.pipeline import file_match, matcher as matcher_mod
 from jira_task_agent.pipeline.classifier import ClassifyResult
 from jira_task_agent.pipeline.extractor import MultiExtractionResult

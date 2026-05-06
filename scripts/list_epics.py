@@ -19,7 +19,7 @@ import sys
 
 from dotenv import load_dotenv
 
-from jira_task_agent.jira.client import JiraClient, list_epics
+from _shared.io.sinks.jira.client import JiraClient, list_epics
 
 
 def main(argv: list[str] | None = None) -> int:
