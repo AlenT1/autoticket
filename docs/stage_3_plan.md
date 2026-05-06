@@ -11,7 +11,7 @@ zero matches.
 
 ---
 
-## ▶ Current position — stopped at end of commit 7 (port + repoint; legacy still alive for c8)
+## ▶ Current position — stopped at end of c8.a (build_issue_payload ported; legacy still alive)
 
 Phase 1 (cherry-picks from `main`) landed at `ba0b72d` and was published
 to `autoticket/scope/final-tool-abstract`. Phase 2 work happens on a
@@ -255,7 +255,28 @@ keeps the offline gate green at every commit boundary.
 - [x] Gate: full offline at 433 (was 422 post-c6, +7 field_discovery + 4 cli_repoint).
   `build_issue_payload` migration deferred to c8 alongside the test moves.
 
-### Commit 8 — Migrate `tests/file_to_jira/test_jira.py` (21 tests)
+### Commit 8 — Migrate `tests/file_to_jira/test_jira.py` (21 tests) + delete legacy package
+
+**Split into 3 sub-commits** so each step ships with tests + green offline gate:
+
+  - **c8.a — port `build_issue_payload` to new home + payload tests** ✅
+    - New: `src/file_to_jira/upload_payload.py` containing `build_issue_payload`
+      + private composers (`_compose_description` / `_compose_labels` /
+      `_compose_components` / `_resolve_assignee` / `_apply_epic_link` /
+      `_apply_custom_fields`) + `markdown_to_jira_wiki` helper.
+    - Legacy `src/file_to_jira/jira/uploader.py` stays in place (its
+      `build_issue_payload` and helpers continue to serve `test_jira.py`
+      until c8.c deletes the package).
+    - New: `tests/file_to_jira/test_upload_payload.py` with 7 tests:
+      payload happy path with routed component, component dropping when
+      not in project's valid set (replaces the previously-deselected
+      legacy test), description truncation, external_id customfield
+      present + absent, markdown→wiki heading/bullet/inline conversion,
+      fenced code block preservation.
+    - Gate: full offline at 440 (was 433 post-c7, +7 c8.a).
+  - **c8.b — migrate the 7 client/whoami tests** (next)
+  - **c8.c — verify drops + delete legacy package + delete `test_jira.py`** (final)
+
 
 | Old test | New home | Strategy gap filled? |
 |---|---|---|
