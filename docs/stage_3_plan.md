@@ -11,7 +11,7 @@ zero matches.
 
 ---
 
-## ▶ Current position — stopped at end of commit 6
+## ▶ Current position — stopped at end of commit 7 (port + repoint; legacy still alive for c8)
 
 Phase 1 (cherry-picks from `main`) landed at `ba0b72d` and was published
 to `autoticket/scope/final-tool-abstract`. Phase 2 work happens on a
@@ -37,13 +37,20 @@ and c5 are now done. Net result post-c5:
 - Cache save gate untouched: `if use_cache and apply and not capture_path and not report.errors: cache.save(...)`.
 - 415 offline tests pass post-c5 (was 398 post-c4, +17 c5-specific apply-path tests).
 
-**Next up:** [commit 7](#commit-7--f2j-cli--delete-legacy-file_to_jirajira) —
-**Sharon's body**. Repoint `src/file_to_jira/cli.py`'s `_build_jira_client_for_cli`
-at `_shared.io.sinks.jira.client` (`JiraClient.from_config(...)`), port the
-field-discovery surface (`FieldInfo`, `build_field_map`, etc.) into
-`src/_shared/io/sinks/jira/field_discovery.py`, migrate
-`build_issue_payload` next to `src/file_to_jira/upload.py`, then delete
-the legacy `src/file_to_jira/jira/` package (1,353 LOC).
+**Next up:** [commit 8](#commit-8--migrate-testsfile_to_jiratest_jirapy-21-tests) —
+migrate the 21 tests in `tests/file_to_jira/test_jira.py` to their new
+homes (`test_jira_client.py` for shared-client tests, `test_jira_field_discovery.py`
+already grew in c7, payload tests to a new `test_upload_payload.py`,
+strategy gap-fillers to `test_jira_sink.py`), delete `test_jira.py`,
+**then delete the legacy `src/file_to_jira/jira/` package** (1,353 LOC) —
+its only remaining caller is `test_jira.py`, which c8 removes.
+
+**Note on c7 split:** the original Stage 3 plan called for c7 to delete
+the legacy package in the same commit. Per the
+"all changes need to be tested" rule and the desire for each commit to
+keep the offline gate green, c7 was scoped to **port new code + repoint
+cli.py**, leaving the legacy package alive so `test_jira.py` still
+passes. c8 migrates tests, then deletes the legacy package.
 
 For everything a fresh dev needs to pick this up cold (env setup, gotchas,
 locked-in sub-decisions, exact starting line numbers for c4) see the
@@ -217,24 +224,36 @@ bearer + Cloud basic) is ported to the shared client to unblock item 3.
   tests). Live re-smoke deferred to end-of-Phase-2 per the test-efficiency
   rule.
 
-### Commit 7 — f2j CLI + delete legacy `file_to_jira/jira/`
+### Commit 7 — f2j CLI + port field_discovery to `_shared` ✅
 
-- [ ] Modify [src/file_to_jira/cli.py](../src/file_to_jira/cli.py) lines 732,
-  752, 844 — repoint at `_shared.io.sinks.jira.client`. Switch
-  `_build_jira_client_for_cli` to `JiraClient.from_config(...)`.
-- [ ] New: `src/_shared/io/sinks/jira/field_discovery.py` — port `FieldInfo`,
-  `build_field_map`, `discover_create_meta`, `discover_fields_from_issue`.
-- [ ] Migrate `build_issue_payload` from
-  `src/file_to_jira/jira/uploader.py` to alongside f2j's `upload.py`.
-- [ ] Delete `src/file_to_jira/jira/{client,field_map,uploader,user_resolver,__init__}.py`
-  (1,353 LOC removed).
-- [ ] Smoke gate:
-  ```powershell
-  uv run f2j jira whoami
-  uv run f2j jira fields --from-issue CENTPM-1253
-  uv run f2j jira fields --project CENTPM
-  uv run f2j upload state.json --only <id> --dry-run
-  ```
+**Split note**: the originally-planned "delete legacy package" step
+moves to c8, after `tests/file_to_jira/test_jira.py` is migrated. This
+keeps the offline gate green at every commit boundary.
+
+- [x] New: `src/_shared/io/sinks/jira/field_discovery.py` — ports
+  `FieldInfo`, `FieldMap`, `build_field_map`, `discover_create_meta`,
+  `discover_fields_from_issue` from the legacy
+  `file_to_jira/jira/field_map.py`. Calls go through the shared
+  `JiraClient.get(path)` directly instead of `client._client.get(...)`
+  (the legacy was wrapping atlassian-python-api).
+- [x] `src/_shared/io/sinks/jira/__init__.py` exports the new symbols.
+- [x] Modify [src/file_to_jira/cli.py](../src/file_to_jira/cli.py):
+  - `_build_jira_client_for_cli` → uses `JiraClient.from_config(url=…, pat=…, …)`
+    from `_shared.io.sinks.jira`.
+  - `_discover_fields_or_exit` → imports `discover_create_meta` /
+    `discover_fields_from_issue` from `_shared`.
+  - `jira_whoami` → uses `JiraClient.from_config(...)` from `_shared`.
+- [x] **11 new offline tests** spread across two files:
+  - `tests/_shared/io/sinks/test_jira_field_discovery.py` (7 tests):
+    createmeta discovery, issue-mode discovery (with global-catalog
+    merge + priority allowed_values surface), tolerant fallback when
+    `/field` errors, `build_field_map` resolution + missing flags.
+  - `tests/file_to_jira/test_cli_jira_repoint.py` (4 contract tests):
+    cli module load doesn't pull in legacy package; build_jira_client
+    constructs `_shared.JiraClient`; `_discover_fields_or_exit` and
+    `jira_whoami` source-text grep for the canonical `_shared` import.
+- [x] Gate: full offline at 433 (was 422 post-c6, +7 field_discovery + 4 cli_repoint).
+  `build_issue_payload` migration deferred to c8 alongside the test moves.
 
 ### Commit 8 — Migrate `tests/file_to_jira/test_jira.py` (21 tests)
 

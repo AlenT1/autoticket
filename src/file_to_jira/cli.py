@@ -729,7 +729,7 @@ def _build_jira_client_for_cli(cfg: AppConfig):
     """Build a JiraClient for CLI commands; print + raise typer.Exit on misconfig."""
     import os
 
-    from .jira import JiraClient
+    from _shared.io.sinks.jira import JiraClient
 
     if not cfg.jira.url:
         err_console.print("[red]jira.url is not configured.[/red]")
@@ -738,8 +738,8 @@ def _build_jira_client_for_cli(cfg: AppConfig):
     if not pat:
         err_console.print("[red]JIRA_PAT env var is not set.[/red]")
         raise typer.Exit(code=1)
-    return JiraClient(
-        cfg.jira.url,
+    return JiraClient.from_config(
+        url=cfg.jira.url,
         pat=pat,
         auth_mode=cfg.jira.auth_mode,
         user_email=cfg.jira.user_email,
@@ -749,7 +749,7 @@ def _build_jira_client_for_cli(cfg: AppConfig):
 
 def _discover_fields_or_exit(client, *, project, issue_type, from_issue):
     """Run the chosen discovery path. Returns (fields, source_label)."""
-    from .jira import discover_create_meta, discover_fields_from_issue
+    from _shared.io.sinks.jira import discover_create_meta, discover_fields_from_issue
 
     try:
         if from_issue:
@@ -841,7 +841,7 @@ def jira_whoami() -> None:
     """Verify Jira PAT works."""
     import os
 
-    from .jira import JiraClient
+    from _shared.io.sinks.jira import JiraClient
 
     configure_logging()
     cfg = load_config()
@@ -853,8 +853,8 @@ def jira_whoami() -> None:
         err_console.print("[red]JIRA_PAT env var is not set.[/red]")
         raise typer.Exit(code=1)
 
-    client = JiraClient(
-        cfg.jira.url,
+    client = JiraClient.from_config(
+        url=cfg.jira.url,
         pat=pat,
         auth_mode=cfg.jira.auth_mode,
         user_email=cfg.jira.user_email,
