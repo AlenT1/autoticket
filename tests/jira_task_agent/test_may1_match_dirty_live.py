@@ -36,7 +36,7 @@ from jira_task_agent.pipeline.file_match import match_with_cache
 pytestmark = [pytest.mark.live]
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 GDRIVE_DIR = ROOT / "data" / "gdrive_files"
 
 

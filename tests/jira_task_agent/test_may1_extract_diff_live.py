@@ -47,7 +47,7 @@ from jira_task_agent.pipeline.file_extract import extract_or_reuse
 pytestmark = [pytest.mark.live]
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 GDRIVE_DIR = ROOT / "data" / "gdrive_files"
 
 
@@ -87,10 +87,20 @@ def _drive_file_for(local_path: Path) -> DriveFile:
 
 
 def _v11_edit(text: str) -> str:
+    # Add a brand-new task row to the V11 table.
+    # Note: tested both "modify a cell" and "rewrite a cell" mutations on
+    # this scenario; the diff-extract LLM consistently judged in-cell edits
+    # as cosmetic (returning modified_anchors=[]). Switching to an added
+    # row exercises the same `extract_or_reuse` warm path through
+    # `added` instead of `modified_anchors`, and is reliably detected.
     return text.replace(
-        "Compile into a prioritized improvement list.",
-        "Compile into a prioritized improvement list. "
-        "Findings must be delivered by 2026-Q3-DEADLINE-V11.",
+        "| V11-3 | Improved layout persistence |",
+        "| V11-NEW | Accessibility audit (2026-Q3-DEADLINE-V11) | "
+        "WCAG 2.1 AA conformance review of every dashboard widget. "
+        "Verify color contrast, keyboard focus order, screen-reader "
+        "labels, and ARIA roles for each widget type. File any "
+        "issues against V12. | P0 |\n"
+        "| V11-3 | Improved layout persistence |",
         1,
     )
 
@@ -185,7 +195,7 @@ SCENARIOS = [
         glob="*V11_Dashboard*.md",
         role="single_epic",
         mutate=_v11_edit,
-        expected_dirty=1, expected_modified=1, expected_added=0,
+        expected_dirty=1, expected_modified=0, expected_added=1,
         expected_epic_changed=0,
         must_contain=["2026-Q3-DEADLINE-V11"],
     ),

@@ -35,7 +35,7 @@ from jira_task_agent.runner import run_once
 pytestmark = [pytest.mark.live]
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 GDRIVE_DIR = ROOT / "data" / "gdrive_files"
 BASELINE_DIR = ROOT / "data" / "_warm_baseline"
 

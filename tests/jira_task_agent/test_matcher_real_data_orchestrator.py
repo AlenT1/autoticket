@@ -33,7 +33,7 @@ from jira_task_agent.pipeline.matcher import run_matcher
 pytestmark = [pytest.mark.live]
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 
 
 EXPECTED_EPIC_PAIRS: dict[str, str] = {

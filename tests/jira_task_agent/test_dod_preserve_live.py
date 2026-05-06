@@ -73,7 +73,7 @@ def _extract_checked_keys(body: str) -> list[str]:
 
 pytestmark = [pytest.mark.live]
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 LOCAL_DIR = ROOT / "data" / "local_files"
 LOCAL_FILE_NAME = "jira_task_agent_test.md"
 LOCAL_FILE_PATH = LOCAL_DIR / LOCAL_FILE_NAME

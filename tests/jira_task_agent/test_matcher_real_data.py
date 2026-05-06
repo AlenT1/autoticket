@@ -31,7 +31,7 @@ from jira_task_agent.pipeline.matcher import MatchInput, match
 pytestmark = [pytest.mark.live]
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 
 
 # ----------------------------------------------------------------------

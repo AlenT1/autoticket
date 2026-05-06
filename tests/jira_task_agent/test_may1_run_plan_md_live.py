@@ -35,7 +35,7 @@ from .test_warm_scenarios_live import (
 
 pytestmark = [pytest.mark.live]
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 OUT_MD = ROOT / "data" / "run_plan_may1.md"
 OUT_JSON = ROOT / "data" / "run_plan_may1.json"
 
