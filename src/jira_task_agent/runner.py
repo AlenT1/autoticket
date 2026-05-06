@@ -30,7 +30,7 @@ from .cache import Cache, file_content_sha
 from .drive.client import (
     DriveFile, build_service, download_file, list_folder, list_local_folder,
 )
-from .jira.client import JiraClient
+from .jira.client import JiraClient, get_issue
 from .jira.project_tree import fetch_project_tree
 from .pipeline.classifier import ClassifyResult, classify_file
 from .pipeline.commenter import format_update_comment
@@ -38,6 +38,7 @@ from .pipeline.context_bundler import bundle_root_context
 from .pipeline.dedupe import find_duplicate_copies
 from .pipeline.dirty_filter import filter_dirty
 from .pipeline.file_extract import extract_or_reuse
+from .pipeline.extractor import merge_with_live
 from .pipeline.file_match import match_with_cache
 from .pipeline.reconciler import (
     Action,
@@ -347,29 +348,21 @@ def run_once(
 
     for plan in plans:
         report.plans.append(plan)
-        for a in plan.actions:
-            report.bump_action(a.kind)
 
     # 10. apply (or report-only) ------------------------------------------
     if apply and verify_before_apply:
-        from .pipeline.run_plan_md import build_run_plan_dict, render_run_plan_md
-        plan_dict = build_run_plan_dict(
-            report, jira=jira, mode="apply (verify)", source=source,
+        verify_outcome = _verify_gate(
+            report, plans, jira=jira, source=source,
+            verify_md_path=verify_md_path,
         )
-        md_path = verify_md_path or Path("data") / "run_plan.md"
-        md_path.parent.mkdir(parents=True, exist_ok=True)
-        md_path.write_text(render_run_plan_md(plan_dict), encoding="utf-8")
-        print(f"\nRun plan written to: {md_path}", file=sys.stderr)
-        print(
-            f"  totals: {plan_dict['totals']}", file=sys.stderr,
-        )
-        try:
-            input("Review the plan above, then press Enter to apply (Ctrl-C to abort): ")
-        except (KeyboardInterrupt, EOFError):
-            print("\n[verify] aborted before apply; no Jira writes issued.",
-                  file=sys.stderr)
+        if verify_outcome is None:
             report.finished_at = datetime.now(tz=timezone.utc)
             return report
+
+    # Count actions AFTER verify so skipped_by_user appears correctly.
+    for plan in plans:
+        for a in plan.actions:
+            report.bump_action(a.kind)
 
     if apply:
         for plan in plans:
@@ -448,6 +441,125 @@ def _enable_capture(jira: JiraClient, sink: list[dict]) -> None:
     jira.put = fake_put  # type: ignore[method-assign]
 
 
+_SKIPPED_BY_USER = "skipped_by_user"
+_VERIFY_HELP = (
+    "  ENTER         approve all\n"
+    "  e.g. 1,3,7    approve only those numbers\n"
+    "  x             cancel everything"
+)
+
+
+def _verify_gate(
+    report: "RunReport",
+    plans: list[ReconcilePlan],
+    *,
+    jira: JiraClient,
+    source: str,
+    verify_md_path: Path | None,
+) -> bool | None:
+    """Render the run plan, prompt the user, mutate `plans` in place
+    to drop non-approved actions. Returns True if any writes should
+    proceed, None if the run was cancelled (caller should bail)."""
+    from .pipeline.run_plan_md import (
+        WRITEABLE_KINDS, build_run_plan_dict, render_run_plan_md,
+    )
+
+    plan_dict = build_run_plan_dict(
+        report, jira=jira, mode="apply (verify)", source=source,
+    )
+    md_path = verify_md_path or Path("data") / "run_plan.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(render_run_plan_md(plan_dict), encoding="utf-8")
+
+    n_actions = sum(
+        plan_dict["totals"].get(k, 0) for k in WRITEABLE_KINDS
+    )
+    if n_actions == 0:
+        print(
+            f"\nRun plan written to: {md_path}\nNo writeable actions; "
+            "nothing to apply.", file=sys.stderr,
+        )
+        return None
+
+    print(
+        f"\nReview the plan in {md_path} ({n_actions} change(s) proposed).\n"
+        f"{_VERIFY_HELP}",
+        file=sys.stderr,
+    )
+    try:
+        ans = input("> ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\n[verify] aborted; no Jira writes.", file=sys.stderr)
+        return None
+
+    approved = _parse_approved(ans, n_actions)
+    if approved is None:
+        print("[verify] cancelled by user.", file=sys.stderr)
+        return None
+    if approved == "all":
+        return True
+
+    if not approved:
+        print("[verify] no valid numbers parsed; cancelled.", file=sys.stderr)
+        return None
+
+    skipped = _mark_unapproved_as_skipped(plans, approved, WRITEABLE_KINDS)
+    print(
+        f"[verify] approved {sorted(approved)}; "
+        f"skipping {skipped} other action(s).",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _parse_approved(
+    ans: str, n_actions: int,
+) -> set[int] | str | None:
+    """Returns 'all' (Enter), None (cancel), or a set of approved
+    1-based indices. Out-of-range numbers are dropped silently."""
+    if ans == "":
+        return "all"
+    if ans.lower() == "x":
+        return None
+    try:
+        nums = {int(x.strip()) for x in ans.split(",") if x.strip()}
+    except ValueError:
+        return None
+    return {i for i in nums if 1 <= i <= n_actions}
+
+
+def _mark_unapproved_as_skipped(
+    plans: list[ReconcilePlan],
+    approved: set[int],
+    writeable_kinds: frozenset[str],
+) -> int:
+    """Walk plans in apply order; for each writeable action whose 1-based
+    index is not in `approved`, set its kind to a sentinel that the apply
+    handlers don't recognise (so no write fires). Returns the count
+    skipped."""
+    state = {"idx": 0, "skipped": 0}
+    for plan in plans:
+        for g in plan.groups:
+            _maybe_skip(g.epic_action, approved, writeable_kinds, state)
+            for ta in g.task_actions:
+                _maybe_skip(ta, approved, writeable_kinds, state)
+    return state["skipped"]
+
+
+def _maybe_skip(
+    action: Action,
+    approved: set[int],
+    writeable_kinds: frozenset[str],
+    state: dict,
+) -> None:
+    if action.kind not in writeable_kinds:
+        return
+    state["idx"] += 1
+    if state["idx"] not in approved:
+        action.kind = _SKIPPED_BY_USER
+        state["skipped"] += 1
+
+
 # ----------------------------------------------------------------------
 # apply
 # ----------------------------------------------------------------------
@@ -502,7 +614,13 @@ def _apply_epic_action(
         )
         return created.get("key")
     if a.kind == "update_epic":
-        fields: dict = {"summary": a.summary, "description": a.description}
+        live = get_issue(a.target_key, client=jira) or {}
+        fields: dict = {
+            "summary": a.summary,
+            "description": merge_with_live(
+                a.description or "", live.get("description") or "",
+            ),
+        }
         if a.assignee_username:
             fields["assignee"] = {"name": a.assignee_username}
         jira.update_issue(a.target_key, fields)
@@ -535,7 +653,13 @@ def _apply_task_action(
         )
         return
     if a.kind == "update_task":
-        fields: dict = {"summary": a.summary, "description": a.description}
+        live = get_issue(a.target_key, client=jira) or {}
+        fields: dict = {
+            "summary": a.summary,
+            "description": merge_with_live(
+                a.description or "", live.get("description") or "",
+            ),
+        }
         if a.assignee_username:
             fields["assignee"] = {"name": a.assignee_username}
         jira.update_issue(a.target_key, fields)
@@ -545,7 +669,6 @@ def _apply_task_action(
 
 
 def _comment_for(action: Action, *, drive_file: DriveFile, jira: JiraClient) -> str:
-    from .jira.client import get_issue
     live = get_issue(action.target_key, client=jira)
     return format_update_comment(
         assignee_username=live.get("assignee_username"),
