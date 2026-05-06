@@ -11,7 +11,7 @@ zero matches.
 
 ---
 
-## ▶ Current position — stopped at end of c8.a (build_issue_payload ported; legacy still alive)
+## ▶ Current position — stopped at end of c8.b (client tests migrated; legacy still alive)
 
 Phase 1 (cherry-picks from `main`) landed at `ba0b72d` and was published
 to `autoticket/scope/final-tool-abstract`. Phase 2 work happens on a
@@ -274,7 +274,22 @@ keeps the offline gate green at every commit boundary.
       present + absent, markdown→wiki heading/bullet/inline conversion,
       fenced code block preservation.
     - Gate: full offline at 440 (was 433 post-c7, +7 c8.a).
-  - **c8.b — migrate the 7 client/whoami tests** (next)
+  - **c8.b — migrate the 7 client/whoami tests** ✅
+    - New: `tests/_shared/io/sinks/test_jira_client.py` with 10 tests
+      adapted from the legacy `test_jira.py` client/auth/attachment tests:
+      whoami extracts username/displayName/email; whoami falls back to
+      accountId when name is absent (Cloud); create_issue POSTs to
+      `/issue` and returns the key; browse_url format + scheme
+      normalization; basic auth requires user_email; basic auth header
+      builds correctly with email; unknown auth_mode raises;
+      download_attachment caps at max_bytes + writes to dest.
+    - Tests use a `_FakeResponse` / `_FakeStreamingResponse` pattern
+      with `monkeypatch.setattr(client_module.requests, "get"/"post", …)`
+      since the shared client uses `requests` directly (not a wrapped
+      atlassian-python-api object as the legacy client did).
+    - `tests/file_to_jira/test_jira.py` still imports from the legacy
+      package; c8.c deletes both the legacy and the test file.
+    - Gate: full offline at 450 (was 440 post-c8.a, +10 c8.b).
   - **c8.c — verify drops + delete legacy package + delete `test_jira.py`** (final)
 
 
