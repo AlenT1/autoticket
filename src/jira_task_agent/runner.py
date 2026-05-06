@@ -38,7 +38,7 @@ from .pipeline.context_bundler import bundle_root_context
 from .pipeline.dedupe import find_duplicate_copies
 from .pipeline.dirty_filter import filter_dirty
 from .pipeline.file_extract import extract_or_reuse
-from .pipeline.extractor import merge_with_live
+from .pipeline.extractor import finalize_body
 from .pipeline.file_match import match_with_cache
 from .pipeline.reconciler import (
     Action,
@@ -400,8 +400,12 @@ def run_once(
             len(captured_writes), capture_path,
         )
 
-    # Persist cache (best-effort; failures don't fail the run).
-    if use_cache:
+    # Persist cache only when writes actually landed in Jira: same gate
+    # as state.json. Capture-mode runs and dry-runs intentionally don't
+    # save — saving them would lie about Jira state and cause `create_*`
+    # actions to be silently skipped on the next warm run (Tier 2 hit
+    # with dirty=∅) while Jira has no record of the issue.
+    if use_cache and apply and not capture_path and not report.errors:
         try:
             cache.save(cache_path)
             logger.info(
@@ -410,6 +414,12 @@ def run_once(
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("cache: save failed: %s", e)
+    elif use_cache:
+        logger.info(
+            "cache: NOT saved (apply=%s capture=%s errors=%d) — "
+            "preserves cache/Jira consistency",
+            apply, bool(capture_path), len(report.errors),
+        )
     return report
 
 
@@ -617,7 +627,7 @@ def _apply_epic_action(
         live = get_issue(a.target_key, client=jira) or {}
         fields: dict = {
             "summary": a.summary,
-            "description": merge_with_live(
+            "description": finalize_body(
                 a.description or "", live.get("description") or "",
             ),
         }
@@ -656,7 +666,7 @@ def _apply_task_action(
         live = get_issue(a.target_key, client=jira) or {}
         fields: dict = {
             "summary": a.summary,
-            "description": merge_with_live(
+            "description": finalize_body(
                 a.description or "", live.get("description") or "",
             ),
         }

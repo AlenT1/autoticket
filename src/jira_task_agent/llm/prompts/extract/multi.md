@@ -69,64 +69,75 @@ E. Each child task description
        <one or two paragraph plain-language explanation of what + why,
         drawing on the task line and any relevant root context>
 
-       ### Implementation hints     (OMIT this section if no code blocks)
-       <For every fenced code block (```…```) in the source for this task,
-        copy it VERBATIM here, preserving the language tag. No commentary.>
+       ### Goal
+       <1-3 sentences describing the observable end-state when this
+        task is done. Present-state language. No process verbs.>
 
-       ### Acceptance criteria
-       - <observable outcome 1>
-       - <observable outcome 2>
+       ### Implementation steps
+       1. <Imperative action.> File: `path/to/file.py` (or other
+          location). Done when: <one-line in-step verify>.
+          ```<lang>
+          <code lifted VERBATIM from the source task if relevant;
+          omit the code block when the source has none for this step>
+          ```
+       2. <Next action.> File: ... Done when: ...
+       3. ...
 
        ### Definition of Done
-       - [ ] <process gate 1>
-       - [ ] <process gate 2>
-       - [ ] <process gate 3>
+       - [ ] All implementation steps completed and verified
+       - [ ] Code merged to <release branch / main / etc.>
+       - [ ] Tests added or updated and passing
+       - [ ] <task-specific shipping gate>
+       - [ ] <optional second task-specific gate>
 
        ### Source
        - Doc: {task_file_name}
        - Section: <the section heading this task belongs to>
        - Last edited by: {last_modifying_user_name}
 
-   - "### Acceptance criteria" — observable outcomes only.
-     Each bullet describes a product/service end-state a reviewer can
-     observe directly: a specific UI state, an API response shape, a
-     metric on a dashboard, a log line, a config value in production.
-     Use present-state language ("X is hidden", "Y returns 404",
-     "Z dashboard shows the metric"). DO NOT use the words "verified",
-     "documented", "reviewed", "checked", "exercised", "validated" —
-     those describe process, not outcome. 1-3 bullets, each
-     independently observable.
+   - "### Goal" — single observable outcome statement. 1-3 sentences.
+     The "stop when this is true" criterion. No checkboxes.
 
-   - "### Definition of Done" — process gates only, never restate AC.
-     Each checkbox is a step the team must complete before closing
-     the ticket: code merged, tests added, peer review, manual QA on
-     staging, runbook / release-notes / comms updated, owner sign-off.
-     DO NOT restate the acceptance criteria in different words. If a
-     DoD bullet would be redundant given the AC, drop it. 3-5 items,
-     mixing universal gates (review / tests) with task-specific gates
-     (e.g. "alerting.yaml committed", "DB migration applied to
-     staging"). The DoD MUST contain at least one task-specific item
-     beyond "code merged" / "tests pass".
+   - "### Implementation steps" — ordered, agent-executable plan.
+     Each numbered step MUST contain: an imperative action, a
+     concrete location (file path, config key, dashboard, etc.),
+     and a "Done when:" inline result. If the source task has fenced
+     code blocks (```…```) or shell commands, lift them VERBATIM into
+     the relevant step (preserving the language tag). DO NOT
+     paraphrase code into prose. Step count: 1 for trivial tasks,
+     up to 8-10 for complex multi-phase work.
+
+   - "### Definition of Done" — shipping gate checklist. 3-5 items.
+     The first item MUST be `[ ] All implementation steps completed
+     and verified`. Then universal gates (`code merged`, `tests`,
+     `reviewed`) and 1-2 task-specific shipping gates.
 
    - Contrast example (task: "Hide unsupported schedule button on
      Flows page"):
 
-         ### Acceptance criteria
-         - The Flows page no longer renders the schedule button in
-           the May-1 release branch.
-         - Ad-hoc flow execution still works from the Flows page.
+         ### Goal
+         The Flows page no longer renders the schedule button on the
+         May-1 release branch, and ad-hoc execution still works.
+
+         ### Implementation steps
+         1. Hide the schedule control. File: `src/flows/page.tsx`.
+            Done when: the schedule button is absent from the
+            rendered DOM in production.
+            ```tsx
+            {flags.enableScheduling && <ScheduleButton/>}
+            ```
+         2. Confirm ad-hoc execution path is untouched. File:
+            `src/flows/exec.ts`. Done when: an ad-hoc run still
+            completes successfully.
 
          ### Definition of Done
+         - [ ] All implementation steps completed and verified
          - [ ] Frontend PR merged to release branch
-         - [ ] Manual smoke on staging confirmed
-         - [ ] Release notes updated to mention the temporary removal
-         - [ ] Tech-lead sign-off
+         - [ ] Tests cover the hidden-button case
+         - [ ] Release notes mention the temporary removal
 
-     Note: the AC describes what someone will SEE; the DoD describes
-     what the team must DO. The two lists do not overlap.
-   - When the source task contains code (fenced blocks, shell commands,
-     config snippets), they MUST appear under "### Implementation hints"
-     verbatim. Do NOT summarize code into prose.
+     Note: Goal, Steps, and DoD do not overlap.
+
    - End the description with the marker line, exactly:
      <!-- managed-by:jira-task-agent v1 -->
 
@@ -147,6 +158,13 @@ H. Coverage
      (strikethrough + "DONE" annotation). Mention those briefly in the
      epic description's overview ("X already done by Y") so the audit
      trail is preserved.
+   - Only TOP-LEVEL bullets at the leftmost indent inside each section
+     become tasks. A top-level bullet's body may contain a numbered
+     list (`1.`, `2.`, `3.`) describing implementation steps for that
+     one task, or nested sub-bullets elaborating context. These nested
+     items are PART OF THE PARENT TASK'S BODY and MUST stay inside
+     that one task — they are never extracted as separate sibling
+     tasks under the same epic.
 
 I. Assignee (epic + each task)
    - Source documents typically have an "Owner" column in their task
