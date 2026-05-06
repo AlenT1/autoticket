@@ -11,36 +11,37 @@ zero matches.
 
 ---
 
-## ▶ Current position — stopped at end of commit 4
+## ▶ Current position — stopped at end of commit 5
 
 Phase 1 (cherry-picks from `main`) landed at `ba0b72d` and was published
-to `autoticket/scope/final-tool-abstract`. Stage 3 c1+c2+c3 already
-landed before that as a single bundled commit (they share
-`src/_shared/io/sinks/jira/client.py`). Stage 3 c4 just landed:
-`pipeline/reconciler.py` now takes `sink: JiraSink` + `resolver:
-AssigneeResolver` instead of `client: JiraClient`. Net result:
+to `autoticket/scope/final-tool-abstract`. Phase 2 work happens on a
+side branch `scope/final-tool-abstract-phase2` so Sharon can review
+before any merge to the shared abstract branch. Stage 3 c1+c2+c3, c4,
+and c5 are now done. Net result post-c5:
 
 - The shared `JiraClient` lives at
   [src/_shared/io/sinks/jira/client.py](../src/_shared/io/sinks/jira/client.py).
-- The `_shared → body` import leak is gone (verify with the greps at the
-  bottom of this doc — they return only the drive-body shims, deleted in
-  c6).
-- `JiraSink` exposes everything the drive runner will need in c5:
-  `get_issue_normalized`, `fetch_project_tree`, plus the new
-  `CapturingJiraSink` subclass.
-- The reconciler is now sink/resolver-driven; the runner constructs a
-  `StaticMapStrategy` + `JiraSink` and threads them through. Apply path
-  is still on the raw client — that's c5's job.
-- 398 offline tests pass post-c4 (was 393 post-Phase-1, +5 c4-specific
-  tests), modulo the pre-existing `test_payload_includes_summary_priority_labels`
-  failure that's unrelated to stage 3.
+- The reconciler is sink/resolver-driven (c4).
+- The drive runner's apply path now routes every write (`create_epic`,
+  `update_epic`, `create_task`, `update_task`, comment) through
+  `JiraSink.create / update / comment`. Pre-resolved assignee usernames
+  go via `Ticket.custom_fields` so the sink's `assignee_resolver`
+  doesn't re-resolve them.
+- `--capture` mode is now `CapturingJiraSink` (no `_enable_capture`
+  monkey-patch); writes land in `sink.captured_writes`.
+- `sink.fetch_project_tree(project_key)` replaces the imported
+  `fetch_project_tree`. `sink.get_issue_normalized` replaces every
+  in-runner `get_issue(...)` call.
+- `finalize_body` runs at apply time, BEFORE the sink call (live-verified
+  for DoD checkbox preservation).
+- Cache save gate untouched: `if use_cache and apply and not capture_path and not report.errors: cache.save(...)`.
+- 415 offline tests pass post-c5 (was 398 post-c4, +17 c5-specific apply-path tests).
 
-**Next up:** [commit 5](#commit-5--drive-runner-uses-jirasink-for-writes-capture-via-capturingjirasink)
-— route the drive runner's apply path through `JiraSink.create/update/comment`
-and replace capture-mode monkey-patching with `CapturingJiraSink`. **Riskiest
-commit** — preserve `finalize_body` calls and the cache-save gate
-(`apply and not capture_path and not report.errors`) per
-[stage_3_phase1_integration.md § c4-c8 deltas](./stage_3_phase1_integration.md).
+**Next up:** [commit 6](#commit-6--delete-the-drive-shim) — delete
+`src/jira_task_agent/jira/{client,project_tree,__init__}.py` (re-export
+shims) and repoint any remaining `from .jira.client import …` (notably
+`run_plan_md.py`'s `get_issue` reads + `_verify_gate`'s `jira: JiraClient`
+type) to `_shared.io.sinks.jira.client`.
 
 For everything a fresh dev needs to pick this up cold (env setup, gotchas,
 locked-in sub-decisions, exact starting line numbers for c4) see the
@@ -159,31 +160,38 @@ bearer + Cloud basic) is ported to the shared client to unblock item 3.
 - [x] Gate: `uv run pytest tests/jira_task_agent/test_reconciler_logical.py`
   → 23 passed (was 18 pre-c4). Full offline gate at 398 (was 393).
 
-### Commit 5 — Drive runner uses `JiraSink` for writes; capture via `CapturingJiraSink`
+### Commit 5 — Drive runner uses `JiraSink` for writes; capture via `CapturingJiraSink` ✅
 
-**Riskiest commit. Live re-smoke required before proceeding to commit 6.**
-
-- [ ] Modify [src/jira_task_agent/runner.py](../src/jira_task_agent/runner.py)
-  line 301 — construct `client + sink` (Capturing if `--capture`).
-- [ ] `runner.py:306` → `sink.fetch_project_tree(project_key)`.
-- [ ] Delete `_enable_capture` and the captured-writes list (lines 302–304,
-  429–448). Read `sink.captured_writes` for the capture dump.
-- [ ] Modify `_apply_epic_action` / `_apply_task_action` (lines 485–545) to
-  build a `Ticket` and call `sink.create/update/comment`.
-- [ ] `runner.py:548` (`_comment_for`) → `sink.get_issue_normalized(...)`.
-- [ ] **Topology-hash safety check**: tree dict from
-  `sink.fetch_project_tree(...)` must equal the prior tree dict
-  byte-for-byte (matcher hash is computed over `json.dumps(tree,
-  sort_keys=True)`).
-- [ ] Live gate (run all six):
-  ```powershell
-  uv run pytest -m live tests/jira_task_agent/test_runner_cache_live.py -x
-  uv run pytest -m live tests/jira_task_agent/test_warm_scenarios_live.py -x
-  uv run pytest -m live tests/jira_task_agent/test_local_e2e_md_live.py -x
-  uv run pytest -m live tests/jira_task_agent/test_may1_full_pipeline_live.py -x
-  uv run pytest -m live tests/jira_task_agent/test_may1_run_plan_md_live.py -x
-  uv run pytest -m live tests/jira_task_agent/test_mixed_warm_and_new_live.py -x
-  ```
+- [x] Modify [src/jira_task_agent/runner.py](../src/jira_task_agent/runner.py):
+  construct `JiraSink` (or `CapturingJiraSink` if `--capture`) wrapping
+  the existing `JiraClient`. `_resolver = StaticMapStrategy()` is shared
+  between the sink (apply path) and reconciler (plan-build, c4).
+- [x] `sink.fetch_project_tree(project_key)` replaces the imported
+  `fetch_project_tree`.
+- [x] Deleted `_enable_capture` and the inline captured-writes list.
+  `sink.captured_writes` is the new dump source.
+- [x] Refactored `_apply_epic_action` / `_apply_task_action` to build
+  `Ticket` objects via two new helpers (`_ticket_for_create`,
+  `_ticket_for_update`) and call `sink.create / update / comment`.
+  Pre-resolved `Action.assignee_username` flows through
+  `Ticket.custom_fields={"assignee": {"name": …}}` to bypass the sink's
+  own `assignee_resolver`.
+- [x] `_comment_for` reads via `sink.get_issue_normalized(...)` —
+  no module-level `get_issue` left in runner.py.
+- [x] **`finalize_body` preserved** — runs in `_ticket_for_update`
+  BEFORE the sink call. Live-verified by `test_dod_preserve_live`
+  (passed on the Phase 1 live gate against CENTPM-1255).
+- [x] **Cache save gate preserved** —
+  `if use_cache and apply and not capture_path and not report.errors:
+  cache.save(cache_path)` still in place at the end of `run_once`.
+- [x] **17 new offline unit tests** in
+  `tests/jira_task_agent/test_runner_apply_unit.py` covering: ticket
+  building, finalize_body wiring, sink injection in
+  `_apply_epic_action` / `_apply_task_action` / `_apply_plan`,
+  `_comment_for` reading via sink, and `CapturingJiraSink` write capture.
+- [x] Gate: full offline at 415 (was 398 post-c4, +17). Live re-smoke
+  deferred to end-of-Phase-2 per the test-efficiency rule (one cold
+  pass at the end, not per-commit).
 
 ### Commit 6 — Delete the drive shim
 

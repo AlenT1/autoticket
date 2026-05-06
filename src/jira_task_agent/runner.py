@@ -30,8 +30,10 @@ from .cache import Cache, file_content_sha
 from .drive.client import (
     DriveFile, build_service, download_file, list_folder, list_local_folder,
 )
-from .jira.client import JiraClient, get_issue
-from .jira.project_tree import fetch_project_tree
+from .jira.client import JiraClient
+from _shared.io.sinks import Ticket
+from _shared.io.sinks.jira import CapturingJiraSink, JiraSink
+from _shared.io.sinks.jira.strategies import StaticMapStrategy
 from .pipeline.classifier import ClassifyResult, classify_file
 from .pipeline.commenter import format_update_comment
 from .pipeline.context_bundler import bundle_root_context
@@ -300,11 +302,25 @@ def run_once(
 
     # 7. Fetch project tree from Jira (one paginated /search) -------------
     jira = JiraClient.from_env()
-    captured_writes: list[dict] = []
+    _resolver = StaticMapStrategy()
     if capture_path:
-        _enable_capture(jira, captured_writes)
+        sink: JiraSink = CapturingJiraSink(
+            client=jira,
+            project_key=project_key,
+            assignee_resolver=_resolver,
+            filter_components=False,
+        )
+        captured_writes: list[dict] = sink.captured_writes
+    else:
+        sink = JiraSink(
+            client=jira,
+            project_key=project_key,
+            assignee_resolver=_resolver,
+            filter_components=False,
+        )
+        captured_writes = []
     try:
-        project_tree = fetch_project_tree(jira, project_key)
+        project_tree = sink.fetch_project_tree(project_key)
         logger.info(
             "fetched project tree: %d epics, %d children",
             project_tree["epic_count"], project_tree["child_count"],
@@ -337,20 +353,11 @@ def run_once(
 
     # 9. Filter to dirty + build ReconcilePlans ---------------------------
     try:
-        from _shared.io.sinks.jira import JiraSink
-        from _shared.io.sinks.jira.strategies import StaticMapStrategy
-        _resolver = StaticMapStrategy()
-        _sink = JiraSink(
-            client=jira,
-            project_key=project_key,
-            assignee_resolver=_resolver,
-            filter_components=False,
-        )
         dirty_sections = filter_dirty(
             matcher_result, extractions, dirty_anchors_per_file,
         )
         plans = build_plans_from_dirty(
-            dirty_sections, sink=_sink, resolver=_resolver,
+            dirty_sections, sink=sink, resolver=_resolver,
         )
     except Exception as e:  # noqa: BLE001
         report.errors.append(f"build_plans failed: {e}")
@@ -382,8 +389,7 @@ def run_once(
                 continue
             try:
                 _apply_plan(
-                    plan, drive_file=f, jira=jira, project_key=project_key,
-                    target_epic=target_epic,
+                    plan, drive_file=f, sink=sink, target_epic=target_epic,
                 )
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"apply failed for {plan.file_name}: {e}")
@@ -435,31 +441,9 @@ def run_once(
 
 
 # ----------------------------------------------------------------------
-# capture mode: monkey-patch the JiraClient HTTP write methods so the
-# apply path runs without sending anything. Reads still go through.
+# verify gate: render data/run_plan.md and let the user approve / pick
+# a subset / cancel before any write fires.
 # ----------------------------------------------------------------------
-
-
-def _enable_capture(jira: JiraClient, sink: list[dict]) -> None:
-    counter = {"n": 0}
-
-    def fake_post(path: str, json_body: dict):
-        counter["n"] += 1
-        sink.append({"method": "POST", "path": path, "body": json_body})
-        if path == "/issue":
-            return {
-                "id": str(counter["n"]),
-                "key": f"CAPTURED-{counter['n']}",
-                "self": "(captured)",
-            }
-        return {}
-
-    def fake_put(path: str, json_body: dict) -> None:
-        counter["n"] += 1
-        sink.append({"method": "PUT", "path": path, "body": json_body})
-
-    jira.post = fake_post  # type: ignore[method-assign]
-    jira.put = fake_put  # type: ignore[method-assign]
 
 
 _SKIPPED_BY_USER = "skipped_by_user"
@@ -590,8 +574,7 @@ def _apply_plan(
     plan: ReconcilePlan,
     *,
     drive_file: DriveFile,
-    jira: JiraClient,
-    project_key: str,
+    sink: JiraSink,
     target_epic: str | None = None,
 ) -> None:
     """Walk each EpicGroup; epic action first, then its task actions."""
@@ -600,18 +583,14 @@ def _apply_plan(
             epic_key = target_epic
         else:
             epic_key = _apply_epic_action(
-                group.epic_action,
-                drive_file=drive_file,
-                jira=jira,
-                project_key=project_key,
+                group.epic_action, drive_file=drive_file, sink=sink,
             )
         for task_action in group.task_actions:
             _apply_task_action(
                 task_action,
                 epic_key=epic_key,
                 drive_file=drive_file,
-                jira=jira,
-                project_key=project_key,
+                sink=sink,
             )
 
 
@@ -619,33 +598,14 @@ def _apply_epic_action(
     a: Action,
     *,
     drive_file: DriveFile,
-    jira: JiraClient,
-    project_key: str,
+    sink: JiraSink,
 ) -> str | None:
     if a.kind == "create_epic":
-        extra: dict = {}
-        if a.assignee_username:
-            extra["assignee"] = {"name": a.assignee_username}
-        created = jira.create_issue(
-            project_key=project_key,
-            summary=a.summary or "",
-            description=a.description or "",
-            issue_type="Epic",
-            extra_fields=extra or None,
-        )
-        return created.get("key")
+        return sink.create(_ticket_for_create(a, issue_type="Epic", epic_key=None))
     if a.kind == "update_epic":
-        live = get_issue(a.target_key, client=jira) or {}
-        fields: dict = {
-            "summary": a.summary,
-            "description": finalize_body(
-                a.description or "", live.get("description") or "",
-            ),
-        }
-        if a.assignee_username:
-            fields["assignee"] = {"name": a.assignee_username}
-        jira.update_issue(a.target_key, fields)
-        jira.post_comment(a.target_key, _comment_for(a, drive_file=drive_file, jira=jira))
+        live = sink.get_issue_normalized(a.target_key) or {}
+        sink.update(a.target_key, _ticket_for_update(a, live, issue_type="Epic"))
+        sink.comment(a.target_key, _comment_for(a, drive_file=drive_file, sink=sink))
         return a.target_key
     if a.kind == "noop":
         return a.target_key
@@ -657,40 +617,56 @@ def _apply_task_action(
     *,
     epic_key: str | None,
     drive_file: DriveFile,
-    jira: JiraClient,
-    project_key: str,
+    sink: JiraSink,
 ) -> None:
     if a.kind == "create_task":
-        extra: dict = {}
-        if a.assignee_username:
-            extra["assignee"] = {"name": a.assignee_username}
-        created = jira.create_issue(
-            project_key=project_key,
-            summary=a.summary or "",
-            description=a.description or "",
-            issue_type="Task",
-            epic_link=epic_key,
-            extra_fields=extra or None,
-        )
+        sink.create(_ticket_for_create(a, issue_type="Task", epic_key=epic_key))
         return
     if a.kind == "update_task":
-        live = get_issue(a.target_key, client=jira) or {}
-        fields: dict = {
-            "summary": a.summary,
-            "description": finalize_body(
-                a.description or "", live.get("description") or "",
-            ),
-        }
-        if a.assignee_username:
-            fields["assignee"] = {"name": a.assignee_username}
-        jira.update_issue(a.target_key, fields)
-        jira.post_comment(a.target_key, _comment_for(a, drive_file=drive_file, jira=jira))
-        return
+        live = sink.get_issue_normalized(a.target_key) or {}
+        sink.update(a.target_key, _ticket_for_update(a, live, issue_type="Task"))
+        sink.comment(a.target_key, _comment_for(a, drive_file=drive_file, sink=sink))
     # noop / orphan: nothing to write
 
 
-def _comment_for(action: Action, *, drive_file: DriveFile, jira: JiraClient) -> str:
-    live = get_issue(action.target_key, client=jira)
+def _ticket_for_create(
+    a: Action, *, issue_type: str, epic_key: str | None,
+) -> Ticket:
+    """Build a Ticket for `sink.create`. Pre-resolved assignee is passed
+    through `custom_fields` so the sink's `assignee_resolver` does not
+    re-resolve the already-resolved username from the reconciler."""
+    custom: dict = {}
+    if a.assignee_username:
+        custom["assignee"] = {"name": a.assignee_username}
+    return Ticket(
+        summary=a.summary or "",
+        description=a.description or "",
+        type=issue_type,
+        epic_key=epic_key,
+        custom_fields=custom,
+    )
+
+
+def _ticket_for_update(
+    a: Action, live: dict, *, issue_type: str,
+) -> Ticket:
+    """Build a Ticket for `sink.update`. Runs `finalize_body` against the
+    live Jira description before passing it to the sink — load-bearing
+    for DoD checkbox preservation across `update_*` writes."""
+    custom: dict = {}
+    if a.assignee_username:
+        custom["assignee"] = {"name": a.assignee_username}
+    new_desc = finalize_body(a.description or "", live.get("description") or "")
+    return Ticket(
+        summary=a.summary or "",
+        description=new_desc,
+        type=issue_type,
+        custom_fields=custom,
+    )
+
+
+def _comment_for(action: Action, *, drive_file: DriveFile, sink: JiraSink) -> str:
+    live = sink.get_issue_normalized(action.target_key) or {}
     return format_update_comment(
         assignee_username=live.get("assignee_username"),
         fallback_username=live.get("reporter_username"),
