@@ -212,28 +212,54 @@ Mirrors planning docs in a Drive folder (or local dir) into a Jira project's
 epic+task tree.
 
 ```sh
+# RECOMMENDED — review every proposed change in data/run_plan.md and approve
+# all / a subset / cancel at the verify gate before any Jira write fires.
+uv run jira-task-agent run --apply --verify
+
 # Dry-run: read everything, write nothing. Always produces data/run_plan.json.
 uv run jira-task-agent run
 
 # Capture intended Jira writes to a file (useful for review)
 uv run jira-task-agent run --capture data/would_send.json --target-epic CENTPM-1253
 
-# Live writes
+# Live writes (no verify gate)
 uv run jira-task-agent run --apply
 
 # Just one file, with all created tasks scoped to a standing test epic
 uv run jira-task-agent run --apply --only V11_Dashboard_Tasks.md --target-epic CENTPM-1253
 ```
 
+When you pass `--verify` together with `--apply`, the runner stops after
+building the plan and writes `data/run_plan.md` — a numbered, human-readable
+summary of every proposed Jira write. At the prompt:
+
+```
+Review the plan in data/run_plan.md (5 change(s) proposed).
+  ENTER         approve all
+  e.g. 1,3,7    approve only those numbers
+  x             cancel everything
+```
+
+Out-of-range numbers are silently dropped. Skipped actions never reach Jira
+and never enter the cache.
+
 The pipeline classifies each doc (`single_epic | multi_epic | root`),
 extracts `{epic, tasks}` via LLM, matches against the live Jira project tree
 using a 2-stage LLM matcher, and emits actions
 (`create_epic / update_epic / noop / create_task / update_task / orphan`).
+Before each `update_*` PUT, `pipeline/extractor.py::finalize_body` runs one
+LLM call that merges the freshly-generated body with the live Jira body —
+this is what preserves user-ticked DoD checkmarks across paraphrasing.
 
 Warm runs with no doc changes cost ≈ 0 LLM tokens thanks to the 3-tier cache:
 - Tier 1 — classification (keyed by file_id + modified_time)
 - Tier 2 — extraction (keyed by file_id + content_sha) with diff-aware re-extract
 - Tier 3 — matcher (keyed by file_id + content_sha + project_topology_sha + matcher_prompt_sha)
+
+The cache is persisted **only after a successful `--apply` run** (no errors,
+no `--capture`). Dry-run and capture-mode runs never touch the cache —
+otherwise a later `--apply` would Tier 2-hit and skip `create_*` actions
+whose Jira issues were never created.
 
 Full operator walkthrough: [docs/jira_task_agent.md](docs/jira_task_agent.md).
 
