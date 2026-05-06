@@ -5,12 +5,11 @@ description truncation, label merging, custom-field projection) ported
 from the legacy `tests/file_to_jira/test_jira.py::test_payload_*` tests,
 adapted to the new home and the c7 `_shared.io.sinks.jira.FieldMap`.
 
-Assignee-routing payload tests (`test_payload_assignee_*` from the
-legacy file) are dropped — those routing decisions live in the sink's
-strategies (`DeterministicChainStrategy` / `StaticMapStrategy` /
-`PickerWithCacheStrategy`) and are covered by `test_jira_sink.py`.
-This file covers the f2j-specific payload shape, not the routing
-contracts.
+Assignee-routing tests at the bottom cover the priority chain in
+`_resolve_assignee` (enriched.assignee_hint > parsed.hinted_assignee >
+module routing > default_assignee) — that's f2j-body logic, not a sink
+strategy. The `_MapResolver` stub stands in for any
+`AssigneeResolver` (e.g. `PickerWithCacheStrategy` from `_shared`).
 """
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ from typing import Any
 from _shared.io.sinks.jira import FieldInfo, build_field_map
 
 from file_to_jira.config import AppConfig, JiraConfig
-from file_to_jira.jira.user_resolver import UserResolver
 from file_to_jira.models import (
     BugRecord,
     BugStage,
@@ -30,6 +28,26 @@ from file_to_jira.models import (
     ParsedBug,
 )
 from file_to_jira.upload_payload import build_issue_payload
+
+
+# ----------------------------------------------------------------------
+# Stub resolver — minimal AssigneeResolver impl for offline tests
+# ----------------------------------------------------------------------
+
+
+class _MapResolver:
+    """`AssigneeResolver` stub — display name → username via a fixed dict.
+
+    Stand-in for `PickerWithCacheStrategy` in tests that don't need
+    YAML cache or tracker-side picker behavior; just deterministic
+    name-to-username translation.
+    """
+
+    def __init__(self, mapping: dict[str, str] | None = None) -> None:
+        self._map = mapping or {}
+
+    def resolve(self, display_name: str) -> str | None:
+        return self._map.get(display_name)
 
 
 # ----------------------------------------------------------------------
@@ -108,7 +126,7 @@ def test_payload_includes_summary_priority_labels_and_routed_component(
             "priority": FieldInfo("priority", "Priority", False, "priority", None),
         },
     )
-    resolver = UserResolver(client=None, user_map_path=tmp_path / "u.yaml")
+    resolver = _MapResolver()
     record = _make_record()
     payload = build_issue_payload(
         record, cfg, fm, resolver,
@@ -135,7 +153,7 @@ def test_payload_drops_components_when_not_in_project_valid_set(
     legacy test fragile on CENTPM (which has zero components)."""
     cfg = _make_cfg()
     fm = build_field_map("BUG", "Bug", {}, {})
-    resolver = UserResolver(client=None, user_map_path=tmp_path / "u.yaml")
+    resolver = _MapResolver()
     record = _make_record()
     payload = build_issue_payload(
         record, cfg, fm, resolver,
@@ -156,7 +174,7 @@ def test_payload_truncates_oversize_description(tmp_path: Path) -> None:
     `state.json`."""
     cfg = _make_cfg()
     fm = build_field_map("BUG", "Bug", {}, {})
-    resolver = UserResolver(client=None, user_map_path=tmp_path / "u.yaml")
+    resolver = _MapResolver()
     record = _make_record()
     record.enriched.description_md = "x" * 50_000
     payload = build_issue_payload(record, cfg, fm, resolver, label="f2j-id:abc")
@@ -177,7 +195,7 @@ def test_payload_includes_external_id_field_when_configured(
     external id surfaces as that field's value."""
     cfg = _make_cfg(external_id_field="customfield_99999")
     fm = build_field_map("BUG", "Bug", {}, {})
-    resolver = UserResolver(client=None, user_map_path=tmp_path / "u.yaml")
+    resolver = _MapResolver()
     record = _make_record(external_id="CORE-CHAT-026")
     payload = build_issue_payload(record, cfg, fm, resolver, label="f2j-id:abc")
     assert payload["fields"]["customfield_99999"] == "CORE-CHAT-026"
@@ -189,7 +207,7 @@ def test_payload_omits_external_id_field_when_not_configured(
     """No `external_id_field` configured ⇒ no customfield in the payload."""
     cfg = _make_cfg()
     fm = build_field_map("BUG", "Bug", {}, {})
-    resolver = UserResolver(client=None, user_map_path=tmp_path / "u.yaml")
+    resolver = _MapResolver()
     record = _make_record(external_id="CORE-CHAT-026")
     payload = build_issue_payload(record, cfg, fm, resolver, label="f2j-id:abc")
     assert not any(
@@ -223,3 +241,85 @@ def test_markdown_to_jira_wiki_preserves_fenced_code_blocks():
     assert "{code:python}" in out
     assert "print('hi')" in out
     assert "{code}" in out
+
+
+# ----------------------------------------------------------------------
+# Assignee priority chain (f2j-specific routing)
+# ----------------------------------------------------------------------
+
+
+def test_payload_assignee_routed_by_module() -> None:
+    """`module_to_assignee[_core] = "Yair Sadan"` is fed to the resolver,
+    which translates the display name to a Jira username."""
+    cfg = _make_cfg()
+    cfg.jira.module_to_assignee = {"_core": "Yair Sadan"}
+    cfg.jira.default_assignee = "Guy Keinan"
+    fm = build_field_map("BUG", "Bug", {}, {})
+    resolver = _MapResolver({"Yair Sadan": "ysadan", "Guy Keinan": "gkeinan"})
+    record = _make_record()
+    # _make_record() uses repo_alias="_core" — the routed module entry
+    # wins over the default.
+    assert record.parsed.inherited_module.repo_alias == "_core"
+    payload = build_issue_payload(record, cfg, fm, resolver, label="f2j-id:abc")
+    assert payload["fields"]["assignee"] == {"name": "ysadan"}
+
+
+def test_payload_assignee_falls_through_to_default() -> None:
+    """A bug whose module isn't in `module_to_assignee` walks the chain
+    down to `default_assignee`."""
+    cfg = _make_cfg()
+    cfg.jira.module_to_assignee = {"_core": "Yair Sadan"}
+    cfg.jira.default_assignee = "Guy Keinan"
+    fm = build_field_map("BUG", "Bug", {}, {})
+    resolver = _MapResolver({"Guy Keinan": "gkeinan"})
+    record = _make_record()
+    # Override the module to one NOT in module_to_assignee.
+    record.parsed.inherited_module = ModuleContext(
+        repo_alias="vibe_coding/centarb", branch="main",
+    )
+    payload = build_issue_payload(record, cfg, fm, resolver, label="f2j-id:abc")
+    assert payload["fields"]["assignee"] == {"name": "gkeinan"}
+
+
+def test_payload_explicit_hint_wins_over_module() -> None:
+    """`ParsedBug.hinted_assignee` from the markdown overrides module
+    routing — the chain is hint > module > default."""
+    cfg = _make_cfg()
+    cfg.jira.module_to_assignee = {"_core": "Yair Sadan"}
+    fm = build_field_map("BUG", "Bug", {}, {})
+    resolver = _MapResolver({
+        "Yair Sadan": "ysadan",
+        "Lior Eli": "lior",
+    })
+    record = _make_record()
+    # Set the parsed-md hinted assignee — should win over module routing.
+    record.parsed.hinted_assignee = "Lior Eli"
+    payload = build_issue_payload(record, cfg, fm, resolver, label="f2j-id:abc")
+    assert payload["fields"]["assignee"] == {"name": "lior"}
+
+
+def test_payload_assignee_resolved_via_resolver() -> None:
+    """`_resolve_assignee` consults the resolver for every chain candidate;
+    a candidate the resolver doesn't know is dropped, and the chain
+    continues to the next entry."""
+    cfg = _make_cfg()
+    cfg.jira.module_to_assignee = {"_core": "Unknown Person"}
+    cfg.jira.default_assignee = "Guy Keinan"
+    fm = build_field_map("BUG", "Bug", {}, {})
+    resolver = _MapResolver({"Guy Keinan": "gkeinan"})  # Unknown Person not mapped
+    record = _make_record()
+    payload = build_issue_payload(record, cfg, fm, resolver, label="f2j-id:abc")
+    # Module assignee resolves to None → falls through to default.
+    assert payload["fields"]["assignee"] == {"name": "gkeinan"}
+
+
+def test_payload_assignee_omitted_when_no_chain_resolves() -> None:
+    """If every chain candidate resolves to None, the `assignee` field
+    is omitted entirely (Jira leaves the ticket unassigned)."""
+    cfg = _make_cfg()
+    cfg.jira.default_assignee = None
+    fm = build_field_map("BUG", "Bug", {}, {})
+    resolver = _MapResolver()  # empty mapping
+    record = _make_record()
+    payload = build_issue_payload(record, cfg, fm, resolver, label="f2j-id:abc")
+    assert "assignee" not in payload["fields"]

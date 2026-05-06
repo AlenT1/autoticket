@@ -11,7 +11,7 @@ zero matches.
 
 ---
 
-## ▶ Current position — stopped at end of c8.b (client tests migrated; legacy still alive)
+## ▶ Current position — Stage 3 complete (c4-c8 done, legacy gone)
 
 Phase 1 (cherry-picks from `main`) landed at `ba0b72d` and was published
 to `autoticket/scope/final-tool-abstract`. Phase 2 work happens on a
@@ -290,7 +290,32 @@ keeps the offline gate green at every commit boundary.
     - `tests/file_to_jira/test_jira.py` still imports from the legacy
       package; c8.c deletes both the legacy and the test file.
     - Gate: full offline at 450 (was 440 post-c8.a, +10 c8.b).
-  - **c8.c — verify drops + delete legacy package + delete `test_jira.py`** (final)
+  - **c8.c — verify drops + delete legacy package + delete `test_jira.py`** ✅
+    - Refactored `src/file_to_jira/upload_payload.py::_resolve_assignee` to
+      take any `AssigneeResolver` (str-returning shape) instead of the
+      legacy `UserResolver` (UserResolution-returning).
+    - Added 5 assignee-chain tests to
+      `tests/file_to_jira/test_upload_payload.py`: routed_by_module,
+      falls_through_to_default, explicit_hint_wins_over_module,
+      resolved_via_resolver, omitted_when_no_chain_resolves.
+    - New: `tests/_shared/io/sinks/test_assignee_strategies.py` with 10
+      tests covering `PickerWithCacheStrategy` (replacement for
+      `UserResolver`): YAML cache load, picker search + cache, three
+      unknown_policy branches (default/skip/fail), no-hit fallthrough,
+      picker exception handling. Plus smoke tests for
+      `PassthroughAssigneeResolver` + `StaticMapStrategy`.
+    - Deleted `src/file_to_jira/jira/{__init__,client,field_map,uploader,user_resolver}.py`
+      (1,353 LOC) and the empty `src/file_to_jira/jira/` directory.
+    - Deleted `tests/file_to_jira/test_jira.py` (21 tests; 10 migrated to
+      new homes, 11 already covered or replaced by stronger tests in
+      c7/c8.a/c8.b).
+    - The `--deselect tests/file_to_jira/test_jira.py::test_payload_includes_summary_priority_labels`
+      flag is now obsolete (the test no longer exists; its replacement
+      in `test_upload_payload.py` passes cleanly).
+    - Both Stage 3 done-condition greps return zero actual imports
+      (only docstrings mention the deleted paths).
+    - Gate: full offline at 445 (was 450 post-c8.b; -20 from
+      `test_jira.py` delete + 5 chain tests + 10 strategy tests).
 
 
 | Old test | New home | Strategy gap filled? |

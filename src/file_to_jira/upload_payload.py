@@ -3,22 +3,15 @@
 
 Ported from the legacy ``file_to_jira.jira.uploader`` module so the
 payload-building logic lives next to the f2j body's ``upload.py``
-orchestrator. The orchestrator currently goes through the shared
+orchestrator. The orchestrator goes through the shared
 :class:`JiraSink` for the actual HTTP write; this module is the
 f2j-specific shape factory it can call before handing off.
 
-What's portable as-is:
-  - ``build_issue_payload`` and its private composers
-    (``_compose_description`` / ``_compose_labels`` /
-    ``_compose_components`` / ``_resolve_assignee`` / ``_apply_epic_link``
-    / ``_apply_custom_fields``).
-  - ``markdown_to_jira_wiki`` — the body-shape converter used by both
-    the description composer and standalone tooling.
-
-The legacy ``UserResolver`` is still imported from
-``file_to_jira.jira.user_resolver`` for now; c8.c (the legacy package
-delete) replaces this with the shared :class:`PickerWithCacheStrategy`
-once the test migration confirms equivalence.
+Resolved at c8.c: assignee resolution takes any
+:class:`_shared.io.sinks.base.AssigneeResolver` (e.g.
+:class:`PickerWithCacheStrategy`) — the legacy
+``file_to_jira.jira.user_resolver.UserResolver`` is gone with the
+package.
 """
 from __future__ import annotations
 
@@ -26,10 +19,10 @@ import logging
 import re
 from typing import Any
 
+from _shared.io.sinks.base import AssigneeResolver
 from _shared.io.sinks.jira import FieldMap
 
 from .config import AppConfig
-from .jira.user_resolver import UserResolver
 from .models import BugRecord, EnrichedBug
 
 log = logging.getLogger(__name__)
@@ -118,14 +111,15 @@ def _module_assignee(cfg: AppConfig, record: BugRecord) -> str | None:
 
 
 def _resolve_assignee(
-    record: BugRecord, cfg: AppConfig, user_resolver: UserResolver,
+    record: BugRecord, cfg: AppConfig, resolver: AssigneeResolver,
 ) -> str | None:
     """Walk the assignee priority chain and return the resolved Jira username.
 
     Order: ``enriched.assignee_hint`` > ``parsed.hinted_assignee`` >
     module routing > ``default_assignee``. Each candidate is run through
-    the ``user_resolver`` so display names get translated to SSO short
-    names.
+    ``resolver.resolve(name)`` so display names get translated to SSO
+    short names. Returns the first chain entry whose resolver call
+    returns a non-empty username.
     """
     enriched = record.enriched
     candidates = [
@@ -137,9 +131,9 @@ def _resolve_assignee(
     for candidate in candidates:
         if not candidate:
             continue
-        resolution = user_resolver.resolve(candidate)
-        if resolution.username:
-            return resolution.username
+        username = resolver.resolve(candidate)
+        if username:
+            return username
     return None
 
 
@@ -292,7 +286,7 @@ def build_issue_payload(
     record: BugRecord,
     cfg: AppConfig,
     field_map: FieldMap,
-    user_resolver: UserResolver,
+    resolver: AssigneeResolver,
     *,
     label: str,
     valid_components: frozenset[str] = frozenset(),
@@ -301,7 +295,9 @@ def build_issue_payload(
 
     Pure function — no Jira HTTP, no LLM, no state mutation. Tests can
     drive every routing branch by varying ``record`` / ``cfg`` /
-    ``field_map`` / ``valid_components``.
+    ``field_map`` / ``valid_components``. ``resolver`` is any
+    :class:`AssigneeResolver` (typically
+    :class:`PickerWithCacheStrategy` from `_shared.io.sinks.jira.strategies`).
     """
     enriched: EnrichedBug = record.enriched  # type: ignore[assignment]
 
@@ -320,7 +316,7 @@ def build_issue_payload(
     if components:
         fields["components"] = [{"name": n} for n in components]
 
-    assignee_username = _resolve_assignee(record, cfg, user_resolver)
+    assignee_username = _resolve_assignee(record, cfg, resolver)
     if assignee_username:
         fields["assignee"] = {"name": assignee_username}
 
