@@ -147,6 +147,32 @@ QUALITY RULES (same as the cold extractor):
 - `source_anchor`: a stable identifier derived from the task's content
   (e.g. `"V11-1 Collect user feedback"`, `"Step 5: Move components"`).
 
+PRESERVATION RULES — content from the source that MUST survive regeneration:
+
+- **Identifier-like markers** that appear in the source bullet or its
+  surrounding context MUST be preserved verbatim in the regenerated
+  body. By "identifier-like" we mean short, distinctive tokens that
+  carry operational meaning the body would otherwise lose:
+    * **deadlines / target dates** — any concrete date or
+      release-window string the source attaches to the work
+      (place in the Goal sentence or as a DoD shipping gate).
+    * **issue / ticket / external IDs** — any code-shaped reference
+      to a tracker item, RFC, ticket, or document
+      (mention verbatim in the comprehensive context paragraph or
+      the relevant Implementation step).
+    * **version tags / release codes** — any short version token
+      attached to the work (Goal or Steps).
+    * **SLA / quantitative targets** — any numeric target the
+      source attaches to "done" (DoD or Goal).
+- **The epic summary's 70-char cap MUST NOT cause an identifier marker
+  to be dropped.** If the source heading contains an identifier and the
+  cap forces it out of the summary, keep the marker verbatim in the
+  description (Goal sentence is the natural home).
+- **Do NOT paraphrase** identifier markers — copy them byte-for-byte.
+  A summary like `"Q3 deadline release"` is wrong if the source says
+  some specific code like `<DEADLINE-CODE-FROM-SOURCE>`; copy the
+  source token, do not rewrite it.
+
 INPUTS:
 
 DOC NAME: {task_file_name}

@@ -106,13 +106,12 @@ def test_cache_does_not_change_captured_writes(tmp_path: Path):
 
     # The cold run had use_cache=False, so cache.json wasn't written.
     # Re-run cold but WITH cache enabled so the cache populates for the
-    # warm comparison. This second cold call should still be a cache miss
-    # because cache.json is empty — and it writes the cache as a side
-    # effect.
-    seed_capture = tmp_path / "seed.json"
+    # warm comparison. The cache save gate (introduced with the Goal/Steps
+    # body changes) requires `apply and not capture_path and not errors`,
+    # so the seed run intentionally omits capture_path — otherwise cache.save
+    # is skipped and the warm run below finds an empty cache.
     seed_report = run_once(
         apply=True,
-        capture_path=str(seed_capture),
         only_file_name=TARGET_FILE,
         cache_path=cache_path,
         state_path=state_path,
@@ -142,7 +141,12 @@ def test_cache_does_not_change_captured_writes(tmp_path: Path):
     assert warm_report.cache_hits_extract >= 1
 
     # ---- Behavior equivalence ------------------------------------------
-    cold_sig = _signature(seed_capture)
+    # Compare the first cold run's captured ops against the warm run.
+    # Both come from the same source file; the only difference is whether
+    # the matcher is served from cache. The signature drops description
+    # bodies (LLM string variation tolerated) — structural divergence
+    # would mean the cache silently changed what we'd write.
+    cold_sig = _signature(cold_capture)
     warm_sig = _signature(warm_capture)
     assert cold_sig == warm_sig, (
         "Tier 3 cache changed captured ops:\n"
@@ -153,7 +157,7 @@ def test_cache_does_not_change_captured_writes(tmp_path: Path):
     )
 
     # ---- Action histograms must also match -----------------------------
-    cold_actions = dict(seed_report.actions_by_kind)
+    cold_actions = dict(cold_report.actions_by_kind)
     warm_actions = dict(warm_report.actions_by_kind)
     assert cold_actions == warm_actions, (
         f"action histograms diverge: cold={cold_actions} warm={warm_actions}"

@@ -208,6 +208,262 @@ def test_sanitizer_drops_unknown_anchor():
 
 
 # ----------------------------------------------------------------------
+# _fuzzy_lookup_anchor — recover cached anchor from LLM-prefixed format
+# ----------------------------------------------------------------------
+
+
+def test_fuzzy_lookup_anchor_matches_section_slash_prefix():
+    """LLM violates rule B with `"<section> / <cached>"`; fuzzy fallback
+    recovers by splitting on `' / '`."""
+    cached = {
+        "T1 First task": "bullet T1 body",
+        "T2 Second task": "bullet T2 body",
+    }
+    out = file_extract._fuzzy_lookup_anchor(
+        "Section A / T2 Second task", cached,
+    )
+    assert out == "T2 Second task"
+
+
+def test_fuzzy_lookup_anchor_matches_double_colon_prefix():
+    """LLM emits `"<file>::<cached>"`; recover via `'::'` separator."""
+    cached = {"T1 First task": "b1", "T2 Second task": "b2"}
+    out = file_extract._fuzzy_lookup_anchor(
+        "File.md::T1 First task", cached,
+    )
+    assert out == "T1 First task"
+
+
+def test_fuzzy_lookup_anchor_suffix_match_picks_longest():
+    """When the emitted anchor ends with one of several cached anchors,
+    pick the LONGEST match to avoid false positives on short prefixes."""
+    cached = {
+        "T1": "short",
+        "T1 First task with detail": "long",
+    }
+    out = file_extract._fuzzy_lookup_anchor(
+        "Section A / T1 First task with detail", cached,
+    )
+    assert out == "T1 First task with detail"
+
+
+def test_fuzzy_lookup_anchor_returns_none_for_truly_hallucinated():
+    """Anchor that doesn't suffix-match or split-match any cached entry
+    returns None — caller drops as hallucination."""
+    cached = {"T1 First task": "b"}
+    out = file_extract._fuzzy_lookup_anchor(
+        "made-up-anchor-name-completely-unrelated", cached,
+    )
+    assert out is None
+
+
+def test_fuzzy_lookup_anchor_returns_none_for_empty_inputs():
+    assert file_extract._fuzzy_lookup_anchor("", {"T1": "b"}) is None
+    assert file_extract._fuzzy_lookup_anchor("X", {}) is None
+
+
+# ----------------------------------------------------------------------
+# _filter_real_modified — exact + fuzzy fallback paths
+# ----------------------------------------------------------------------
+
+
+def test_filter_real_modified_keeps_exact_match():
+    """The simple case still works: exact-match anchor whose bullet
+    actually changed in the current text is kept."""
+    out = file_extract._filter_real_modified(
+        ["T1 First task"],
+        cached_bullets={"T1 First task": "old bullet body"},
+        current_text="document with new bullet body",
+    )
+    assert out == ["T1 First task"]
+
+
+def test_filter_real_modified_recovers_section_prefixed_anchor():
+    """LLM emits `"<section> / <cached>"`; filter recovers via fuzzy
+    fallback and returns the cached anchor (NOT the LLM-emitted form)."""
+    out = file_extract._filter_real_modified(
+        ["Section A / T1 First task"],
+        cached_bullets={"T1 First task": "old bullet body"},
+        current_text="document with new bullet body",
+    )
+    assert out == ["T1 First task"], (
+        "fuzzy recovery should return the cached anchor, not the "
+        "LLM-emitted prefixed form"
+    )
+
+
+def test_filter_real_modified_recovered_anchor_still_drops_if_unchanged():
+    """Fuzzy recovery does not bypass the over-emission check: even
+    if the anchor recovers, if its cached bullet is byte-identical
+    in the current text, drop it."""
+    out = file_extract._filter_real_modified(
+        ["Section A / T1 First task"],
+        cached_bullets={"T1 First task": "still here"},
+        current_text="this current text contains still here unchanged",
+    )
+    assert out == [], (
+        "recovered anchor should still drop when bullet is unchanged"
+    )
+
+
+def test_filter_real_modified_drops_truly_hallucinated_anchor():
+    """An anchor that has no cached match AND no fuzzy recovery is
+    dropped (existing behavior — hallucination guard)."""
+    out = file_extract._filter_real_modified(
+        ["totally-made-up-name"],
+        cached_bullets={"T1 First task": "old"},
+        current_text="document with new",
+    )
+    assert out == []
+
+
+# ----------------------------------------------------------------------
+# _lookup_key_for_anchor — compound-anchor task-suffix splitting
+# ----------------------------------------------------------------------
+
+
+def test_lookup_key_simple_anchor_returns_unchanged():
+    assert file_extract._lookup_key_for_anchor("T1 First task") == "T1 First task"
+
+
+def test_lookup_key_compound_anchor_returns_task_suffix():
+    """The cold extractor produces compound anchors like
+    "<section> / <task>" for multi-epic files. The lookup key is the
+    task suffix (after the last separator)."""
+    assert file_extract._lookup_key_for_anchor(
+        "Section A / T1 First task",
+    ) == "T1 First task"
+
+
+def test_lookup_key_compound_anchor_uses_LAST_separator():
+    """If somehow the section name itself contains ' / ', split on the
+    LAST occurrence — the task suffix is what's after the last ' / '."""
+    assert file_extract._lookup_key_for_anchor(
+        "Section A / sub-area / TASK-9",
+    ) == "TASK-9"
+
+
+# ----------------------------------------------------------------------
+# _extract_task_bullets — compound-anchor end-to-end
+# ----------------------------------------------------------------------
+
+
+def _make_compound_extraction() -> MultiExtractionResult:
+    """Multi-epic extraction whose anchors use the LLM's compound
+    "<section> / <task>" convention."""
+    desc = (
+        "context.\n\n### Goal\nshipped\n\n"
+        "### Implementation steps\n1. do it. File: x. Done when: ok.\n\n"
+        "### Definition of Done\n- [ ] step done\n- [ ] tests pass\n\n"
+        "### Source\n- Doc: F.md\n- Last edited by: dev\n\n"
+        f"{AGENT_MARKER}"
+    )
+    epic_a = ExtractedEpicWithTasks(
+        summary="Section A area",
+        description="A body",
+        assignee_name=None,
+        tasks=[
+            ExtractedTask(
+                summary="A1 task",
+                description=desc,
+                source_anchor="A. Section / A1",
+                assignee_name=None,
+            ),
+            ExtractedTask(
+                summary="A2 task",
+                description=desc,
+                source_anchor="A. Section / A2",
+                assignee_name=None,
+            ),
+        ],
+    )
+    return MultiExtractionResult(file_id="F1", file_name="F.md", epics=[epic_a])
+
+
+def test_extract_task_bullets_handles_compound_anchors():
+    """Compound anchors like 'A. Section / A1' don't appear literally
+    in the source markdown — the section heading and the bullet are on
+    different lines. Bug fix: split on ' / ' and match the task suffix
+    on the bullet's line."""
+    cached_text = (
+        "# Doc\n\n"
+        "Overview text.\n\n"
+        "## A. Section\n\n"
+        "- A1: do the first thing\n"
+        "- A2: do the second thing\n"
+    )
+    cached = _make_compound_extraction()
+    out = file_extract._extract_task_bullets(cached_text, cached)
+    assert "A. Section / A1" in out, (
+        f"compound anchor 'A. Section / A1' should map to its bullet; got keys={list(out.keys())}"
+    )
+    assert "A. Section / A2" in out
+    assert "A1" in out["A. Section / A1"]
+    assert "A2" in out["A. Section / A2"]
+
+
+def test_extract_task_bullets_handles_simple_anchors():
+    """Backwards-compat: non-compound anchors (the cold extractor's
+    convention for single-epic files) still match by literal substring."""
+    cached_text = (
+        "# Single Epic\n\n"
+        "- T1 First task: do the first thing\n"
+        "- T2 Second task: do the second thing\n"
+    )
+    desc = f"body\n\n{AGENT_MARKER}"
+    cached = _single([
+        _task("T1 First task", "T1 First task"),
+        _task("T2 Second task", "T2 Second task"),
+    ])
+    out = file_extract._extract_task_bullets(cached_text, cached)
+    assert "T1 First task" in out
+    assert "T2 Second task" in out
+
+
+def test_extract_task_bullets_two_compound_anchors_dont_claim_same_line():
+    """Two anchors with the same task suffix shouldn't both claim the
+    same line (consumed-set guard)."""
+    cached_text = (
+        "## A. Section\n\n"
+        "- T1: A area task\n\n"
+        "## B. Other Section\n\n"
+        "- T1: B area task\n"
+    )
+    desc = f"body\n\n{AGENT_MARKER}"
+    epic_a = ExtractedEpicWithTasks(
+        summary="A",
+        description="A body",
+        assignee_name=None,
+        tasks=[
+            ExtractedTask(
+                summary="A T1", description=desc,
+                source_anchor="A. Section / T1", assignee_name=None,
+            ),
+        ],
+    )
+    epic_b = ExtractedEpicWithTasks(
+        summary="B",
+        description="B body",
+        assignee_name=None,
+        tasks=[
+            ExtractedTask(
+                summary="B T1", description=desc,
+                source_anchor="B. Other Section / T1", assignee_name=None,
+            ),
+        ],
+    )
+    cached = MultiExtractionResult(
+        file_id="F1", file_name="F.md", epics=[epic_a, epic_b],
+    )
+    out = file_extract._extract_task_bullets(cached_text, cached)
+    # Each compound anchor gets its OWN bullet, not the same one.
+    assert "A. Section / T1" in out
+    assert "B. Other Section / T1" in out
+    assert "A area task" in out["A. Section / T1"]
+    assert "B area task" in out["B. Other Section / T1"]
+
+
+# ----------------------------------------------------------------------
 # fixtures
 # ----------------------------------------------------------------------
 

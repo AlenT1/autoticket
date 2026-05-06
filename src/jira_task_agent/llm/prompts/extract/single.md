@@ -180,6 +180,22 @@ D. Each child task description
    - End the description with the marker line, exactly:
      <!-- managed-by:jira-task-agent v1 -->
 
+   - **PRESERVE IDENTIFIER-LIKE MARKERS.** When the source bullet or
+     its surrounding context contains short, distinctive tokens that
+     carry operational meaning the regenerated body would otherwise
+     lose, copy them verbatim into the body. By "identifier-like" we
+     mean any of:
+       * deadlines or target dates the source attaches to the work
+         (Goal sentence or DoD shipping gate);
+       * issue / ticket / external IDs (comprehensive context paragraph
+         or relevant Implementation step);
+       * version tags or release codes (Goal or Steps);
+       * SLA or quantitative targets (DoD or Goal).
+     DO NOT paraphrase or drop them — copy the source token
+     byte-for-byte. (E.g. if the source says some specific code
+     `<DEADLINE-CODE-FROM-SOURCE>`, your output keeps that exact
+     code; do not summarize it as "Q3 deadline".)
+
 E. source_anchor
    - A short (≤ 60 chars) identifier for where this task came from in the
      source document — usually the heading it's under, or the first ~40

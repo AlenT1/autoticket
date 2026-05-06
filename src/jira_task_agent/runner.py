@@ -90,6 +90,7 @@ def run_once(
     matcher_max_workers: int = 3,
     verify_before_apply: bool = False,
     verify_md_path: Path | None = None,
+    force_cache_save: bool = False,
 ) -> RunReport:
     """Single end-to-end run.
 
@@ -193,7 +194,10 @@ def run_once(
     report.finished_at = datetime.now(tz=timezone.utc)
     _persist_state(state, started, apply, capture_path, report, state_path)
     _dump_capture(capture_path, captured_writes)
-    _persist_cache(cache, cache_path, use_cache, apply, capture_path, report)
+    _persist_cache(
+        cache, cache_path, use_cache, apply, capture_path, report,
+        force_cache_save=force_cache_save,
+    )
     return report
 
 
@@ -616,28 +620,39 @@ def _persist_cache(
     apply: bool,
     capture_path: str | None,
     report: "RunReport",
+    *,
+    force_cache_save: bool = False,
 ) -> None:
     """Save the matcher cache only when actual writes landed in Jira.
     Same gate as `_persist_state`. Capture-mode and dry-runs intentionally
     don't save — saving them would lie about Jira state and cause
     `create_*` actions to be silently skipped on the next warm run
-    (Tier 2 hit with dirty=∅) while Jira has no record of the issue."""
+    (Tier 2 hit with dirty=∅) while Jira has no record of the issue.
+
+    ``force_cache_save=True`` is a test-fixture escape hatch: it bypasses
+    the capture-mode check so tests can build warm baselines without
+    sending real Jira writes. Production callers must NOT pass this.
+    """
     if not use_cache:
         return
-    if apply and not capture_path and not report.errors:
+    gate = (apply and not report.errors) and (
+        force_cache_save or not capture_path
+    )
+    if gate:
         try:
             cache.save(cache_path)
             logger.info(
-                "cache: saved %d file entr(ies) (classify hits=%d, extract hits=%d)",
-                len(cache.files), report.cache_hits_classify, report.cache_hits_extract,
+                "cache: saved %d file entr(ies) (classify hits=%d, extract hits=%d, forced=%s)",
+                len(cache.files), report.cache_hits_classify,
+                report.cache_hits_extract, force_cache_save,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("cache: save failed: %s", e)
         return
     logger.info(
-        "cache: NOT saved (apply=%s capture=%s errors=%d) — "
+        "cache: NOT saved (apply=%s capture=%s errors=%d forced=%s) — "
         "preserves cache/Jira consistency",
-        apply, bool(capture_path), len(report.errors),
+        apply, bool(capture_path), len(report.errors), force_cache_save,
     )
 
 

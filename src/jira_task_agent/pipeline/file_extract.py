@@ -250,28 +250,69 @@ def _sanitize_labels_against_source(
     )
 
 
+def _fuzzy_lookup_anchor(
+    emitted: str, cached_bullets: dict[str, str],
+) -> str | None:
+    """Return the cached anchor whose text is a suffix of `emitted`, or None.
+
+    Handles the case where the diff LLM emits a short form of a compound
+    anchor (e.g. ``"UI-1 Hide…"`` when the cached key is
+    ``"I. Section / UI-1 Hide…"``). Pick the longest match to avoid
+    false positives on short shared suffixes.
+    """
+    if not emitted or not cached_bullets:
+        return None
+    candidates = [a for a in cached_bullets if a and emitted.endswith(a)]
+    return max(candidates, key=len) if candidates else None
+
+
+def _resolve_modified_anchor(
+    emitted: str, cached_bullets: dict[str, str],
+) -> tuple[str, str] | None:
+    """Resolve one LLM-emitted modified_anchor to (anchor, bullet) or
+    None if it can't be matched to any cached entry."""
+    bullet = cached_bullets.get(emitted)
+    if bullet is not None:
+        return emitted, bullet
+    recovered = _fuzzy_lookup_anchor(emitted, cached_bullets)
+    if recovered is None:
+        logger.info(
+            "diff-extract: dropping unknown modified_anchor %r "
+            "(not in cached extraction)", emitted,
+        )
+        return None
+    logger.info(
+        "diff-extract: recovered modified_anchor %r -> %r "
+        "(LLM violated rule B; fuzzy fallback)", emitted, recovered,
+    )
+    return recovered, cached_bullets[recovered]
+
+
 def _filter_real_modified(
     anchors: list[str], cached_bullets: dict[str, str], current_text: str,
 ) -> list[str]:
     """Drop anchors whose cached bullet is byte-identical in current
     text (LLM over-emission), AND drop anchors that don't match any
-    cached bullet at all (LLM hallucinated an anchor name)."""
+    cached bullet at all (LLM hallucinated an anchor name).
+
+    Includes a fuzzy fallback (:func:`_resolve_modified_anchor`) for
+    LLM rule-B violations: if the emitted anchor isn't an exact
+    cached match but recovers via fuzzy lookup, treat the recovery
+    as the real anchor.
+    """
     real: list[str] = []
     for a in anchors:
-        bullet = cached_bullets.get(a)
-        if bullet is None:
-            logger.info(
-                "diff-extract: dropping unknown modified_anchor %r "
-                "(not in cached extraction)", a,
-            )
+        resolved = _resolve_modified_anchor(a, cached_bullets)
+        if resolved is None:
             continue
+        anchor, bullet = resolved
         if bullet in current_text:
             logger.info(
                 "diff-extract: dropping spurious modified_anchor %r "
-                "(source bullet unchanged)", a,
+                "(source bullet unchanged)", anchor,
             )
             continue
-        real.append(a)
+        real.append(anchor)
     return real
 
 
@@ -290,24 +331,95 @@ def _real_epic_changed(
     return True
 
 
+def _lookup_key_for_anchor(anchor: str) -> str:
+    """Reduce a `source_anchor` to the substring that should appear on
+    the bullet's line in the source markdown.
+
+    The cold extractor produces compound anchors of the form
+    ``"<section> / <task>"`` for multi-epic files (its convention to
+    keep anchors unique across sections). Those anchors do NOT appear
+    literally on any single line — the section heading and the bullet
+    are on different lines. So when locating a bullet, drop the section
+    prefix and search for the task suffix only. Anchors without a
+    `" / "` separator are returned unchanged.
+    """
+    if " / " in anchor:
+        return anchor.rsplit(" / ", 1)[-1]
+    return anchor
+
+
+def _normalize_for_anchor_match(text: str) -> str:
+    """Collapse whitespace and markdown-table pipes to single spaces so
+    a cached anchor like ``"V11-1 Collect user feedback"`` matches a
+    table row line ``"| V11-1 | Collect user feedback | ... |"``."""
+    return re.sub(r"[\s|]+", " ", text).strip()
+
+
+def _line_matches_anchor(
+    line: str, anchor: str, key: str, norm_anchor: str, norm_key: str,
+) -> bool:
+    if anchor in line or (key != anchor and key in line):
+        return True
+    norm_line = _normalize_for_anchor_match(line)
+    return norm_anchor in norm_line or (
+        key != anchor and norm_key in norm_line
+    )
+
+
+def _find_anchor_line(
+    anchor: str, lines: list[str], consumed: set[int],
+) -> int | None:
+    """Return the index of the first unclaimed line containing the
+    anchor (or its task-suffix lookup key for compound anchors), or
+    None if no match. Mutates `consumed` on success.
+
+    Falls back to a normalized comparison (whitespace + ``|`` collapsed
+    to single spaces) so cached anchors derived from markdown table rows
+    still match — the cold extractor stores ``"<id> <summary>"`` while
+    the source line has them separated by ``|``.
+    """
+    key = _lookup_key_for_anchor(anchor)
+    norm_anchor = _normalize_for_anchor_match(anchor)
+    norm_key = (
+        _normalize_for_anchor_match(key) if key != anchor else norm_anchor
+    )
+    for i, line in enumerate(lines):
+        if i in consumed:
+            continue
+        if _line_matches_anchor(line, anchor, key, norm_anchor, norm_key):
+            consumed.add(i)
+            return i
+    return None
+
+
 def _extract_task_bullets(
     cached_text: str, cached: Extraction,
 ) -> dict[str, str]:
     """For each cached task with a `source_anchor`, locate its bullet
-    block in `cached_text` and return `{anchor: bullet_text}`. The
+    block in `cached_text` and return ``{anchor: bullet_text}``. The
     bullet block is the substring from the line where the anchor first
-    appears up to (but not including) the next bullet of the same
-    indent, or end of file."""
+    appears up to (but not including) the next bullet's line, or end
+    of file.
+
+    Compound anchors (`"<section> / <task>"`) are matched on their
+    task suffix via :func:`_lookup_key_for_anchor` because the literal
+    compound string never appears as a single line in the source. We
+    walk anchors in the order they appear in the cached extraction
+    and consume each match's line so two anchors don't claim the same
+    bullet.
+    """
     out: dict[str, str] = {}
     lines = cached_text.splitlines(keepends=True)
     anchors = [t.source_anchor for t in _all_tasks(cached) if t.source_anchor]
 
+    consumed: set[int] = set()
     starts: list[tuple[int, str]] = []
-    for i, line in enumerate(lines):
-        for a in anchors:
-            if a and a in line:
-                starts.append((i, a))
-                break
+    for anchor in anchors:
+        if not anchor:
+            continue
+        idx = _find_anchor_line(anchor, lines, consumed)
+        if idx is not None:
+            starts.append((idx, anchor))
     starts.sort()
     for j, (start_i, anchor) in enumerate(starts):
         end_i = starts[j + 1][0] if j + 1 < len(starts) else len(lines)
@@ -325,28 +437,29 @@ def _extract_epic_intro(cached_text: str) -> str:
 
 
 def labels_to_targets(labels: DiffLabels, cached: Extraction) -> dict:
-    """Build the `targets` payload for the targeted extractor: every
-    summary it must produce a fresh body for. Modified anchors look up
-    their cached summary; added items use their LLM-given summary; epic
-    targets cover single-epic body change + new sub-epics."""
+    """Build the `targets` payload for the targeted extractor.
+
+    Modified anchors include `source_anchor` so the targeted-extract LLM
+    echoes it verbatim (rule 2 in ``extract/targeted.md``) — without this
+    the LLM derives a fresh anchor and the merged extraction's key no
+    longer matches the cached entry.
+    """
     cached_by_anchor = {
         t.source_anchor: t for t in _all_tasks(cached) if t.source_anchor
     }
-    section_for_anchor: dict[str, str] = {}
-    if isinstance(cached, MultiExtractionResult):
-        for e in cached.epics:
-            for t in e.tasks:
-                if t.source_anchor:
-                    section_for_anchor[t.source_anchor] = e.summary
+    section_for_anchor: dict[str, str] = (
+        {t.source_anchor: e.summary
+         for e in cached.epics for t in e.tasks if t.source_anchor}
+        if isinstance(cached, MultiExtractionResult) else {}
+    )
 
     task_targets: list[dict] = []
     for anchor in labels.modified_anchors:
         ct = cached_by_anchor.get(anchor)
         if ct is None:
             continue
-        target: dict = {"summary": ct.summary}
-        section = section_for_anchor.get(anchor)
-        if section:
+        target: dict = {"summary": ct.summary, "source_anchor": anchor}
+        if section := section_for_anchor.get(anchor):
             target["section"] = section
         task_targets.append(target)
     for added in labels.added:

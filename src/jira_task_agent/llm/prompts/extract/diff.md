@@ -45,9 +45,25 @@ RULES:
 A. Every change region in the diff MUST land in exactly one bucket. Do
    not silently drop a region.
 
-B. `modified_anchors` entries MUST be strings present in `cached_items`.
-   If the diff edits the body of an existing cached task, list its
-   anchor here.
+B. `modified_anchors` entries MUST be COPIED VERBATIM from one of the
+   `cached_items[].source_anchor` values. Do NOT prepend the owning
+   section heading, the file name, or any other context. Use the
+   EXACT string from `cached_items`.
+
+   Suppose `cached_items` contains an entry like
+   `{"source_anchor": "<EXISTING ANCHOR FROM CACHED_ITEMS>", ...}`.
+   When emitting that anchor:
+
+       GOOD: "<EXISTING ANCHOR FROM CACHED_ITEMS>"
+       BAD : "<sub-epic heading> / <EXISTING ANCHOR FROM CACHED_ITEMS>"
+       BAD : "Section <X> / <EXISTING ANCHOR FROM CACHED_ITEMS>"
+       BAD : "<file>.md::<EXISTING ANCHOR FROM CACHED_ITEMS>"
+       BAD : any reformulation, paraphrase, or shortening of the cached anchor
+
+   The post-step DROPS any anchor that does not match a cached entry —
+   so a wrongly-formatted anchor silently loses the modification. If
+   the diff edits the body of an existing cached task, copy its
+   `source_anchor` byte-for-byte from the `cached_items` list.
 
 C. `removed_anchors` entries MUST be strings present in `cached_items`.
    The task's lines appear only in `-` lines, no `+` replacement.

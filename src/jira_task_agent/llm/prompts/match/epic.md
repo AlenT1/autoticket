@@ -30,10 +30,29 @@ HARD RULES:
 3. Confidence floors — return null for `candidate_key` below them:
    - "epic": below 0.90. Adopting an epic clobbers its summary +
      description and hangs new tasks under it; a wrong match silently
-     merges two unrelated workstreams. Be conservative.
+     merges two unrelated workstreams. Be conservative when content
+     differs.
    - "task": below 0.70.
    Don't guess. Missed matches just create a new ticket a human can
    merge later. Wrong matches are far more expensive to undo.
+
+3a. Confidence calibration — score decisively when matches ARE clear.
+   The 0.90 floor exists to PREVENT silent-merge of unrelated work,
+   NOT to suppress legitimate matches. Indecisive scoring (0.82–0.89
+   on a genuinely-matching pair) creates a different failure mode:
+   on every warm re-run, the same pair flips between matched and
+   unmatched, generating duplicate Jira epics each time the unmatched
+   side wins. Avoid this by:
+   - When the item and a candidate share substantive overlap — same
+     workstream / same release / same surface (file paths, API
+     endpoints, config keys, ticket-ID prefixes) — score >= 0.95.
+   - Reserve 0.80–0.89 for genuinely ambiguous pairs where you
+     cannot decide; for those, return null with a reason that names
+     what's missing for confident matching.
+   - Once you've decided "this is the same workstream" in your
+     `reason` text, your confidence score MUST reflect that decision
+     (>= 0.95). Do NOT write a confident reason and then attach a
+     borderline score — that's a failed self-consistency check.
 4. Compare by INTENT + SCOPE, not by surface wording.
    - "Generate JWT secret and store in Vault" matches "JWT secret" when
      both describe the same workstream item.

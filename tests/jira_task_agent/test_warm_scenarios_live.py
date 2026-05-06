@@ -180,6 +180,11 @@ def _maybe_run_cold(
     # for the other 18 files so the cold only pays the target file's
     # extract + match LLM cost.
     _seed_cache_from_peer_baseline(cache)
+    # `force_cache_save=True` is a test-fixture override: production's
+    # cache-save gate (apply and not capture_path) intentionally skips
+    # in capture mode, but warm-scenario fixtures NEED the cache
+    # persisted so subsequent warm tests can reuse the cold extract +
+    # match decisions. Production callers don't pass this flag.
     cold_report = run_once(
         apply=True,
         capture_path=str(capture),
@@ -188,6 +193,7 @@ def _maybe_run_cold(
         use_cache=True,
         only_file_name=only_name,
         since_override=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        force_cache_save=True,
     )
     assert cold_report.errors == [], f"cold errors: {cold_report.errors}"
     return cache, state, capture, file_path
@@ -369,6 +375,23 @@ def test_nemoclaw_edit_task_appears_in_warm_capture(tmp_path):
 
 
 def test_v0_lior_edit_step_appears_in_warm_capture(tmp_path):
+    """Verify the agent's correct behavior on a V0_Lior modification.
+
+    The agent's contract has TWO valid branches depending on Jira state
+    of the matched epic (`_COMPLETED_EPIC_STATUSES` guard in
+    `pipeline/reconciler.py`):
+
+      A. Active matched epic → mutation reflected in a captured Jira
+         write; the marker text appears in at least one captured op.
+      B. Completed matched epic (Done / Closed / Resolved / Cancelled
+         / Won't Do / Won't Fix / In Staging / In Review) →
+         reconciler emits `skip_completed_epic` for that section and
+         suppresses ALL writes for it. Zero ops captured.
+
+    Both branches are correct system behavior. The mutation IS detected
+    in both — branch B differs only in that the agent intentionally
+    refuses to edit a completed epic. We accept both.
+    """
     _ensure_env()
     file_path = _resolve_one_file("*V0_Lior*.md")
     only_name = file_path.name.split("__", 1)[-1]
@@ -389,7 +412,22 @@ def test_v0_lior_edit_step_appears_in_warm_capture(tmp_path):
         mutated_text=mutated, original_text=original,
     )
     assert warm_report.errors == []
-    assert _ops_with_marker(warm_ops, marker) >= 1
+    actions = dict(warm_report.actions_by_kind)
+    if actions.get("skip_completed_epic", 0) >= 1:
+        # Branch B — matched epic is in completed status; system
+        # correctly suppressed all writes for that section. Verify
+        # nothing reached the (capture-mode) Jira sink.
+        assert warm_ops == [], (
+            f"[V0_Lior] skip_completed_epic emitted but ops were "
+            f"captured: {[op.get('path') for op in warm_ops]}"
+        )
+    else:
+        # Branch A — matched epic is active. The mutation must appear
+        # in at least one captured op.
+        assert _ops_with_marker(warm_ops, marker) >= 1, (
+            f"marker {marker!r} missing from warm capture "
+            f"({len(warm_ops)} ops); actions={actions}"
+        )
 
 
 def test_may1_three_changes_in_one_warm_run(tmp_path):
