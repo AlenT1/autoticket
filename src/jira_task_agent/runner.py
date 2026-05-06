@@ -25,6 +25,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .cache import Cache, file_content_sha
 from .drive.client import (
@@ -99,24 +100,14 @@ def run_once(
     `use_cache=False` (or `--no-cache` on the CLI) to force re-run
     everything.
     """
-    if source not in ("both", "gdrive", "local"):
-        raise ValueError(f"invalid source {source!r}; expected both/gdrive/local")
-
     started = datetime.now(tz=timezone.utc)
     report = RunReport(started_at=started, apply=apply)
     cache = Cache.load(cache_path) if use_cache else Cache()
 
-    project_key = os.environ.get("JIRA_PROJECT_KEY")
-    if not project_key:
-        report.errors.append("JIRA_PROJECT_KEY is not set in env")
-        report.finished_at = datetime.now(tz=timezone.utc)
+    env = _validate_run_env(source, report)
+    if env is None:
         return report
-
-    folder_id = os.environ.get("FOLDER_ID") if source in ("both", "gdrive") else None
-    if source in ("both", "gdrive") and not folder_id:
-        report.errors.append("FOLDER_ID is not set in env")
-        report.finished_at = datetime.now(tz=timezone.utc)
-        return report
+    project_key, folder_id = env
 
     state = load_state(state_path)
     cursor = since_override or state.last_run_at
@@ -124,9 +115,124 @@ def run_once(
         "run_once: cursor=%s apply=%s source=%s", cursor, apply, source,
     )
 
+    files, local_paths = _collect_files(
+        source, folder_id, download_dir, local_dir, report,
+    )
+
+    report.files_total = len(files)
+    if not files:
+        return _finalize_empty_run(report, started, apply, state_path, "no files")
+
+    # 3+4. Dedupe + classify all ------------------------------------------
+    content_shas = _compute_content_shas(files, local_paths)
+    classifications = _classify_all_files(
+        files, local_paths, content_shas, cache, report,
+    )
+
+    # 5. Bundle root context (always — regardless of cursor) --------------
+    root_context = bundle_root_context(
+        _root_pairs(files, classifications, local_paths),
+    )
+
+    # 6. Extract task-bearing files modified since cursor (+ --only filter) ---
+    extractions, dirty_anchors_per_file = _extract_task_bearing_files(
+        files, classifications, local_paths, content_shas, root_context,
+        cache, use_cache, cursor, only_file_name, report,
+    )
+
+    if not extractions:
+        return _finalize_empty_run(
+            report, started, apply, state_path, "no task-bearing files to reconcile",
+        )
+
+    # 7. Fetch project tree from Jira (one paginated /search) -------------
+    jira = JiraClient.from_env()
+    _resolver = StaticMapStrategy()
+    sink, captured_writes = _make_sink(jira, project_key, capture_path, _resolver)
+    project_tree = _fetch_project_tree(sink, project_key, report)
+    if project_tree is None:
+        report.finished_at = datetime.now(tz=timezone.utc)
+        return report
+
+    # 8. Matcher ----------------------------------------------------------
+    matcher_result = _run_matcher(
+        extractions, project_tree, cache, content_shas, use_cache,
+        matcher_batch_size, matcher_max_workers, dirty_anchors_per_file,
+        report,
+    )
+    if matcher_result is None:
+        report.finished_at = datetime.now(tz=timezone.utc)
+        return report
+
+    # 9. Filter to dirty + build ReconcilePlans ---------------------------
+    plans = _build_plans(
+        matcher_result, extractions, dirty_anchors_per_file,
+        sink, _resolver, report,
+    )
+    if plans is None:
+        report.finished_at = datetime.now(tz=timezone.utc)
+        return report
+
+    report.plans.extend(plans)
+
+    # 10. apply (or report-only) ------------------------------------------
+    if apply and verify_before_apply:
+        verify_outcome = _verify_gate(
+            report, plans, jira=jira, source=source,
+            verify_md_path=verify_md_path,
+        )
+        if verify_outcome is None:
+            report.finished_at = datetime.now(tz=timezone.utc)
+            return report
+
+    _count_action_kinds(plans, report)
+
+    if apply:
+        _run_apply_phase(plans, extractions, sink, target_epic, report)
+
+    # 11. Persist cursor + dump captured writes ---------------------------
+    report.finished_at = datetime.now(tz=timezone.utc)
+    _persist_state(state, started, apply, capture_path, report, state_path)
+    _dump_capture(capture_path, captured_writes)
+    _persist_cache(cache, cache_path, use_cache, apply, capture_path, report)
+    return report
+
+
+# ----------------------------------------------------------------------
+# run_once helpers (extracted to keep run_once orchestration-only;
+# each helper owns one phase's branching so cognitive complexity stays
+# bounded per function).
+# ----------------------------------------------------------------------
+
+
+def _validate_run_env(source: str, report: "RunReport") -> tuple[str, str | None] | None:
+    """Validate inputs and required env vars. Returns (project_key, folder_id)
+    or None if the run should bail (with errors already on `report`)."""
+    if source not in ("both", "gdrive", "local"):
+        raise ValueError(f"invalid source {source!r}; expected both/gdrive/local")
+    project_key = os.environ.get("JIRA_PROJECT_KEY")
+    if not project_key:
+        report.errors.append("JIRA_PROJECT_KEY is not set in env")
+        report.finished_at = datetime.now(tz=timezone.utc)
+        return None
+    folder_id = os.environ.get("FOLDER_ID") if source in ("both", "gdrive") else None
+    if source in ("both", "gdrive") and not folder_id:
+        report.errors.append("FOLDER_ID is not set in env")
+        report.finished_at = datetime.now(tz=timezone.utc)
+        return None
+    return project_key, folder_id
+
+
+def _collect_files(
+    source: str,
+    folder_id: str | None,
+    download_dir: str,
+    local_dir: str,
+    report: "RunReport",
+) -> tuple[list[DriveFile], dict[str, Path]]:
+    """List + download files from the configured sources."""
     files: list[DriveFile] = []
     local_paths: dict[str, Path] = {}
-
     if source in ("both", "gdrive"):
         drive_service = build_service()
         drive_files = list_folder(folder_id, service=drive_service)
@@ -139,93 +245,126 @@ def run_once(
                     local_paths[f.id] = p
             except Exception as e:  # noqa: BLE001
                 report.errors.append(f"download failed for {f.name}: {e}")
-
     if source in ("both", "local"):
         local_files, local_only_paths = list_local_folder(Path(local_dir))
         files.extend(local_files)
         local_paths.update(local_only_paths)
+    return files, local_paths
 
-    report.files_total = len(files)
-    if not files:
-        logger.info("run_once: no files from source=%s; nothing to do", source)
-        report.finished_at = datetime.now(tz=timezone.utc)
-        if apply:
-            save_state(State(last_run_at=started, last_run_status="ok"), state_path)
-        return report
 
-    # 3+4. Dedupe + classify all ------------------------------------------
-    duplicate_of = find_duplicate_copies(files, local_paths)
-    classifications: dict[str, ClassifyResult] = {}
-    neighbor_names = [f.name for f in files]
-    # Pre-compute file content shas (used by both classify-cache and
-    # extract-cache). Cheap (sha256 over a few KB).
-    content_shas: dict[str, str] = {}
+def _finalize_empty_run(
+    report: "RunReport",
+    started: datetime,
+    apply: bool,
+    state_path: Path | None,
+    reason: str,
+) -> "RunReport":
+    """Short-circuit when there's nothing to reconcile (no files, or no
+    task-bearing extractions). Logs the reason; persists the cursor only
+    if `apply=True`."""
+    logger.info("run_once: %s; nothing to do", reason)
+    report.finished_at = datetime.now(tz=timezone.utc)
+    if apply:
+        save_state(State(last_run_at=started, last_run_status="ok"), state_path)
+    return report
+
+
+def _compute_content_shas(
+    files: list[DriveFile], local_paths: dict[str, Path],
+) -> dict[str, str]:
+    out: dict[str, str] = {}
     for f in files:
         if f.id in local_paths:
             try:
-                content_shas[f.id] = file_content_sha(local_paths[f.id])
+                out[f.id] = file_content_sha(local_paths[f.id])
             except Exception:
                 pass
+    return out
 
+
+def _classify_all_files(
+    files: list[DriveFile],
+    local_paths: dict[str, Path],
+    content_shas: dict[str, str],
+    cache: Cache,
+    report: "RunReport",
+) -> dict[str, ClassifyResult]:
+    """Tier-1-cached classification for every file. Mutates `report`'s
+    classification counters."""
+    duplicate_of = find_duplicate_copies(files, local_paths)
+    classifications: dict[str, ClassifyResult] = {}
+    neighbor_names = [f.name for f in files]
     for f in files:
         if f.id not in local_paths:
             continue
-        if f.id in duplicate_of:
-            res = ClassifyResult(
-                file_id=f.id,
-                role="skip",
-                confidence=1.0,
-                reason=f"content-duplicate of canonical file {duplicate_of[f.id]}",
-            )
+        res = _classify_one(
+            f, local_paths, content_shas, neighbor_names, cache,
+            duplicate_of, report,
+        )
+        if res is not None:
             classifications[f.id] = res
-            report.files_classified["skip"] = (
-                report.files_classified.get("skip", 0) + 1
-            )
-            logger.info("dedup: %s is a copy of %s", f.name, duplicate_of[f.id])
-            continue
+    return classifications
 
-        # Tier 1 cache: skip classify if (file_id, modified_time) match.
-        mtime_iso = f.modified_time.isoformat()
-        cached = cache.get_classification(f.id, mtime_iso)
-        if cached is not None:
-            role, conf, reason = cached
-            res = ClassifyResult(
-                file_id=f.id,
-                role=role,
-                confidence=conf or 0.0,
-                reason=(reason or "") + " [cache hit]",
-            )
-            classifications[f.id] = res
-            report.files_classified[role] = report.files_classified.get(role, 0) + 1
-            report.cache_hits_classify += 1
-            logger.info("cache: classify hit for %s -> %s", f.name, role)
-            continue
 
-        try:
-            res = classify_file(
-                f, local_path=local_paths[f.id], neighbor_names=neighbor_names
-            )
-            classifications[f.id] = res
-            report.files_classified[res.role] = (
-                report.files_classified.get(res.role, 0) + 1
-            )
-            logger.info(
-                "classified %s -> %s (conf=%.2f) %s",
-                f.name, res.role, res.confidence, res.reason,
-            )
-            cache.set_classification(
-                file_id=f.id,
-                modified_time=mtime_iso,
-                content_sha=content_shas.get(f.id, ""),
-                role=res.role,
-                confidence=res.confidence,
-                reason=res.reason,
-            )
-        except Exception as e:  # noqa: BLE001
-            report.errors.append(f"classifier failed for {f.name}: {e}")
+def _classify_one(
+    f: DriveFile,
+    local_paths: dict[str, Path],
+    content_shas: dict[str, str],
+    neighbor_names: list[str],
+    cache: Cache,
+    duplicate_of: dict[str, str],
+    report: "RunReport",
+) -> ClassifyResult | None:
+    if f.id in duplicate_of:
+        res = ClassifyResult(
+            file_id=f.id,
+            role="skip",
+            confidence=1.0,
+            reason=f"content-duplicate of canonical file {duplicate_of[f.id]}",
+        )
+        report.files_classified["skip"] = report.files_classified.get("skip", 0) + 1
+        logger.info("dedup: %s is a copy of %s", f.name, duplicate_of[f.id])
+        return res
+    mtime_iso = f.modified_time.isoformat()
+    cached = cache.get_classification(f.id, mtime_iso)
+    if cached is not None:
+        role, conf, reason = cached
+        report.files_classified[role] = report.files_classified.get(role, 0) + 1
+        report.cache_hits_classify += 1
+        logger.info("cache: classify hit for %s -> %s", f.name, role)
+        return ClassifyResult(
+            file_id=f.id, role=role, confidence=conf or 0.0,
+            reason=(reason or "") + " [cache hit]",
+        )
+    try:
+        res = classify_file(
+            f, local_path=local_paths[f.id], neighbor_names=neighbor_names,
+        )
+    except Exception as e:  # noqa: BLE001
+        report.errors.append(f"classifier failed for {f.name}: {e}")
+        return None
+    report.files_classified[res.role] = report.files_classified.get(res.role, 0) + 1
+    logger.info(
+        "classified %s -> %s (conf=%.2f) %s",
+        f.name, res.role, res.confidence, res.reason,
+    )
+    cache.set_classification(
+        file_id=f.id,
+        modified_time=mtime_iso,
+        content_sha=content_shas.get(f.id, ""),
+        role=res.role,
+        confidence=res.confidence,
+        reason=res.reason,
+    )
+    return res
 
-    # 5. Bundle root context (always — regardless of cursor) --------------
-    root_pairs: list[tuple[str, Path]] = sorted(
+
+def _root_pairs(
+    files: list[DriveFile],
+    classifications: dict[str, ClassifyResult],
+    local_paths: dict[str, Path],
+) -> list[tuple[str, Path]]:
+    return sorted(
         (
             (f.name, local_paths[f.id])
             for f in files
@@ -235,10 +374,25 @@ def run_once(
         ),
         key=lambda np: np[0],
     )
-    root_context = bundle_root_context(root_pairs)
 
-    # 6. Extract task-bearing files modified since cursor (+ --only filter) ---
+
+def _extract_task_bearing_files(
+    files: list[DriveFile],
+    classifications: dict[str, ClassifyResult],
+    local_paths: dict[str, Path],
+    content_shas: dict[str, str],
+    root_context: str,
+    cache: Cache,
+    use_cache: bool,
+    cursor: datetime | None,
+    only_file_name: str | None,
+    report: "RunReport",
+) -> tuple[list[tuple[DriveFile, object]], dict[str, set[str] | None]]:
+    """Extract every task-bearing file modified since `cursor` (and matching
+    `--only`). Per-file dirty-anchor map is `None` for cold (process-all),
+    `set()` for Tier 2 hits (no changes), or the changed source_anchors."""
     extractions: list[tuple[DriveFile, object]] = []
+    dirty_anchors_per_file: dict[str, set[str] | None] = {}
 
     def _ok():
         report.extractions_ok += 1
@@ -250,30 +404,12 @@ def run_once(
     def _hit():
         report.cache_hits_extract += 1
 
-    # Per-file dirty-anchor map: which task source_anchors did the doc
-    # actually change this run? None = process-all (cold), set() = none
-    # changed (Tier 2 hit), set(...) = exactly these changed.
-    dirty_anchors_per_file: dict[str, set[str] | None] = {}
-
     for f in files:
-        c = classifications.get(f.id)
-        if not c or c.role not in ("single_epic", "multi_epic"):
+        if not _should_extract(f, classifications, local_paths, cursor, only_file_name):
             continue
-        if f.id not in local_paths:
-            continue
-        if cursor is not None and f.modified_time <= cursor:
-            logger.info(
-                "skip extract %s: modifiedTime %s <= cursor %s",
-                f.name, f.modified_time, cursor,
-            )
-            continue
-        if only_file_name and f.name != only_file_name:
-            logger.info("skip extract %s: --only is set to %r", f.name, only_file_name)
-            continue
-
         ext, dirty = extract_or_reuse(
             f,
-            classification=c,
+            classification=classifications[f.id],
             local_path=local_paths[f.id],
             content_sha=content_shas.get(f.id, ""),
             root_context=root_context,
@@ -292,53 +428,88 @@ def run_once(
                     f.name, len(dirty),
                     ", ".join(sorted(dirty)[:5]) + ("..." if len(dirty) > 5 else ""),
                 )
+    return extractions, dirty_anchors_per_file
 
-    if not extractions:
-        logger.info("run_once: no task-bearing files to reconcile")
-        report.finished_at = datetime.now(tz=timezone.utc)
-        if apply:
-            save_state(State(last_run_at=started, last_run_status="ok"), state_path)
-        return report
 
-    # 7. Fetch project tree from Jira (one paginated /search) -------------
-    jira = JiraClient.from_env()
-    _resolver = StaticMapStrategy()
+def _should_extract(
+    f: DriveFile,
+    classifications: dict[str, ClassifyResult],
+    local_paths: dict[str, Path],
+    cursor: datetime | None,
+    only_file_name: str | None,
+) -> bool:
+    c = classifications.get(f.id)
+    if not c or c.role not in ("single_epic", "multi_epic"):
+        return False
+    if f.id not in local_paths:
+        return False
+    if cursor is not None and f.modified_time <= cursor:
+        logger.info(
+            "skip extract %s: modifiedTime %s <= cursor %s",
+            f.name, f.modified_time, cursor,
+        )
+        return False
+    if only_file_name and f.name != only_file_name:
+        logger.info("skip extract %s: --only is set to %r", f.name, only_file_name)
+        return False
+    return True
+
+
+def _make_sink(
+    jira: JiraClient,
+    project_key: str,
+    capture_path: str | None,
+    resolver: Any,
+) -> tuple[JiraSink, list[dict]]:
+    """Construct the sink (CapturingJiraSink if --capture, otherwise
+    JiraSink). Returns `(sink, captured_writes)` — `captured_writes` is
+    a live reference to the sink's recorder list when capturing, or an
+    empty list when not."""
+    kwargs = {
+        "client": jira,
+        "project_key": project_key,
+        "assignee_resolver": resolver,
+        "filter_components": False,
+    }
     if capture_path:
-        sink: JiraSink = CapturingJiraSink(
-            client=jira,
-            project_key=project_key,
-            assignee_resolver=_resolver,
-            filter_components=False,
-        )
-        captured_writes: list[dict] = sink.captured_writes
-    else:
-        sink = JiraSink(
-            client=jira,
-            project_key=project_key,
-            assignee_resolver=_resolver,
-            filter_components=False,
-        )
-        captured_writes = []
+        sink: JiraSink = CapturingJiraSink(**kwargs)
+        return sink, sink.captured_writes
+    return JiraSink(**kwargs), []
+
+
+def _fetch_project_tree(
+    sink: JiraSink, project_key: str, report: "RunReport",
+) -> dict | None:
     try:
         project_tree = sink.fetch_project_tree(project_key)
-        logger.info(
-            "fetched project tree: %d epics, %d children",
-            project_tree["epic_count"], project_tree["child_count"],
-        )
     except Exception as e:  # noqa: BLE001
         report.errors.append(f"failed to fetch project tree: {e}")
-        report.finished_at = datetime.now(tz=timezone.utc)
-        return report
+        return None
+    logger.info(
+        "fetched project tree: %d epics, %d children",
+        project_tree["epic_count"], project_tree["child_count"],
+    )
+    return project_tree
 
-    # 8. Matcher ----------------------------------------------------------
+
+def _run_matcher(
+    extractions: list[tuple[DriveFile, object]],
+    project_tree: dict,
+    cache: Cache,
+    content_shas: dict[str, str],
+    use_cache: bool,
+    matcher_batch_size: int,
+    matcher_max_workers: int,
+    dirty_anchors_per_file: dict[str, set[str] | None],
+    report: "RunReport",
+):
+    """Run the two-stage LLM matcher; return `MatcherResult` or `None`
+    if the matcher errored (with the error already on `report`)."""
     def _hit_match():
         report.cache_hits_match += 1
-
     try:
-        matcher_result = match_with_cache(
-            extractions,
-            project_tree,
-            cache,
+        return match_with_cache(
+            extractions, project_tree, cache,
             content_shas=content_shas,
             use_cache=use_cache,
             matcher_batch_size=matcher_batch_size,
@@ -348,81 +519,113 @@ def run_once(
         )
     except Exception as e:  # noqa: BLE001
         report.errors.append(f"matcher failed: {e}")
-        report.finished_at = datetime.now(tz=timezone.utc)
-        return report
+        return None
 
-    # 9. Filter to dirty + build ReconcilePlans ---------------------------
+
+def _build_plans(
+    matcher_result,
+    extractions: list[tuple[DriveFile, object]],
+    dirty_anchors_per_file: dict[str, set[str] | None],
+    sink: JiraSink,
+    resolver: Any,
+    report: "RunReport",
+) -> list[ReconcilePlan] | None:
     try:
         dirty_sections = filter_dirty(
             matcher_result, extractions, dirty_anchors_per_file,
         )
-        plans = build_plans_from_dirty(
-            dirty_sections, sink=sink, resolver=_resolver,
+        return build_plans_from_dirty(
+            dirty_sections, sink=sink, resolver=resolver,
         )
     except Exception as e:  # noqa: BLE001
         report.errors.append(f"build_plans failed: {e}")
-        report.finished_at = datetime.now(tz=timezone.utc)
-        return report
+        return None
 
-    for plan in plans:
-        report.plans.append(plan)
 
-    # 10. apply (or report-only) ------------------------------------------
-    if apply and verify_before_apply:
-        verify_outcome = _verify_gate(
-            report, plans, jira=jira, source=source,
-            verify_md_path=verify_md_path,
-        )
-        if verify_outcome is None:
-            report.finished_at = datetime.now(tz=timezone.utc)
-            return report
-
-    # Count actions AFTER verify so skipped_by_user appears correctly.
+def _count_action_kinds(
+    plans: list[ReconcilePlan], report: "RunReport",
+) -> None:
     for plan in plans:
         for a in plan.actions:
             report.bump_action(a.kind)
 
-    if apply:
-        for plan in plans:
-            f = next((df for df, _ in extractions if _.file_id == plan.file_id), None)
-            if f is None:
-                continue
-            try:
-                _apply_plan(
-                    plan, drive_file=f, sink=sink, target_epic=target_epic,
-                )
-            except Exception as e:  # noqa: BLE001
-                report.errors.append(f"apply failed for {plan.file_name}: {e}")
 
-    # 11. Persist cursor + dump captured writes ---------------------------
-    finished = datetime.now(tz=timezone.utc)
-    report.finished_at = finished
-    if apply and not capture_path and not report.errors:
+def _run_apply_phase(
+    plans: list[ReconcilePlan],
+    extractions: list[tuple[DriveFile, object]],
+    sink: JiraSink,
+    target_epic: str | None,
+    report: "RunReport",
+) -> None:
+    for plan in plans:
+        f = next(
+            (df for df, _ in extractions if _.file_id == plan.file_id), None,
+        )
+        if f is None:
+            continue
+        try:
+            _apply_plan(
+                plan, drive_file=f, sink=sink, target_epic=target_epic,
+            )
+        except Exception as e:  # noqa: BLE001
+            report.errors.append(f"apply failed for {plan.file_name}: {e}")
+
+
+def _persist_state(
+    state: State,
+    started: datetime,
+    apply: bool,
+    capture_path: str | None,
+    report: "RunReport",
+    state_path: Path | None,
+) -> None:
+    """Persist the run-cursor state. Same gate as cache: only saves on
+    a successful apply, and an error apply records the previous cursor
+    with an `error` status flag."""
+    if not (apply and not capture_path):
+        return
+    if not report.errors:
         save_state(State(last_run_at=started, last_run_status="ok"), state_path)
-    elif apply and not capture_path and report.errors:
+    else:
         save_state(
             State(last_run_at=state.last_run_at, last_run_status="error"),
             state_path,
         )
 
-    if capture_path:
-        cap = Path(capture_path)
-        cap.parent.mkdir(parents=True, exist_ok=True)
-        cap.write_text(
-            _json.dumps(captured_writes, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        logger.info(
-            "capture: %d intended write(s) recorded to %s",
-            len(captured_writes), capture_path,
-        )
 
-    # Persist cache only when writes actually landed in Jira: same gate
-    # as state.json. Capture-mode runs and dry-runs intentionally don't
-    # save — saving them would lie about Jira state and cause `create_*`
-    # actions to be silently skipped on the next warm run (Tier 2 hit
-    # with dirty=∅) while Jira has no record of the issue.
-    if use_cache and apply and not capture_path and not report.errors:
+def _dump_capture(
+    capture_path: str | None, captured_writes: list[dict],
+) -> None:
+    if not capture_path:
+        return
+    cap = Path(capture_path)
+    cap.parent.mkdir(parents=True, exist_ok=True)
+    cap.write_text(
+        _json.dumps(captured_writes, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info(
+        "capture: %d intended write(s) recorded to %s",
+        len(captured_writes), capture_path,
+    )
+
+
+def _persist_cache(
+    cache: Cache,
+    cache_path: Path | None,
+    use_cache: bool,
+    apply: bool,
+    capture_path: str | None,
+    report: "RunReport",
+) -> None:
+    """Save the matcher cache only when actual writes landed in Jira.
+    Same gate as `_persist_state`. Capture-mode and dry-runs intentionally
+    don't save — saving them would lie about Jira state and cause
+    `create_*` actions to be silently skipped on the next warm run
+    (Tier 2 hit with dirty=∅) while Jira has no record of the issue."""
+    if not use_cache:
+        return
+    if apply and not capture_path and not report.errors:
         try:
             cache.save(cache_path)
             logger.info(
@@ -431,13 +634,12 @@ def run_once(
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("cache: save failed: %s", e)
-    elif use_cache:
-        logger.info(
-            "cache: NOT saved (apply=%s capture=%s errors=%d) — "
-            "preserves cache/Jira consistency",
-            apply, bool(capture_path), len(report.errors),
-        )
-    return report
+        return
+    logger.info(
+        "cache: NOT saved (apply=%s capture=%s errors=%d) — "
+        "preserves cache/Jira consistency",
+        apply, bool(capture_path), len(report.errors),
+    )
 
 
 # ----------------------------------------------------------------------
