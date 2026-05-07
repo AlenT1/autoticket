@@ -141,12 +141,12 @@ class Settings(BaseSettings):
         project = self.jira_project_key or os.environ.get("REPO_NAME") or "unknown"
         role_file = Path.home() / ".autodev" / "tokens" / f"task-jira-{project}"
         if role_file.exists():
-            return role_file.read_text().strip()
+            return role_file.read_text(encoding="utf-8").strip()
         repo_owner = os.environ.get("REPO_OWNER", "unknown")
         repo_name = os.environ.get("REPO_NAME", "unknown")
         legacy = Path.home() / ".autodev" / "tokens" / f"{repo_owner}-{repo_name}"
         if legacy.exists():
-            return legacy.read_text().strip()
+            return legacy.read_text(encoding="utf-8").strip()
         if self.autodev_token:
             return self.autodev_token.strip()
         return None

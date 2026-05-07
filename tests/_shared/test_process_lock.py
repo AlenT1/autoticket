@@ -3,12 +3,22 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
 from _shared.process_lock import RunLockBusy, acquire_run_lock
+
+# On Windows the lock file holds a single sentinel byte at offset 0 so the
+# msvcrt byte-range lock stays valid for the run's lifetime — writing the
+# PID into the file would invalidate that lock. The PID-in-lockfile and
+# PID-in-busy-message diagnostics are POSIX-only.
+_WINDOWS_LOCK_HAS_NO_PID = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows lock holds sentinel byte; PID is not written to the file",
+)
 
 
 def test_acquire_creates_parent_dirs(tmp_path: Path) -> None:
@@ -18,6 +28,7 @@ def test_acquire_creates_parent_dirs(tmp_path: Path) -> None:
         assert target.parent.is_dir()
 
 
+@_WINDOWS_LOCK_HAS_NO_PID
 def test_acquire_writes_pid(tmp_path: Path) -> None:
     target = tmp_path / "run.lock"
     with acquire_run_lock(target):
@@ -69,6 +80,7 @@ def test_second_acquirer_in_separate_process_raises(tmp_path: Path) -> None:
         assert p.exitcode == 0
 
 
+@_WINDOWS_LOCK_HAS_NO_PID
 def test_lock_message_includes_holder_pid(tmp_path: Path) -> None:
     target = tmp_path / "run.lock"
     with acquire_run_lock(target):
