@@ -70,7 +70,7 @@ packages = ["src/_shared", "src/file_to_jira", "src/jira_task_agent"]
 [tool.hatch.build.targets.wheel.force-include]
 # f2j's external prompt + default config get vendored as package data.
 "prompts/file_to_jira/enrichment_system.md" = "file_to_jira/_data/enrichment_system.md"
-"configs/default.yaml" = "file_to_jira/_data/default.yaml"
+"configs/f2j.yaml" = "file_to_jira/_data/f2j.yaml"
 # jira_task_agent's prompt templates live under the package, ship as package data.
 "src/jira_task_agent/llm/prompts" = "jira_task_agent/llm/prompts"
 

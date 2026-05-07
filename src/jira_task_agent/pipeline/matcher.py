@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 
@@ -664,7 +663,9 @@ def compute_matcher_prompt_sha() -> str:
     parts = [
         _SYSTEM_PROMPT,
         _GROUPED_SYSTEM_PROMPT,
-        os.environ.get("LLM_MODEL_CLASSIFY", ""),
+        # Cache key includes the active classify model so the cache busts
+        # when configs/jira_task_agent.yaml::models.classify changes.
+        models_classify()[0],
         f"min_conf:{_MIN_CONFIDENCE_BY_KIND}",
     ]
     payload = "\n---\n".join(parts)

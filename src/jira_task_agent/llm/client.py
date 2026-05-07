@@ -4,7 +4,8 @@ Routes through :class:`_shared.llm.OpenAICompatProvider` for the actual SDK
 call. This module owns:
 
 - the multi-model fallback chain (try N models in order on transient errors)
-- per-task model defaults (classify / extract / summarize), env-overridable
+- per-task model defaults (classify / extract / summarize), read from
+  ``configs/jira_task_agent.yaml``
 - JSON-mode plumbing: code-fence stripping + ``json.loads`` of the content
 - prompt loading + ``render_prompt`` (variable substitution that ignores
   literal ``{...}`` blocks in JSON examples)
@@ -13,15 +14,18 @@ What lives elsewhere:
 
 - SDK construction, base_url + api_key resolution, normalized response
   shape — :class:`_shared.llm.OpenAICompatProvider`.
+- Operator-edited values (API key, base URL) — ``.env`` via
+  :class:`_shared.config.Settings`.
 """
 from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from _shared.llm import LLMProvider, OpenAICompatProvider
 
@@ -29,31 +33,65 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://inference-api.nvidia.com/v1/"
 
-# Fallback chains. First entry wins; later entries are tried only when the
-# earlier ones fail. Override per-task via env (LLM_MODEL_CLASSIFY etc.).
-_FALLBACK = [
+# Hard-coded fallback chain when the YAML or its specific entry is missing.
+# Used in the order shown; first model that succeeds wins.
+_HARD_FALLBACK = [
     "openai/openai/gpt-5.2",
     "meta/llama-3.1-70b-instruct",
     "meta/llama-3.1-8b-instruct",
 ]
 
+# Per-task hard defaults — used only when the YAML config can't be read.
+_TASK_HARD_DEFAULT = {
+    "classify":  "meta/llama-3.1-70b-instruct",
+    "extract":   "openai/openai/gpt-5.2",
+    "summarize": "meta/llama-3.1-8b-instruct",
+}
 
-def _models_for(env_name: str, primary_default: str) -> list[str]:
-    primary = os.getenv(env_name) or primary_default
-    chain = [primary] + [m for m in _FALLBACK if m != primary]
-    return chain
+_CONFIG_PATH = Path(__file__).resolve().parents[3] / "configs" / "jira_task_agent.yaml"
+
+_yaml_cache: dict[str, Any] | None = None
+
+
+def _load_yaml_config() -> dict[str, Any]:
+    """Read configs/jira_task_agent.yaml once, cache, return parsed dict."""
+    global _yaml_cache
+    if _yaml_cache is not None:
+        return _yaml_cache
+    if not _CONFIG_PATH.exists():
+        logger.warning(
+            "configs/jira_task_agent.yaml not found at %s; using hard-coded "
+            "model defaults.", _CONFIG_PATH
+        )
+        _yaml_cache = {}
+        return _yaml_cache
+    with _CONFIG_PATH.open(encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{_CONFIG_PATH} must be a YAML mapping at the root."
+        )
+    _yaml_cache = data
+    return _yaml_cache
+
+
+def _models_for(task: str) -> list[str]:
+    cfg = _load_yaml_config()
+    models_section = cfg.get("models") or {}
+    primary = models_section.get(task) or _TASK_HARD_DEFAULT[task]
+    return [primary] + [m for m in _HARD_FALLBACK if m != primary]
 
 
 def models_classify() -> list[str]:
-    return _models_for("LLM_MODEL_CLASSIFY", "meta/llama-3.1-70b-instruct")
+    return _models_for("classify")
 
 
 def models_extract() -> list[str]:
-    return _models_for("LLM_MODEL_EXTRACT", "openai/openai/gpt-5.2")
+    return _models_for("extract")
 
 
 def models_summarize() -> list[str]:
-    return _models_for("LLM_MODEL_SUMMARIZE", "meta/llama-3.1-8b-instruct")
+    return _models_for("summarize")
 
 
 _provider_singleton: LLMProvider | None = None
@@ -62,15 +100,8 @@ _provider_singleton: LLMProvider | None = None
 def _get_provider() -> LLMProvider:
     global _provider_singleton
     if _provider_singleton is None:
-        api_key = os.getenv("NVIDIA_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "NVIDIA_API_KEY is required. Add it to .env. "
-                "Get one from https://build.nvidia.com or your internal NVIDIA "
-                "Inference console."
-            )
-        base_url = os.getenv("NVIDIA_BASE_URL") or DEFAULT_BASE_URL
-        _provider_singleton = OpenAICompatProvider(api_key=api_key, base_url=base_url)
+        from _shared.config import load_settings
+        _provider_singleton = OpenAICompatProvider.from_settings(load_settings())
     return _provider_singleton
 
 

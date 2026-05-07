@@ -100,6 +100,7 @@ def test_runner_invalid_source_raises(tmp_path, monkeypatch):
 
 def test_runner_gdrive_requires_folder_id(tmp_path, monkeypatch):
     monkeypatch.delenv("FOLDER_ID", raising=False)
+    monkeypatch.delenv("DRIVE_FOLDER_ID", raising=False)
     monkeypatch.setenv("JIRA_PROJECT_KEY", "TEST")
     report = run_once(
         apply=False,
@@ -108,7 +109,7 @@ def test_runner_gdrive_requires_folder_id(tmp_path, monkeypatch):
         state_path=tmp_path / "state.json",
         use_cache=False,
     )
-    assert any("FOLDER_ID" in e for e in report.errors)
+    assert any("DRIVE_FOLDER_ID" in e for e in report.errors)
 
 
 def test_runner_local_source_classifies_local_files(tmp_path, monkeypatch):

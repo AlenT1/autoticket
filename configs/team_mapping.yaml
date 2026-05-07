@@ -1,0 +1,17 @@
+# jira_task_agent team mapping: first name (as it appears in planning docs)
+# → Jira username. Used by the assignee resolution step in
+# `pipeline/extractor.py`.
+#
+# This is the YAML migration of `team_mapping.json`. Keep both in sync
+# until the .json is removed in a follow-up.
+
+Saar:    sriftin
+Aviv:    ariftin
+Lior:    lischwartz
+Sharon:  sharong
+Yuval:   yhamuy
+Yair:    ysadan
+Noam:    nlederman
+Einat:   eshahal
+Joel:    jlanglois
+Guy:     gkeinan

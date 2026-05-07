@@ -24,18 +24,14 @@ load_dotenv(override=False)
 
 
 class AnthropicConfig(BaseModel):
+    """f2j-specific Anthropic enrichment-loop tuning.
+
+    Connection details (base URL, API key) live in :class:`_shared.config.Settings`
+    (``ANTHROPIC_API_KEY``, ``ANTHROPIC_BASE_URL``). The provider is built via
+    :meth:`AnthropicProvider.from_settings`.
+    """
     model: str = "claude-sonnet-4-6"
     enable_prompt_caching: bool = True
-    # Override the SDK default `https://api.anthropic.com`. Set this to route
-    # through an Anthropic-compatible internal proxy (NVIDIA MaaS, AWS Bedrock,
-    # etc.). Per-operator: each user can set this in their own `.env` or
-    # `~/.config/f2j/config.yaml` without touching the shared project repo.
-    base_url: str | None = None
-    # Name of the env var holding the bearer token, when not using the default
-    # `ANTHROPIC_API_KEY`. Some proxies expect `ANTHROPIC_AUTH_TOKEN` or a
-    # team-specific name. Only the *name* lives in config; the token itself
-    # always comes from env (never YAML).
-    auth_token_env: str | None = None
 
 
 class EnrichmentConfig(BaseModel):
@@ -57,20 +53,13 @@ class EnrichmentConfig(BaseModel):
 
 
 class OpenAICompatibleConfig(BaseModel):
-    """Endpoint configuration for the openai_compatible provider.
+    """f2j-specific OpenAI-compatible enrichment-loop tuning.
 
-    The token itself never lives in YAML — only the env-var *name* does. That
-    keeps the project repo shareable; each operator drops their token in `.env`.
-
-    The base URL can also come from env (via ``base_url_env``) so an operator
-    behind a different region/proxy doesn't need to edit f2j.yaml.
-    Resolution order for the URL: ``base_url_env`` (if set and the env var has
-    a value) → ``base_url`` literal → SDK default.
+    Connection details (base URL, API key) live in :class:`_shared.config.Settings`
+    (``NVIDIA_API_KEY``, ``NVIDIA_BASE_URL``). The provider is built via
+    :meth:`OpenAICompatProvider.from_settings`.
     """
 
-    base_url: str = "https://api.openai.com/v1"
-    base_url_env: str | None = None  # optional: read the URL from this env var
-    api_key_env: str = "OPENAI_API_KEY"
     model: str = "gpt-4o"
     temperature: float = 0.0
     max_tokens_per_turn: int = 4096
@@ -247,12 +236,6 @@ class AppConfig(BaseSettings):
         )
 
 
-SECRET_ENV_VARS: dict[str, str] = {
-    "anthropic_api_key": "ANTHROPIC_API_KEY",
-    "jira_pat": "JIRA_PAT",
-}
-
-
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
@@ -288,7 +271,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 def config_paths(explicit: Path | None) -> list[Path]:
     """Return config file paths in load order (later wins). Existence not checked here."""
-    paths = [_project_root() / "configs" / "default.yaml"]
+    paths = [_project_root() / "configs" / "f2j.yaml"]
     paths.append(_user_config_dir() / "config.yaml")
     paths.append(Path.cwd() / "f2j.yaml")
     if explicit is not None:

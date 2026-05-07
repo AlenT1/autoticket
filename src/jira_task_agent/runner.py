@@ -146,7 +146,8 @@ def run_once(
         )
 
     # 7. Fetch project tree from Jira (one paginated /search) -------------
-    jira = JiraClient.from_env()
+    from _shared.config import load_settings
+    jira = JiraClient.from_settings(load_settings())
     _resolver = StaticMapStrategy()
     sink, captured_writes = _make_sink(jira, project_key, capture_path, _resolver)
     project_tree = _fetch_project_tree(sink, project_key, report)
@@ -213,14 +214,16 @@ def _validate_run_env(source: str, report: "RunReport") -> tuple[str, str | None
     or None if the run should bail (with errors already on `report`)."""
     if source not in ("both", "gdrive", "local"):
         raise ValueError(f"invalid source {source!r}; expected both/gdrive/local")
-    project_key = os.environ.get("JIRA_PROJECT_KEY")
+    from _shared.config import load_settings
+    settings = load_settings()
+    project_key = settings.jira_project_key
     if not project_key:
-        report.errors.append("JIRA_PROJECT_KEY is not set in env")
+        report.errors.append("JIRA_PROJECT_KEY is not set")
         report.finished_at = datetime.now(tz=timezone.utc)
         return None
-    folder_id = os.environ.get("FOLDER_ID") if source in ("both", "gdrive") else None
+    folder_id = settings.drive_folder_id if source in ("both", "gdrive") else None
     if source in ("both", "gdrive") and not folder_id:
-        report.errors.append("FOLDER_ID is not set in env")
+        report.errors.append("DRIVE_FOLDER_ID is not set")
         report.finished_at = datetime.now(tz=timezone.utc)
         return None
     return project_key, folder_id

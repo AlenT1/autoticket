@@ -55,6 +55,24 @@ class AnthropicProvider:
             kwargs["base_url"] = resolved_url
         self._client = Anthropic(**kwargs)
 
+    @classmethod
+    def from_settings(cls, settings: Any) -> "AnthropicProvider":
+        """Build a provider from a unified ``Settings`` object.
+
+        Reads ``anthropic_api_key`` + ``anthropic_base_url`` (env:
+        ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_BASE_URL``). One canonical
+        name per field; legacy names are not consulted.
+        """
+        if not settings.anthropic_api_key:
+            raise RuntimeError(
+                "No Anthropic key resolvable from settings. Set "
+                "ANTHROPIC_API_KEY in .env."
+            )
+        return cls(
+            api_key=settings.anthropic_api_key,
+            base_url=settings.anthropic_base_url,
+        )
+
     # ---- LLMProvider ----------------------------------------------------
 
     def chat(

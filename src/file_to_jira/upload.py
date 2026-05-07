@@ -17,7 +17,6 @@ expressed as plug-in strategies, not hard-coded behaviors:
 from __future__ import annotations
 
 import logging
-import os
 import re
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -30,15 +29,11 @@ from rich.table import Table
 
 from _shared.io.sinks import Ticket
 from _shared.io.sinks.jira import JiraSink
+from _shared.io.sinks.jira.client import JiraClient
 from _shared.io.sinks.jira.strategies import (
     DeterministicChainStrategy,
     LabelSearchStrategy,
     PickerWithCacheStrategy,
-)
-from _shared.io.sinks.jira.client import (
-    JiraClient,
-    _build_auth_header,
-    _normalize_host,
 )
 
 from .config import AppConfig
@@ -117,45 +112,15 @@ def markdown_to_jira_wiki(md: str) -> str:
 # JiraClient construction (bridges f2j config → drive's env-driven from_env)
 # ---------------------------------------------------------------------------
 
-def _build_jira_client(cfg: AppConfig) -> JiraClient:
-    """Build a JiraClient honoring f2j's config without disturbing the env."""
-    host = _normalize_host(cfg.jira.url or "")
-    if not host:
-        raise RuntimeError("cfg.jira.url is not configured")
-    token = os.environ.get("JIRA_PAT") or os.environ.get("JIRA_TOKEN")
-    if not token:
-        # Fall back to the autodev token chain inside JiraClient by setting
-        # JIRA_PROJECT_KEY temporarily — but only consult the file system,
-        # don't mutate the parent env permanently. Easier: import the
-        # token loader directly.
-        from _shared.io.sinks.jira.client import _load_token
-        prior = os.environ.get("JIRA_PROJECT_KEY")
-        os.environ["JIRA_PROJECT_KEY"] = cfg.jira.project_key or "unknown"
-        try:
-            token = _load_token()
-        finally:
-            if prior is None:
-                os.environ.pop("JIRA_PROJECT_KEY", None)
-            else:
-                os.environ["JIRA_PROJECT_KEY"] = prior
-    auth_mode = cfg.jira.auth_mode or "bearer"
-    # _build_auth_header reads JIRA_AUTH_MODE / JIRA_USER_EMAIL from env;
-    # bridge cfg into env temporarily so it works for "basic" Cloud auth.
-    prior_mode = os.environ.get("JIRA_AUTH_MODE")
-    prior_email = os.environ.get("JIRA_USER_EMAIL")
-    os.environ["JIRA_AUTH_MODE"] = auth_mode
-    if cfg.jira.user_email:
-        os.environ["JIRA_USER_EMAIL"] = cfg.jira.user_email
-    try:
-        auth_header = _build_auth_header(token)
-    finally:
-        if prior_mode is None:
-            os.environ.pop("JIRA_AUTH_MODE", None)
-        else:
-            os.environ["JIRA_AUTH_MODE"] = prior_mode
-        if cfg.jira.user_email and prior_email is None:
-            os.environ.pop("JIRA_USER_EMAIL", None)
-    return JiraClient(host=host, auth_header=auth_header, auth_mode=auth_mode)
+def _build_jira_client() -> JiraClient:
+    """Build a JiraClient via the unified Settings layer.
+
+    Connection details (host, project_key, auth_mode, user_email, ca_bundle,
+    token) come from ``.env`` + ``configs/shared.yaml``. Jira connection
+    config is shared between agents, not f2j-specific.
+    """
+    from _shared.config import load_settings
+    return JiraClient.from_settings(load_settings())
 
 
 def _issue_browse_url(client: JiraClient, key: str) -> str:
@@ -357,7 +322,7 @@ def upload_state(
 
     if client is None:
         try:
-            client = _build_jira_client(cfg)
+            client = _build_jira_client()
         except Exception as e:  # noqa: BLE001
             if not dry_run:
                 err_console.print(f"[red]could not build JiraClient:[/red] {e}")

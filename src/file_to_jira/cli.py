@@ -23,7 +23,6 @@ from rich.table import Table
 
 from . import __version__
 from .config import (
-    SECRET_ENV_VARS,
     AppConfig,
     config_paths,
     get_secret,
@@ -282,10 +281,11 @@ def _build_parse_source(
         return F2JFileSource(input_file), str(input_file)
 
     if source == "gdrive":
-        fid = folder_id or os.environ.get("FOLDER_ID")
+        from _shared.config import load_settings
+        fid = folder_id or load_settings().drive_folder_id
         if not fid:
             err_console.print(
-                "[red]--source gdrive requires --folder-id or $FOLDER_ID.[/red]"
+                "[red]--source gdrive requires --folder-id or $DRIVE_FOLDER_ID.[/red]"
             )
             raise typer.Exit(code=1)
         if not only:
@@ -510,7 +510,7 @@ def validate_config(
     _cli_cross_checks()
 
     console.rule("[bold]Phase 1 readiness[/bold]")
-    blockers = _phase1_readiness(cfg, missing, console)
+    blockers = _phase1_readiness(cfg, console)
 
     if missing:
         console.print(
@@ -531,41 +531,40 @@ def validate_config(
         log.info("validate_config: all secrets and config present")
 
 
-def _check_enrich_readiness(
-    cfg: AppConfig, missing_secrets: list[str]
-) -> tuple[bool, list[str]]:
+def _check_enrich_readiness(cfg: AppConfig) -> tuple[bool, list[str]]:
     """Check whether the enrich stage has its credentials. Returns (ok, blockers)."""
+    from _shared.config import load_settings
+    settings = load_settings()
     if cfg.enrichment.provider == "openai_compatible":
-        env_name = cfg.openai_compatible.api_key_env
-        if not get_secret(env_name):
-            return False, [f"{env_name} (for openai_compatible enrichment)"]
+        if not settings.nvidia_api_key:
+            return False, ["NVIDIA_API_KEY (for openai_compatible enrichment)"]
         return True, []
-    if "ANTHROPIC_API_KEY" in missing_secrets:
+    if not settings.anthropic_api_key:
         return False, ["ANTHROPIC_API_KEY (for enrichment)"]
     return True, []
 
 
-def _check_upload_readiness(
-    cfg: AppConfig, missing_secrets: list[str]
-) -> tuple[bool, list[str]]:
+def _check_upload_readiness(cfg: AppConfig) -> tuple[bool, list[str]]:
     """Check whether the upload stage has Jira config + creds. Returns (ok, blockers)."""
+    from _shared.config import load_settings
+    settings = load_settings()
     blockers: list[str] = []
-    if "JIRA_PAT" in missing_secrets:
-        blockers.append("JIRA_PAT (for upload)")
-    if not cfg.jira.url:
-        blockers.append("jira.url (for upload)")
-    if not cfg.jira.project_key:
-        blockers.append("jira.project_key (for upload)")
+    if not settings.effective_jira_token():
+        blockers.append("JIRA_TOKEN (for upload)")
+    if not settings.jira_host:
+        blockers.append("JIRA_HOST (for upload)")
+    if not settings.jira_project_key:
+        blockers.append("JIRA_PROJECT_KEY (for upload)")
     if not cfg.jira.field_map:
         blockers.append("jira.field_map (run `f2j jira fields --project <KEY>`)")
     return (not blockers, blockers)
 
 
-def _phase1_readiness(cfg: AppConfig, missing_secrets: list[str], console: Console) -> list[str]:
+def _phase1_readiness(cfg: AppConfig, console: Console) -> list[str]:
     """Print a per-stage readiness checklist; return list of unmet blockers."""
     parse_ok = True
-    enrich_ok, enrich_blockers = _check_enrich_readiness(cfg, missing_secrets)
-    upload_ok, upload_blockers = _check_upload_readiness(cfg, missing_secrets)
+    enrich_ok, enrich_blockers = _check_enrich_readiness(cfg)
+    upload_ok, upload_blockers = _check_upload_readiness(cfg)
     blockers = enrich_blockers + upload_blockers
 
     if not cfg.repo_aliases:
@@ -583,7 +582,7 @@ def _phase1_readiness(cfg: AppConfig, missing_secrets: list[str], console: Conso
     _enrich_why = None
     if not enrich_ok:
         _enrich_why = (
-            f"needs {cfg.openai_compatible.api_key_env}"
+            "needs NVIDIA_API_KEY"
             if cfg.enrichment.provider == "openai_compatible"
             else "needs ANTHROPIC_API_KEY"
         )
@@ -591,7 +590,7 @@ def _phase1_readiness(cfg: AppConfig, missing_secrets: list[str], console: Conso
     _row(
         "upload",
         upload_ok,
-        None if upload_ok else "needs JIRA_PAT + jira.url + project_key + field_map",
+        None if upload_ok else "needs JIRA_TOKEN + jira.url + project_key + field_map",
     )
     return blockers
 
@@ -603,20 +602,9 @@ def _print_config_summary(cfg: AppConfig) -> None:
 
     table.add_row("enrichment.provider", cfg.enrichment.provider)
     if cfg.enrichment.provider == "openai_compatible":
-        oc = cfg.openai_compatible
-        table.add_row("openai_compatible.base_url", oc.base_url)
-        table.add_row("openai_compatible.api_key_env", oc.api_key_env)
-        table.add_row("openai_compatible.model", oc.model)
+        table.add_row("openai_compatible.model", cfg.openai_compatible.model)
     else:
         table.add_row("anthropic.model", cfg.anthropic.model)
-        table.add_row(
-            "anthropic.base_url",
-            cfg.anthropic.base_url or "[dim](SDK default — api.anthropic.com)[/dim]",
-        )
-        table.add_row(
-            "anthropic.auth_token_env",
-            cfg.anthropic.auth_token_env or "[dim](SDK default — ANTHROPIC_API_KEY)[/dim]",
-        )
         table.add_row(
             "anthropic.enable_prompt_caching", str(cfg.anthropic.enable_prompt_caching)
         )
@@ -649,14 +637,13 @@ def _print_secrets_table(cfg: AppConfig | None = None) -> list[str]:
     table.add_column("Value")
     table.add_column("Status")
 
-    # Build the env-var list dynamically: always include the static ones, plus
-    # the openai_compatible one when that provider is selected. Defensive
-    # dedupe via dict.fromkeys preserves insertion order even if upstream
-    # somehow leaks duplicates.
-    raw_names: list[str] = list(SECRET_ENV_VARS.values())
+    # Build the canonical env-var list based on which provider is active.
+    # All names are the canonical Settings names (no aliases).
+    env_names: list[str] = ["JIRA_TOKEN"]
     if cfg is not None and cfg.enrichment.provider == "openai_compatible":
-        raw_names.append(cfg.openai_compatible.api_key_env)
-    env_names: list[str] = list(dict.fromkeys(raw_names))
+        env_names.append("NVIDIA_API_KEY")
+    else:
+        env_names.append("ANTHROPIC_API_KEY")
 
     missing: list[str] = []
     for env_name in env_names:
@@ -725,26 +712,16 @@ def repo_cache_prune(older_than: str = typer.Option("14d", "--older-than")) -> N
     _stub(4, "repo-cache prune")
 
 
-def _build_jira_client_for_cli(cfg: AppConfig):
+def _build_jira_client_for_cli():
     """Build a JiraClient for CLI commands; print + raise typer.Exit on misconfig."""
-    import os
-
+    from _shared.config import load_settings
     from _shared.io.sinks.jira import JiraClient
 
-    if not cfg.jira.url:
-        err_console.print("[red]jira.url is not configured.[/red]")
-        raise typer.Exit(code=1)
-    pat = os.environ.get("JIRA_PAT")
-    if not pat:
-        err_console.print("[red]JIRA_PAT env var is not set.[/red]")
-        raise typer.Exit(code=1)
-    return JiraClient.from_config(
-        url=cfg.jira.url,
-        pat=pat,
-        auth_mode=cfg.jira.auth_mode,
-        user_email=cfg.jira.user_email,
-        ca_bundle=cfg.jira.ca_bundle,
-    )
+    try:
+        return JiraClient.from_settings(load_settings())
+    except RuntimeError as e:
+        err_console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1) from e
 
 
 def _discover_fields_or_exit(client, *, project, issue_type, from_issue):
@@ -828,8 +805,7 @@ def jira_fields(
         raise typer.Exit(code=1)
 
     configure_logging()
-    cfg = load_config()
-    client = _build_jira_client_for_cli(cfg)
+    client = _build_jira_client_for_cli()
     fields, source_label = _discover_fields_or_exit(
         client, project=project, issue_type=issue_type, from_issue=from_issue
     )
@@ -844,22 +820,7 @@ def jira_whoami() -> None:
     from _shared.io.sinks.jira import JiraClient
 
     configure_logging()
-    cfg = load_config()
-    if not cfg.jira.url:
-        err_console.print("[red]jira.url is not configured.[/red]")
-        raise typer.Exit(code=1)
-    pat = os.environ.get("JIRA_PAT")
-    if not pat:
-        err_console.print("[red]JIRA_PAT env var is not set.[/red]")
-        raise typer.Exit(code=1)
-
-    client = JiraClient.from_config(
-        url=cfg.jira.url,
-        pat=pat,
-        auth_mode=cfg.jira.auth_mode,
-        user_email=cfg.jira.user_email,
-        ca_bundle=cfg.jira.ca_bundle,
-    )
+    client = _build_jira_client_for_cli()
     try:
         me = client.whoami()
     except Exception as e:

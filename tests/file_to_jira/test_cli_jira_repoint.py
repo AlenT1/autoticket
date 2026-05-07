@@ -36,22 +36,15 @@ def test_cli_module_loads_without_legacy_jira_import():
 
 def test_cli_build_jira_client_uses_shared_jira_client(monkeypatch):
     """`_build_jira_client_for_cli` should construct a `_shared.io.sinks.jira.JiraClient`
-    via `from_config(...)`, not the legacy `file_to_jira.jira.JiraClient`."""
-    monkeypatch.setenv("JIRA_PAT", "test-pat")
+    via `Settings.from_settings(...)`, not the legacy `file_to_jira.jira.JiraClient`.
+    Connection details come from canonical env vars (JIRA_HOST + JIRA_TOKEN)."""
+    monkeypatch.setenv("JIRA_HOST", "example.atlassian.net")
+    monkeypatch.setenv("JIRA_TOKEN", "test-token")
 
     from _shared.io.sinks.jira import JiraClient as SharedJiraClient
     from file_to_jira.cli import _build_jira_client_for_cli
-    from file_to_jira.config import AppConfig, JiraConfig
 
-    cfg = AppConfig(
-        jira=JiraConfig(
-            url="https://example.atlassian.net",
-            project_key="DEMO",
-            issue_type="Bug",
-            auth_mode="bearer",
-        ),
-    )
-    client = _build_jira_client_for_cli(cfg)
+    client = _build_jira_client_for_cli()
     assert isinstance(client, SharedJiraClient), (
         f"expected `_shared` JiraClient, got {type(client)}"
     )

@@ -90,6 +90,29 @@ def _load_credentials(
     return creds
 
 
+def _load_credentials_from_env_values(
+    *,
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+) -> Credentials:
+    """Build :class:`Credentials` from three discrete OAuth values.
+
+    No JSON file on disk. The ``refresh_token`` is the durable secret;
+    access tokens regenerate from it on first use.
+    """
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=SCOPES,
+    )
+    creds.refresh(Request())
+    return creds
+
+
 def build_service(
     credentials_path: Path = Path("credentials.json"),
     token_path: Path = Path("token.json"),
@@ -231,13 +254,22 @@ class GDriveSource:
     Yields :class:`RawDocument`s with text content where exportable. Native
     types that don't export to text (PDF, PNG, Forms, Shortcuts) are skipped.
 
+    Two auth modes:
+    - **Env-based** (preferred): pass ``oauth_client_id`` +
+      ``oauth_client_secret`` + ``oauth_refresh_token``. No JSON files
+      written or read.
+    - **File-based** (legacy): pass ``credentials_path`` + ``token_path``.
+      The library writes refreshed tokens back to ``token_path``.
+
     Args:
         folder_id: Drive folder UUID to list.
         download_dir: Local cache dir for downloaded files. Files are
             saved as ``<id>__<sanitized-name>`` so subsequent runs can
             reuse them.
-        credentials_path / token_path: OAuth client secrets and cached
-            token. Default to CWD.
+        credentials_path / token_path: file-mode paths. Defaults to CWD.
+        oauth_client_id / oauth_client_secret / oauth_refresh_token:
+            env-mode OAuth values. When all three are set, file paths
+            are ignored.
     """
 
     def __init__(
@@ -247,12 +279,50 @@ class GDriveSource:
         download_dir: Path | str = "data/gdrive_files",
         credentials_path: Path | str = "credentials.json",
         token_path: Path | str = "token.json",
+        oauth_client_id: str | None = None,
+        oauth_client_secret: str | None = None,
+        oauth_refresh_token: str | None = None,
     ) -> None:
         self.folder_id = folder_id
         self.download_dir = Path(download_dir)
         self.credentials_path = Path(credentials_path)
         self.token_path = Path(token_path)
+        self.oauth_client_id = oauth_client_id
+        self.oauth_client_secret = oauth_client_secret
+        self.oauth_refresh_token = oauth_refresh_token
         self._service = None  # lazy
+
+    @classmethod
+    def from_settings(cls, settings: "Any") -> "GDriveSource":
+        """Build a source from a unified ``Settings`` object.
+
+        Picks env-mode auth when all three OAuth values are set; otherwise
+        falls back to file-mode paths.
+        """
+        if not settings.drive_folder_id:
+            raise RuntimeError(
+                "settings.drive_folder_id is empty. Set DRIVE_FOLDER_ID in .env "
+                "or YAML."
+            )
+        return cls(
+            folder_id=settings.drive_folder_id,
+            download_dir=settings.drive_download_dir,
+            credentials_path=settings.drive_credentials_path,
+            token_path=settings.drive_token_path,
+            oauth_client_id=settings.google_oauth_client_id,
+            oauth_client_secret=settings.google_oauth_client_secret,
+            oauth_refresh_token=settings.google_oauth_refresh_token,
+        )
+
+    def _build_service(self):
+        if all((self.oauth_client_id, self.oauth_client_secret, self.oauth_refresh_token)):
+            creds = _load_credentials_from_env_values(
+                client_id=self.oauth_client_id,
+                client_secret=self.oauth_client_secret,
+                refresh_token=self.oauth_refresh_token,
+            )
+            return build("drive", "v3", credentials=creds, cache_discovery=False)
+        return build_service(self.credentials_path, self.token_path)
 
     def iter_documents(
         self,
@@ -261,7 +331,7 @@ class GDriveSource:
         only: str | None = None,
     ) -> Iterable[RawDocument]:
         if self._service is None:
-            self._service = build_service(self.credentials_path, self.token_path)
+            self._service = self._build_service()
         files = list_folder(
             self.folder_id, modified_after=since, service=self._service
         )

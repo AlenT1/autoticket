@@ -156,6 +156,39 @@ class JiraClient:
         )
 
     @classmethod
+    def from_settings(cls, settings: "Any") -> "JiraClient":
+        """Build a client from a unified ``Settings`` object.
+
+        Reads ``jira_host``, ``jira_auth_mode``, ``jira_user_email``,
+        ``jira_ca_bundle`` and runs ``settings.effective_jira_token()``
+        for the autodev-aware token chain. No env reads beyond what
+        ``Settings`` already absorbed.
+        """
+        host = settings.jira_host
+        if not host:
+            raise RuntimeError(
+                "settings.jira_host is empty. Set JIRA_HOST in .env or YAML."
+            )
+        token = settings.effective_jira_token()
+        if not token:
+            raise RuntimeError(
+                "No Jira token resolvable from settings. Set JIRA_TOKEN "
+                "(or AUTODEV_TOKEN), or place a token at "
+                "~/.autodev/tokens/task-jira-<project>."
+            )
+        auth_mode = (settings.jira_auth_mode or "bearer").lower()
+        return cls(
+            host=_normalize_host(host),
+            auth_header=_build_auth_header(
+                token,
+                auth_mode=auth_mode,
+                user_email=settings.jira_user_email,
+            ),
+            auth_mode=auth_mode,
+            verify_ssl=settings.jira_ca_bundle if settings.jira_ca_bundle else True,
+        )
+
+    @classmethod
     def from_config(
         cls,
         *,
@@ -521,14 +554,14 @@ class JiraClient:
     _static_map: dict[str, str] | None = None
 
     def _load_static_map(self) -> dict[str, str]:
-        """Load `team_mapping.json` from CWD if present. Keys lowercased."""
+        """Load ``configs/team_mapping.yaml`` if present. Keys lowercased."""
         if self._static_map is not None:
             return self._static_map
-        import json as _json
-        path = Path("team_mapping.json")
+        import yaml
+        path = Path("configs/team_mapping.yaml")
         if path.exists():
             try:
-                raw = _json.loads(path.read_text(encoding="utf-8"))
+                raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
                 self._static_map = {
                     str(k).strip().lower(): str(v).strip()
                     for k, v in raw.items()

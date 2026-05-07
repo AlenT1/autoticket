@@ -37,12 +37,12 @@ class PassthroughAssigneeResolver:
 
 
 class StaticMapStrategy:
-    """Resolve via a JSON map ``{display_name: username}`` loaded from disk.
+    """Resolve via a YAML map ``{display_name: username}`` loaded from disk.
 
     Args:
-        map_path: Path to a JSON file mapping display names → usernames.
-            Defaults to ``team_mapping.json`` in the CWD (drive's
-            convention). If the file is missing, every lookup misses.
+        map_path: Path to a YAML file mapping display names → usernames.
+            Defaults to ``configs/team_mapping.yaml`` (the shipped file).
+            If missing, every lookup misses.
         default_username: Optional fallback username when a name is unmapped.
             ``None`` means "leave unassigned on miss".
 
@@ -53,7 +53,7 @@ class StaticMapStrategy:
     def __init__(
         self,
         *,
-        map_path: Path | str = "team_mapping.json",
+        map_path: Path | str = "configs/team_mapping.yaml",
         default_username: str | None = None,
     ) -> None:
         self.map_path = Path(map_path)
@@ -79,14 +79,14 @@ class StaticMapStrategy:
             self._map = {}
             return self._map
         try:
-            import json
-            data = json.loads(self.map_path.read_text(encoding="utf-8"))
+            import yaml
+            data = yaml.safe_load(self.map_path.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
             log.warning("failed to load %s: %s", self.map_path, e)
             self._map = {}
             return self._map
         if not isinstance(data, dict):
-            log.warning("%s: must contain a JSON object", self.map_path)
+            log.warning("%s: must contain a YAML mapping", self.map_path)
             self._map = {}
             return self._map
         self._map = {

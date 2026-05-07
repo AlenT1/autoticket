@@ -58,6 +58,24 @@ class OpenAICompatProvider:
             kwargs["api_key"] = resolved_key
         self._client = OpenAI(**kwargs)
 
+    @classmethod
+    def from_settings(cls, settings: Any) -> "OpenAICompatProvider":
+        """Build a provider from a unified ``Settings`` object.
+
+        Reads ``nvidia_api_key`` + ``nvidia_base_url`` (env: ``NVIDIA_API_KEY``
+        / ``NVIDIA_BASE_URL``). One canonical name per field; legacy names
+        like ``OPENAI_API_KEY`` are not consulted by Settings.
+        """
+        if not settings.nvidia_api_key:
+            raise RuntimeError(
+                "No LLM API key resolvable from settings. Set NVIDIA_API_KEY "
+                "in .env."
+            )
+        return cls(
+            api_key=settings.nvidia_api_key,
+            base_url=settings.nvidia_base_url,
+        )
+
     # ---- LLMProvider ----------------------------------------------------
 
     def chat(

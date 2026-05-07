@@ -47,7 +47,7 @@ BASELINE_DIR = ROOT / "data" / "_warm_baseline"
 
 def _ensure_env() -> None:
     load_dotenv()
-    for var in ("NVIDIA_API_KEY", "FOLDER_ID", "JIRA_HOST", "JIRA_PROJECT_KEY", "JIRA_TOKEN"):
+    for var in ("NVIDIA_API_KEY", "DRIVE_FOLDER_ID", "JIRA_HOST", "JIRA_PROJECT_KEY", "JIRA_TOKEN"):
         if not os.environ.get(var):
             pytest.skip(f"{var} not set; skipping live warm-scenario tests")
 

@@ -39,7 +39,8 @@ state-*.json.bak*
 # run_plan.json, captured payloads (would_send*.json), cold/cached run debug files.
 data/
 
-# User local overrides (shipped example is configs/example.user.yaml)
+# Legacy per-operator override at the repo root (shipped defaults live in
+# configs/f2j.yaml). New flow: operators edit only `.env`.
 /f2j.yaml
 
 # Example input files (drop-in zone; keep dir but ignore content)

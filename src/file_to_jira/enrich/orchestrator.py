@@ -345,25 +345,23 @@ def _build_agent(
 ):
     """Pick the agent backend by ``cfg.enrichment.provider`` and construct it.
 
-    The :class:`_shared.llm.LLMProvider` is constructed via the registry and
-    injected into the agent — so the agent itself owns only loop semantics,
-    not SDK/auth plumbing.
+    The provider's connection details (API key, base URL) come from the
+    unified :class:`_shared.config.Settings` (``.env`` + ``configs/shared.yaml``).
+    f2j's ``cfg`` only owns enrichment-loop tuning — model, temperature,
+    max_tokens_per_turn, prompt-caching flag.
     """
-    from _shared.llm import get_provider
+    from _shared.config import load_settings
+    from _shared.llm import AnthropicProvider, OpenAICompatProvider
 
     provider_name = cfg.enrichment.provider
     available_epics = list(cfg.jira.available_epics) if cfg.jira.available_epics else None
+    settings = load_settings()
 
     if provider_name == "openai_compatible":
         from .agent_openai import OpenAIEnrichmentAgent
 
         oc = cfg.openai_compatible
-        provider = get_provider(
-            "openai_compatible",
-            base_url=oc.base_url,
-            base_url_env=oc.base_url_env,
-            api_key_env=oc.api_key_env,
-        )
+        provider = OpenAICompatProvider.from_settings(settings)
         return OpenAIEnrichmentAgent(
             toolkit=toolkit,
             submit_tool=submit_tool,
@@ -375,11 +373,7 @@ def _build_agent(
             available_epics=available_epics,
         )
     if provider_name == "anthropic":
-        provider = get_provider(
-            "anthropic",
-            base_url=cfg.anthropic.base_url,
-            api_key_env=cfg.anthropic.auth_token_env,
-        )
+        provider = AnthropicProvider.from_settings(settings)
         return EnrichmentAgent(
             toolkit=toolkit,
             submit_tool=submit_tool,

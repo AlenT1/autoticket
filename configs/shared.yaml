@@ -1,0 +1,14 @@
+# Shared defaults consumed by both agents.
+# This file ships with the repo. Do not put secrets here — `.env` is the
+# only place for secrets.
+#
+# Top-level keys must match Settings field names (lowercase). Any
+# `f2j:` / `jira_task_agent:` namespaced sections that belong in agent-
+# specific YAMLs are silently ignored by the shared loader.
+
+# --- Jira defaults (operator overrides via .env) ---
+jira_auth_mode: bearer
+
+# --- Google Drive default paths (file-mode fallback when OAuth env vars
+#     are not set; the env-mode is preferred) ---
+drive_download_dir: data/gdrive_files

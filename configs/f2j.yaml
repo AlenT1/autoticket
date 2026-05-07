@@ -10,14 +10,8 @@
 anthropic:
   model: "claude-sonnet-4-6"
   enable_prompt_caching: true
-  # Override the SDK default (https://api.anthropic.com). Set to route through
-  # an Anthropic-compatible internal proxy (NVIDIA MaaS, Bedrock shim, etc.).
-  # Per-operator: each user typically sets this in ~/.config/f2j/config.yaml
-  # or via the ANTHROPIC_BASE_URL env var, NOT in the shared project f2j.yaml.
-  base_url: null
-  # Name of the env var holding the bearer token, when not using the default
-  # ANTHROPIC_API_KEY. The token itself always lives in env vars.
-  auth_token_env: null
+  # Connection details (base URL, API key) live in `.env` /
+  # configs/shared.yaml via Settings (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL).
 
 enrichment:
   # Which agent backend drives enrichment:
@@ -36,8 +30,8 @@ enrichment:
 
 openai_compatible:
   # Used only when enrichment.provider == "openai_compatible".
-  base_url: "https://api.openai.com/v1"
-  api_key_env: "OPENAI_API_KEY"     # name of the env var holding the bearer token
+  # Connection details (base URL, API key) live in `.env` /
+  # configs/shared.yaml via Settings (NVIDIA_API_KEY, NVIDIA_BASE_URL).
   model: "gpt-4o"
   temperature: 0.0
   max_tokens_per_turn: 4096
