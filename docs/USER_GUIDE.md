@@ -149,3 +149,35 @@ The agent caches every decision it makes. A second run on unchanged content prod
 
 - The source doc has wrong file paths or made-up details — the agent will copy them. Fix the doc first.
 - You haven't read the plan. Never approve `all` blindly on a first run for a new doc.
+
+---
+
+## Scheduled runs
+
+Once you trust the agent's output for a class of docs, you can schedule it. The agent already has a `last_run_at` cursor, so each scheduled invocation only processes files modified since the previous run.
+
+### Example: cron, every two hours
+
+```cron
+0 */2 * * * cd /opt/autoticket && uv run jira-task-agent run --apply >> /var/log/jira-agent.log 2>&1
+```
+
+That's it — no extra setup. The agent handles everything else:
+
+- **Run lock**: if cron fires while the previous run is still in flight, the second invocation exits cleanly (exit code 3) with a "another run holds the lock" message instead of corrupting the cache.
+- **Non-interactive guard**: `--verify` requires a real terminal. Drop `--verify` for scheduled runs; the agent will refuse to start otherwise (exit code 2).
+- **Cursor-based incrementality**: only files modified since the last successful run are reconsidered.
+- **Idempotent re-runs**: a scheduled run on unchanged content writes nothing to Jira.
+
+### Recommended rollout
+
+1. **Start with scheduled dry-runs**: `... run >> ...log` (no `--apply`). The plan lands in `data/run_plan.md` for human review. Catches doc changes early without writing anything.
+2. **Graduate to scheduled apply**: switch to `... run --apply >> ...log` once you've reviewed several runs and the plans match what you'd have approved manually.
+
+### Exit codes (for monitoring)
+
+| Code | Meaning |
+|---|---|
+| 0 | Success — the run completed; whether it wrote anything depends on diff/cache |
+| 2 | Configuration error (missing env, `--verify` without TTY, etc.) |
+| 3 | Another run is already in progress — safe to ignore, will retry on next schedule |

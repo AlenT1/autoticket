@@ -90,20 +90,40 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(
             "--verify only meaningful with --apply; ignoring.", file=sys.stderr,
         )
+    # `--verify` blocks waiting on stdin; refuse it when stdin is not a TTY
+    # (cron / systemd / CI). The operator should remove `--verify` for
+    # scheduled runs that are expected to apply automatically.
+    if args.verify and args.apply and not sys.stdin.isatty():
+        print(
+            "ERROR: --verify requires an interactive terminal (stdin must "
+            "be a TTY). For scheduled / non-interactive runs, drop --verify "
+            "and rely on dry-run review or capture-mode review instead.",
+            file=sys.stderr,
+        )
+        return 2
+
     md_path = Path(args.report_out).with_suffix(".md") if args.report_out else None
-    report = run_once(
-        apply=apply_writes,
-        since_override=args.since,
-        download_dir=args.download_dir,
-        local_dir=args.local_dir,
-        source=args.source,
-        only_file_name=args.only,
-        target_epic=args.target_epic,
-        capture_path=args.capture,
-        use_cache=not args.no_cache,
-        verify_before_apply=bool(args.apply and args.verify),
-        verify_md_path=md_path,
-    )
+    # `data/run.lock` ensures cron firing the next run while the previous
+    # is still in flight does not collide on cache / state writes.
+    from _shared.process_lock import RunLockBusy, acquire_run_lock
+    try:
+        with acquire_run_lock(Path("data") / "run.lock"):
+            report = run_once(
+                apply=apply_writes,
+                since_override=args.since,
+                download_dir=args.download_dir,
+                local_dir=args.local_dir,
+                source=args.source,
+                only_file_name=args.only,
+                target_epic=args.target_epic,
+                capture_path=args.capture,
+                use_cache=not args.no_cache,
+                verify_before_apply=bool(args.apply and args.verify),
+                verify_md_path=md_path,
+            )
+    except RunLockBusy as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 3
     _print_report(report)
 
     if args.report_out:
