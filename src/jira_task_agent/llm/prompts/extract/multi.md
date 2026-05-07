@@ -85,10 +85,10 @@ E. Each child task description
 
        ### Definition of Done
        - [ ] All implementation steps completed and verified
-       - [ ] Code merged to <release branch / main / etc.>
-       - [ ] Tests added or updated and passing
        - [ ] <task-specific shipping gate>
-       - [ ] <optional second task-specific gate>
+       - [ ] <add as many task-specific gates as the task actually needs;
+             trivial tasks may have just the first line; complex multi-
+             surface tasks may have 5-6. No filler.>
 
        ### Source
        - Doc: {task_file_name}
@@ -107,10 +107,30 @@ E. Each child task description
      paraphrase code into prose. Step count: 1 for trivial tasks,
      up to 8-10 for complex multi-phase work.
 
-   - "### Definition of Done" — shipping gate checklist. 3-5 items.
-     The first item MUST be `[ ] All implementation steps completed
-     and verified`. Then universal gates (`code merged`, `tests`,
-     `reviewed`) and 1-2 task-specific shipping gates.
+   - "### Definition of Done" — shipping gate checklist.
+     **Item count scales with task complexity.**
+       * Trivial task: 1 item (just `[ ] All implementation steps
+         completed and verified`).
+       * Standard task: 2-4 items.
+       * Complex multi-phase task: up to 6-8 items.
+     The first item MUST always be `[ ] All implementation steps
+     completed and verified`. DO NOT pad to hit a target count.
+     **EVERY OTHER DoD ITEM MUST BE TASK-SPECIFIC.** No generic
+     boilerplate. Forbidden as standalone items:
+       * `[ ] Code merged to main` / `[ ] Code merged to <branch>`
+       * `[ ] Tests added or updated and passing`
+       * `[ ] Reviewed by team`
+       * `[ ] Documentation updated`
+     If a task involves a code change, name what's being merged AND
+     what scope the merge covers (e.g.
+     `[ ] PR adding rate-limit middleware to /api/auth merged to release-may1`,
+     not `[ ] Code merged to main`).
+     If a task involves tests, name what's being tested (e.g.
+     `[ ] Integration test exercises /api/flows/schedule returns 410`,
+     not `[ ] Tests added`).
+     A reader of just the DoD MUST be able to tell what task it
+     belongs to without reading Goal or Steps. If a DoD item could
+     be pasted onto another task unchanged, it is generic and wrong.
 
    - Contrast example (task: "Hide unsupported schedule button on
      Flows page"):
@@ -132,9 +152,9 @@ E. Each child task description
 
          ### Definition of Done
          - [ ] All implementation steps completed and verified
-         - [ ] Frontend PR merged to release branch
-         - [ ] Tests cover the hidden-button case
-         - [ ] Release notes mention the temporary removal
+         - [ ] PR removing the Schedule button from `src/flows/page.tsx` merged to the May-1 release branch
+         - [ ] Unit test confirms the Schedule button is absent from the rendered Flows DOM in production
+         - [ ] Release notes for May-1 explicitly mention the temporary Schedule button removal
 
      Note: Goal, Steps, and DoD do not overlap.
 
@@ -192,6 +212,12 @@ I. Assignee (epic + each task)
    - For each EPIC, set "assignee" to the section's owner if explicit, or
      to the most-frequent owner across the section's tasks if no
      section-level owner is given. If neither is determinable, emit `null`.
+   - **Inheritance rule**: when a task has no per-row owner (blank cell,
+     "—", "TBD") AND the epic has a resolved owner (section-level or
+     doc-level), copy the epic's owner into the task's assignee. The
+     epic owner is the implicit owner of every unattributed task in
+     the same section. Only emit `null` for a task when BOTH the per-row
+     owner AND the epic-level owner are missing.
    - Do NOT invent assignees.
 
 Inputs follow.

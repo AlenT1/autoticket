@@ -109,11 +109,10 @@ D. Each child task description
 
        ### Definition of Done
        - [ ] All implementation steps completed and verified
-       - [ ] Code merged to <release branch / main / etc.>
-       - [ ] Tests added or updated and passing
-       - [ ] <task-specific shipping gate, e.g. "Manual smoke on
-              staging confirmed", "Runbook updated">
-       - [ ] <optional second task-specific gate>
+       - [ ] <task-specific shipping gate>
+       - [ ] <add as many task-specific gates as the task actually needs;
+             trivial tasks may have just the first line; complex multi-
+             surface tasks may have 5-6. No filler.>
 
        ### Source
        - Doc: {task_file_name}
@@ -138,13 +137,38 @@ D. Each child task description
      be small enough that "Done when" is unambiguous.
 
    - "### Definition of Done" — shipping gate checklist, not a
-     restatement of the steps. 3-5 items, mostly the universal gates
-     (`code merged`, `tests added`, `reviewed` …) plus 1-2
-     task-specific shipping gates (`alerting.yaml committed`,
-     `runbook page updated`, `release notes mention removal`).
-     The first DoD item should be `[ ] All implementation steps
+     restatement of the steps.
+     **Item count scales with task complexity.** Use as many items as
+     the task genuinely needs — no more, no less.
+       * Trivial task (single config flip, one-line removal): 1 item
+         (just the universal `[ ] All implementation steps completed
+         and verified`).
+       * Standard task (one or two surfaces touched): 2-4 items.
+       * Complex multi-phase task (multiple files, services,
+         migrations, or rollouts): up to 6-8 items, each pinning a
+         distinct shipping gate.
+     The first DoD item MUST always be `[ ] All implementation steps
      completed and verified` — that's the link between Steps and
      shipping.
+     DO NOT pad to hit a target count. If the task only ships when
+     one extra thing is true, write that one item and stop.
+     **EVERY OTHER DoD ITEM MUST BE TASK-SPECIFIC.** No generic
+     boilerplate. Forbidden as standalone items:
+       * `[ ] Code merged to main` / `[ ] Code merged to <branch>`
+       * `[ ] Tests added or updated and passing`
+       * `[ ] Reviewed by team`
+       * `[ ] Documentation updated`
+     If a task involves a code change, name what's being merged AND
+     what scope the merge covers — e.g.
+     `[ ] PR adding rate-limit middleware to /api/auth merged to release-may1`,
+     not `[ ] Code merged to main`.
+     If a task involves tests, name what's being tested — e.g.
+     `[ ] Unit test confirms hidden Schedule button is absent from prod DOM`,
+     not `[ ] Tests added or updated and passing`.
+     A reader of just the DoD MUST be able to tell what task it
+     belongs to without reading the Goal or Steps. If a DoD item
+     could be pasted onto another task unchanged, it is generic and
+     wrong.
 
    - Contrast example (task: "Hide unsupported schedule button on
      Flows page"):
@@ -169,10 +193,10 @@ D. Each child task description
 
          ### Definition of Done
          - [ ] All implementation steps completed and verified
-         - [ ] Frontend PR merged to release branch
-         - [ ] Tests cover the hidden-button case
-         - [ ] Manual smoke on staging confirmed
-         - [ ] Release notes mention the temporary removal
+         - [ ] PR removing the Schedule button from `src/flows/page.tsx` merged to the May-1 release branch
+         - [ ] Unit test confirms the Schedule button is absent from the rendered Flows DOM in production
+         - [ ] Manual smoke on staging confirms ad-hoc execution still works after the button removal
+         - [ ] Release notes for May-1 explicitly mention the temporary Schedule button removal
 
      Note: Goal answers "is this done?". Steps are the plan. DoD is
      the shipping checklist. The three lists do not overlap.
@@ -228,11 +252,14 @@ H. Assignee (epic + each task)
      **verbatim** — do NOT normalize, expand, or pick one when several are
      listed. Examples to preserve as-is: "Sharon", "Nick/Joe", "Lior + Aviv",
      "Evgeny", "Nick/Joe + Guy".
-   - If the source has no owner for a task (e.g. blank cell, "—", "TBD"),
-     emit `null`. Do not guess.
+   - **Inheritance rule**: if a task has no per-row owner (blank cell, "—",
+     "TBD") AND the document has a doc-level Owner, copy the doc-level Owner
+     into the task's assignee. The epic owner is the implicit owner of every
+     unattributed task in the same doc.
    - For the epic's "assignee", use the doc-level Owner (if present at the
      top of the document). If the doc has no doc-level owner, emit `null`.
-   - Do NOT invent assignees. If you can't see one in the source, it's null.
+   - Only emit `null` for a task when BOTH the per-row owner AND the
+     doc-level Owner are missing. Do not invent assignees.
 
 Inputs follow.
 

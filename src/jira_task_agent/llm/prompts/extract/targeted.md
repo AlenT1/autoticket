@@ -88,10 +88,10 @@ QUALITY RULES (same as the cold extractor):
 
       ### Definition of Done
       - [ ] All implementation steps completed and verified
-      - [ ] Code merged to <release branch / main / etc.>
-      - [ ] Tests added or updated and passing
       - [ ] <task-specific shipping gate>
-      - [ ] <optional second task-specific gate>
+      - [ ] <add as many task-specific gates as the task actually needs;
+            trivial tasks may have just the first line; complex multi-
+            surface tasks may have 5-6. No filler.>
 
       ### Source
       - Doc: {task_file_name}
@@ -111,10 +111,26 @@ QUALITY RULES (same as the cold extractor):
   DO NOT paraphrase code into prose. Step count: 1 for trivial
   tasks, up to 8-10 for complex multi-phase work.
 
-- "### Definition of Done" — shipping gate checklist. 3-5 items.
-  The first item MUST be `[ ] All implementation steps completed
-  and verified`. Then universal gates (code merged, tests, review)
-  and 1-2 task-specific shipping gates.
+- "### Definition of Done" — shipping gate checklist.
+  **Item count scales with task complexity.**
+    * Trivial task: 1 item (just `[ ] All implementation steps
+      completed and verified`).
+    * Standard task: 2-4 items.
+    * Complex multi-phase task: up to 6-8 items.
+  The first item MUST always be `[ ] All implementation steps
+  completed and verified`. DO NOT pad to hit a target count.
+  **EVERY OTHER DoD ITEM MUST BE TASK-SPECIFIC.** No generic
+  boilerplate. Forbidden as standalone items:
+    * `[ ] Code merged to main` / `[ ] Code merged to <branch>`
+    * `[ ] Tests added or updated and passing`
+    * `[ ] Reviewed by team`
+    * `[ ] Documentation updated`
+  If a task involves a code change, name what's being merged AND
+  what scope the merge covers. If a task involves tests, name what
+  is being tested. A reader of just the DoD MUST be able to tell
+  what task it belongs to without reading Goal or Steps. If a DoD
+  item could be pasted onto another task unchanged, it is generic
+  and wrong.
 
 - Contrast example (task: "Hide unsupported schedule button on Flows
   page"):
@@ -135,8 +151,8 @@ QUALITY RULES (same as the cold extractor):
 
       ### Definition of Done
       - [ ] All implementation steps completed and verified
-      - [ ] Frontend PR merged to release branch
-      - [ ] Tests cover the hidden-button case
+      - [ ] PR removing the Schedule button from `src/flows/page.tsx` merged to the May-1 release branch
+      - [ ] Unit test confirms the Schedule button is absent from the rendered Flows DOM in production
       - [ ] Release notes mention the temporary removal
 
   Note: Goal, Steps, and DoD do not overlap.
@@ -172,6 +188,18 @@ PRESERVATION RULES — content from the source that MUST survive regeneration:
   A summary like `"Q3 deadline release"` is wrong if the source says
   some specific code like `<DEADLINE-CODE-FROM-SOURCE>`; copy the
   source token, do not rewrite it.
+
+ASSIGNEE RULES:
+
+- For each task body, copy the source's per-row owner string verbatim
+  into `assignee`. Composites ("Lior + Aviv", "Nick/Joe") are preserved
+  as-is.
+- **Inheritance**: when a task has no per-row owner (blank cell, "—",
+  "TBD") AND the document or section has a resolved Owner, copy that
+  epic-level Owner into the task's `assignee`. The epic owner is the
+  implicit owner of every unattributed task in the same scope. Only
+  emit `null` when BOTH the per-row owner AND the epic-level owner
+  are missing. Do not invent assignees.
 
 INPUTS:
 
