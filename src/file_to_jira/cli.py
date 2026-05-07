@@ -421,6 +421,35 @@ def run(
 
 
 @app.command()
+def init() -> None:
+    """First-time setup: copy .env.example to .env and create data/local_files/."""
+    from _shared.config import format_init_result, init_workspace
+
+    try:
+        result = init_workspace()
+    except FileNotFoundError as e:
+        # markup=False keeps bracketed text from being interpreted as Rich tags.
+        err_console.print(str(e), markup=False)
+        raise typer.Exit(code=2) from e
+    console.print(format_init_result(result), markup=False)
+
+
+@app.command()
+def doctor() -> None:
+    """Read current config and report which required keys are present or missing."""
+    from _shared.config import (
+        check_config, doctor_exit_code, format_check_results,
+    )
+
+    checks = check_config()
+    # markup=False keeps `[ok]` / `[warn]` / `[error]` from being treated as Rich tags.
+    console.print(format_check_results(checks), markup=False)
+    code = doctor_exit_code(checks)
+    if code:
+        raise typer.Exit(code=code)
+
+
+@app.command()
 def inspect(
     state_file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
     bug: Optional[str] = typer.Option(None, "--bug", help="Show one bug by bug_id or external_id."),

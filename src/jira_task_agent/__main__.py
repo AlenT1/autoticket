@@ -222,8 +222,40 @@ def main(argv: list[str] | None = None) -> int:
     )
     r.set_defaults(func=cmd_run)
 
+    init = sub.add_parser(
+        "init",
+        help="First-time setup: copy .env.example to .env and create data/local_files/.",
+    )
+    init.set_defaults(func=cmd_init)
+
+    doc = sub.add_parser(
+        "doctor",
+        help="Read current config and report which required keys are present or missing.",
+    )
+    doc.set_defaults(func=cmd_doctor)
+
     args = p.parse_args(argv)
     return args.func(args)
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    from _shared.config import format_init_result, init_workspace
+    try:
+        result = init_workspace()
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(format_init_result(result))
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from _shared.config import (
+        check_config, doctor_exit_code, format_check_results,
+    )
+    checks = check_config()
+    print(format_check_results(checks))
+    return doctor_exit_code(checks)
 
 
 if __name__ == "__main__":

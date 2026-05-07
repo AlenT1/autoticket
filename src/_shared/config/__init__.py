@@ -19,5 +19,24 @@ Agent-specific YAMLs (``configs/f2j.yaml``,
 not by this shared layer.
 """
 from .settings import Settings, load_settings
+from .workspace import (
+    Check,
+    InitResult,
+    check_config,
+    doctor_exit_code,
+    format_check_results,
+    format_init_result,
+    init_workspace,
+)
 
-__all__ = ["Settings", "load_settings"]
+__all__ = [
+    "Settings",
+    "load_settings",
+    "Check",
+    "InitResult",
+    "check_config",
+    "doctor_exit_code",
+    "format_check_results",
+    "format_init_result",
+    "init_workspace",
+]
